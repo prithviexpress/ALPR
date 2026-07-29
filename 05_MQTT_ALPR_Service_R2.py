@@ -27,12 +27,15 @@
 #      aborts the job as FRAME_SIZE_ERROR -- catches a misconfigured RTSP
 #      URL pointed at a low-res substream before wasting a collection
 #      cycle on frames that could never hold a readable plate.
-#   5. RTSP source is now selectable per camera (config "rtsp.mode",
-#      per-camera override cameras.json "rtsp_mode"): "genetec" (GUID via
-#      the Genetec media gateway, R1/R2 behavior) or "direct" (straight to
-#      the camera's own RTSP server via IP + username/password). Both
-#      modes always request the camera's primary/main stream (stream 1,
-#      full resolution), never a substream.
+#   5. RTSP source is now selectable via config "rtsp.mode": "genetec"
+#      (GUID via the Genetec media gateway, R1/R2 behavior) or "direct"
+#      (straight to each camera's own RTSP server via its IP, using one
+#      common username/password for all cameras in "rtsp.direct"). This
+#      is a single global switch, not per-camera -- cameras.json only
+#      holds {guid, ip, roi, enabled} per bay, so flipping rtsp.mode
+#      repoints every camera without editing cameras.json. Both modes
+#      always request the camera's primary/main stream (stream 1, full
+#      resolution), never a substream.
 #   6. Initial MQTT connect now retries with exponential backoff instead
 #      of crashing the process if the broker isn't reachable yet at boot;
 #      SIGTERM (not just Ctrl+C/SIGINT) now triggers a clean shutdown.

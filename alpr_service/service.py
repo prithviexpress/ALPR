@@ -16,6 +16,25 @@ QUEUE_MAX = 50
 AUDIT_DIR = BASE_DIR / "audit"
 CAMERAS_FILE = BASE_DIR / "cameras.json"
 
+# The field each rtsp.mode needs from every camera entry.
+_RTSP_MODE_REQUIRES = {"genetec": "guid", "direct": "ip"}
+
+
+def check_camera_rtsp_fields(cameras: dict, rtsp_mode: str, log):
+    """Fail fast at startup if rtsp.mode is set globally but some camera
+    is missing the field that mode needs, rather than discovering it one
+    RTSP_CONFIG_ERROR job at a time."""
+    required = _RTSP_MODE_REQUIRES.get(rtsp_mode)
+    if required is None:
+        log.error(f"unknown rtsp.mode '{rtsp_mode}' "
+                  f"(expected 'genetec' or 'direct')")
+        raise SystemExit(1)
+    missing = [bay for bay, cam in cameras.items() if not cam.get(required)]
+    if missing:
+        log.error(f"rtsp.mode='{rtsp_mode}' requires '{required}' on every "
+                  f"camera, but it's missing for: {missing}")
+        raise SystemExit(1)
+
 
 def build_mqtt(cameras: dict, config: dict, bus: JobBus) -> mqtt.Client:
     log = get_logger("MQTT")
@@ -119,9 +138,9 @@ def main():
     enabled = [b for b, c in cameras.items() if c.get('enabled', True)]
     log.info(f"Loaded {len(cameras)} cameras from {CAMERAS_FILE} "
               f"({len(enabled)} enabled: {enabled})")
+    check_camera_rtsp_fields(cameras, config['rtsp']['mode'], log)
     for bay, cam in cameras.items():
-        mode = cam.get('rtsp_mode', config['rtsp']['mode'])
-        log.debug(f"camera '{bay}': mode={mode} ip={cam.get('ip')} "
+        log.debug(f"camera '{bay}': guid={cam.get('guid')} ip={cam.get('ip')} "
                   f"roi={cam.get('roi')} enabled={cam.get('enabled', True)}")
 
     AUDIT_DIR.mkdir(exist_ok=True)

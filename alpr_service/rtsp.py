@@ -1,12 +1,16 @@
-"""RTSP URL construction and stream capture, supporting two source modes
-(config "rtsp.mode", overridable per-camera via cameras.json "rtsp_mode"):
+"""RTSP URL construction and stream capture, supporting two source modes,
+selected globally for every camera via config.json "rtsp.mode" (there is
+no per-camera override -- cameras.json only carries guid/ip/roi/enabled,
+so flipping this one setting repoints every camera without editing the
+camera registry):
 
   "genetec" -- pull the feed through a Genetec media-gateway endpoint keyed
                by camera GUID (server/port/username/password in config.json
                "rtsp", same as R1/R2's build_rtsp()).
-  "direct"  -- connect straight to the camera's own RTSP server using its
-               IP and credentials (config.json "rtsp.direct", or per-camera
-               overrides in cameras.json), bypassing Genetec entirely.
+  "direct"  -- connect straight to each camera's own RTSP server using its
+               IP (from cameras.json) plus one common username/password for
+               all cameras (config.json "rtsp.direct"), bypassing Genetec
+               entirely.
 
 Both modes always request the camera's primary/main stream (stream 1, full
 resolution) -- OCR needs the detail a substream throws away:
@@ -35,10 +39,6 @@ class RtspOpenError(RuntimeError):
     pass
 
 
-def _stream_number(camera_cfg, rtsp_cfg):
-    return int(camera_cfg.get("stream") or rtsp_cfg.get("stream", 1))
-
-
 def _build_genetec_url(camera_cfg, rtsp_cfg):
     for key in ("server", "port", "username", "password"):
         if key not in rtsp_cfg:
@@ -56,22 +56,22 @@ def _build_genetec_url(camera_cfg, rtsp_cfg):
 
 
 def _build_direct_url(camera_cfg, rtsp_cfg):
-    direct = rtsp_cfg.get("direct", {})
     ip = camera_cfg.get("ip")
     if not ip:
         raise RtspOpenError("rtsp mode 'direct' requires camera 'ip'")
-    username = camera_cfg.get("username", direct.get("username"))
-    password = camera_cfg.get("password", direct.get("password"))
+    direct = rtsp_cfg.get("direct", {})
+    username = direct.get("username")
+    password = direct.get("password")
     if username is None or password is None:
         raise RtspOpenError(
-            "rtsp mode 'direct' requires 'username'/'password' on the "
-            "camera entry or in config.json rtsp.direct")
-    port = camera_cfg.get("port", direct.get("port", 554))
-    channel = camera_cfg.get("channel", 1)
-    stream = _stream_number(camera_cfg, rtsp_cfg)
+            "rtsp mode 'direct' requires config.json rtsp.direct.username "
+            "and rtsp.direct.password (one common set of credentials for "
+            "every camera)")
+    port = direct.get("port", 554)
+    channel = direct.get("channel", 1)
+    stream = rtsp_cfg.get("stream", 1)
     template = direct.get(
-        "url_template",
-        "rtsp://{username}:{password}@{ip}:{port}/Streaming/Channels/{channel}0{stream}")
+        "url_template", "rtsp://{username}:{password}@{ip}:{port}/video{stream}")
     return template.format(
         username=quote(str(username), safe=''),
         password=quote(str(password), safe=''),
@@ -80,7 +80,7 @@ def _build_direct_url(camera_cfg, rtsp_cfg):
 
 def build_rtsp_url(camera_cfg: dict, config: dict) -> str:
     rtsp_cfg = config["rtsp"]
-    mode = camera_cfg.get("rtsp_mode", rtsp_cfg.get("mode", "genetec"))
+    mode = rtsp_cfg.get("mode", "genetec")
     if mode == "direct":
         return _build_direct_url(camera_cfg, rtsp_cfg)
     if mode == "genetec":

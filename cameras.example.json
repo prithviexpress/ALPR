@@ -1,20 +1,17 @@
 {
+  "_comment": "Every entry carries both 'guid' (used in rtsp.mode='genetec') and 'ip' (used in rtsp.mode='direct') so switching config.json's rtsp.mode repoints every camera without editing this file. Credentials for direct mode are NOT per-camera -- they're the one common username/password in config.json rtsp.direct.",
+
   "AR-FS": {
     "guid": "01000000001babe00c81f7ff9",
     "ip": "10.69.10.100",
     "roi": [850, 250, 1750, 1800],
-    "enabled": true,
-    "rtsp_mode": "genetec"
+    "enabled": true
   },
 
-  "AR-DIRECT-EXAMPLE": {
-    "_comment": "Bosch FLEXIDOME 3000i dome, connected directly (bypassing Genetec). Builds rtsp://camera_admin:...@10.69.10.101:554/video1 via config.json rtsp.direct.url_template.",
+  "AR-DOCK2": {
+    "guid": "01000000002cafe00d81f7abc",
     "ip": "10.69.10.101",
     "roi": [800, 300, 1700, 1750],
-    "enabled": false,
-    "rtsp_mode": "direct",
-    "username": "camera_admin",
-    "password": "CHANGE_ME",
-    "stream": 1
+    "enabled": true
   }
 }

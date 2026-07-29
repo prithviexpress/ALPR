@@ -68,6 +68,8 @@ class Worker(threading.Thread):
         self.min_ocr_conf = alpr.get("min_ocr_conf", 0.35)
         self.rtsp_timeout_ms = config["rtsp"].get("timeout_ms", 8000)
         self.rtsp_timeout_option = config["rtsp"].get("timeout_option_name", "stimeout")
+        self.rtsp_mode = config["rtsp"].get("mode")
+        self.rtsp_stream = config["rtsp"].get("stream")
 
     def run(self):
         self.log.info("loading models...")
@@ -211,9 +213,8 @@ class Worker(threading.Thread):
             stats['error'] = 'rtsp_config_error'
             return [], stats
 
-        mode = cam.get('rtsp_mode', self.config['rtsp'].get('mode'))
-        stream = cam.get('stream', self.config['rtsp'].get('stream'))
-        self.log.debug(f"opening {redact(rtsp_url)} (mode={mode}, stream={stream}, "
+        self.log.debug(f"opening {redact(rtsp_url)} "
+                        f"(mode={self.rtsp_mode}, stream={self.rtsp_stream}, "
                         f"timeout={self.rtsp_timeout_ms}ms)")
         cap, open_ms = open_capture(rtsp_url, self.rtsp_timeout_ms,
                                      self.rtsp_timeout_option)

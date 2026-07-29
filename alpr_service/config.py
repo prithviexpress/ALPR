@@ -75,14 +75,15 @@ def load_config(path: Path = None) -> dict:
     # "genetec": pull the feed through a Genetec media-gateway endpoint
     #            keyed by camera GUID (server/port/username/password below,
     #            same fields as R1/R2).
-    # "direct":  connect straight to the camera's own RTSP server using its
-    #            IP and credentials (see rtsp.direct below), bypassing
-    #            Genetec entirely. Per-camera override via cameras.json
-    #            "rtsp_mode".
+    # "direct":  connect straight to each camera's own RTSP server using its
+    #            IP (from cameras.json) plus one common username/password
+    #            for all cameras (rtsp.direct below), bypassing Genetec.
+    # Applies to every camera -- there is no per-camera override. cameras.json
+    # only carries guid/ip/roi/enabled, so every entry has both a guid and an
+    # ip and flipping this one setting repoints all cameras at once.
     rtsp.setdefault("mode", "genetec")
     # Always the camera's primary/main stream (full resolution) -- OCR
-    # needs the detail a substream throws away. Per-camera override via
-    # cameras.json "stream".
+    # needs the detail a substream throws away. Applies to every camera.
     rtsp.setdefault("stream", 1)
     rtsp.setdefault("timeout_ms", 8000)
     # ffmpeg RTSP option name for the socket timeout. Some ffmpeg builds
@@ -91,8 +92,10 @@ def load_config(path: Path = None) -> dict:
     rtsp.setdefault("timeout_option_name", "stimeout")
     direct = rtsp.setdefault("direct", {})
     direct.setdefault("port", 554)
+    # One common username/password for every camera in direct mode.
     direct.setdefault("username", None)
     direct.setdefault("password", None)
+    direct.setdefault("channel", 1)
     # Bosch-style main-stream URL by default: single-sensor domes (the
     # 3000i/5000i FLEXIDOME line included) serve stream N at "/videoN" --
     # no NVR-style channel prefix, so {channel} is unused here but still

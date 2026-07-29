@@ -67,7 +67,16 @@ def matches_class_filter(data: dict, class_types, min_likelihood: float):
     """True if any detection in the payload is one of `class_types`
     (case-insensitive) at or above `min_likelihood`. Returns
     (matched: bool, class_text, likelihood) -- the latter two are the
-    best-matching detection's values (or None) for logging/audit."""
+    best-matching detection's values (or None) for logging/audit.
+
+    An empty/falsy `class_types` (config "event_filter.class_types": [])
+    disables the filter entirely -- every event matches, regardless of
+    what (if anything) it was classified as. Without this special case,
+    an empty list would mean the opposite of "no filtering": nothing
+    would ever be in the wanted set, so every event would be rejected.
+    """
+    if not class_types:
+        return True, None, None
     wanted = {c.strip().lower() for c in class_types}
     best = (False, None, None)
     for text, likelihood in _iter_detections(data):

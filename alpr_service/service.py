@@ -76,8 +76,12 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus) -> mqtt.Client:
                       f"class in {class_types} at likelihood>={min_likelihood} "
                       f"(topic {msg.topic})")
             return
-        log.info(f"({bay}) event matched class='{cls_text}' "
-                 f"likelihood={likelihood:.2f}")
+        if likelihood is None:
+            log.info(f"({bay}) event_filter disabled (empty class_types), "
+                     f"accepting event unconditionally")
+        else:
+            log.info(f"({bay}) event matched class='{cls_text}' "
+                     f"likelihood={likelihood:.2f}")
 
         queued_event = {
             "bay": bay,

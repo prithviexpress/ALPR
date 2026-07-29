@@ -64,6 +64,7 @@ class Worker(threading.Thread):
         self.center_distance_limit = alpr["center_distance_limit"]
         self.upper_half_fraction = alpr.get("upper_half_fraction", 0.45)
         self.troubleshooting = alpr.get("diagnostics_mode", "basic") == "troubleshooting"
+        self.publish_no_valid_plate = alpr.get("publish_no_valid_plate", False)
         self.expected_frame_width = alpr.get("expected_frame_width")
         self.expected_frame_height = alpr.get("expected_frame_height")
         self.frame_size_tolerance_pct = alpr.get("frame_size_tolerance_pct", 10)
@@ -212,10 +213,16 @@ class Worker(threading.Thread):
             json.dumps(result, indent=2, default=str))
         (folder / 'event.json').write_text(
             json.dumps(job, indent=2, default=str))
-        topic = f"{self.config['mqtt']['result_topic_prefix']}/{bay}"
-        self.publish(topic, json.dumps(result, default=str))
-        self.log.info(f"({bay}) {final or status} published to {topic} "
-                       f"({elapsed}s total, {len(reads)} reads)")
+
+        if status == 'NO_VALID_PLATE' and not self.publish_no_valid_plate:
+            self.log.info(f"({bay}) no valid plate found, result saved to "
+                           f"{folder} but not published ({elapsed}s total, "
+                           f"{len(reads)} reads)")
+        else:
+            topic = f"{self.config['mqtt']['result_topic_prefix']}/{bay}"
+            self.publish(topic, json.dumps(result, default=str))
+            self.log.info(f"({bay}) {final or status} published to {topic} "
+                           f"({elapsed}s total, {len(reads)} reads)")
 
     def collect(self, cam: dict, debug_dir=None):
         stats = {'first_fetch_ms': 0, 'avg_fetch_ms': 0.0, 'total_bytes': 0,

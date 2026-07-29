@@ -8,10 +8,28 @@ import time
 from .logging_setup import get_logger
 
 log = get_logger("QUEUE")
+mqtt_log = get_logger("MQTT")
+
+DEFAULT_TRIGGER_RULES = [{"rule": "LineDetector", "event": "Crossed"}]
 
 
-def extract_event(topic: str, payload: bytes):
-    """Map a raw MQTT message to a bay + its parsed VCA payload.
+def extract_event(topic: str, payload: bytes, bay_segment_index=1,
+                   rule_segment_index=4, event_segment_index=5,
+                   trigger_rules=None):
+    """Map a raw MQTT message to a bay + its parsed VCA payload -- but
+    only for topics whose rule/event segments match one of
+    `trigger_rules` (config.json "mqtt.trigger_rules", default just
+    LineDetector/Crossed). Every other topic on the subscribed wildcard
+    (e.g. other Genetec/Bosch rule types) is ignored, logged at DEBUG so
+    it's visible rather than silently dropped -- set
+    "logging.level": "DEBUG" (or "alpr.diagnostics_mode":
+    "troubleshooting") to see what else is coming through and add it to
+    trigger_rules if wanted.
+
+    Segment positions are configurable too (config.json "mqtt.
+    bay_segment_index"/"rule_segment_index"/"event_segment_index") in
+    case your topic layout differs from
+    "<prefix>/<bay>/.../<rule>/<event>".
 
     "data" is the full parsed JSON body (Genetec/Bosch-style, XML-derived:
     "@Attr" for attributes, "#text" for element text), e.g.:
@@ -24,14 +42,25 @@ def extract_event(topic: str, payload: bytes):
     treats that the same as "no detections", so it's discarded rather than
     raising further down the pipeline.
     """
+    if trigger_rules is None:
+        trigger_rules = DEFAULT_TRIGGER_RULES
     parts = topic.split('/')
-    if len(parts) < 6:
+    min_len = max(bay_segment_index, rule_segment_index, event_segment_index) + 1
+    if len(parts) < min_len:
+        mqtt_log.debug(f"ignored topic '{topic}': only {len(parts)} segments, "
+                        f"need at least {min_len}")
         return None
-    if parts[4] != 'LineDetector':
+
+    rule = parts[rule_segment_index]
+    event_type = parts[event_segment_index]
+    if not any(rule.lower() == r["rule"].lower()
+               and event_type.lower() == r["event"].lower()
+               for r in trigger_rules):
+        mqtt_log.debug(f"ignored topic '{topic}': rule='{rule}' event='{event_type}' "
+                        f"not in trigger_rules {trigger_rules}")
         return None
-    if parts[5] != 'Crossed':
-        return None
-    bay = parts[1]
+
+    bay = parts[bay_segment_index]
     try:
         data = json.loads(payload.decode())
     except Exception:

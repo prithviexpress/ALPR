@@ -48,6 +48,10 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus) -> mqtt.Client:
         client = mqtt.Client()
 
     trigger_topic = config["mqtt"]["subscribe_topic"]
+    bay_segment_index = config["mqtt"]["bay_segment_index"]
+    rule_segment_index = config["mqtt"]["rule_segment_index"]
+    event_segment_index = config["mqtt"]["event_segment_index"]
+    trigger_rules = config["mqtt"]["trigger_rules"]
     class_types = config["event_filter"]["class_types"]
     min_likelihood = config["event_filter"]["min_likelihood"]
 
@@ -59,7 +63,9 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus) -> mqtt.Client:
         log.warning("disconnected -- paho will auto-reconnect")
 
     def on_message(client, userdata, msg):
-        event = extract_event(msg.topic, msg.payload)
+        event = extract_event(msg.topic, msg.payload, bay_segment_index,
+                               rule_segment_index, event_segment_index,
+                               trigger_rules)
         if event is None:
             return
         bay = event["bay"]
@@ -126,6 +132,12 @@ def main():
     log.info(f"mqtt={config['mqtt']['host']}:{config['mqtt']['port']} "
               f"trigger='{config['mqtt']['subscribe_topic']}' "
               f"results='{config['mqtt']['result_topic_prefix']}/<bay>'")
+    log.info(f"mqtt topic segments: bay={config['mqtt']['bay_segment_index']} "
+              f"rule={config['mqtt']['rule_segment_index']} "
+              f"event={config['mqtt']['event_segment_index']} "
+              f"trigger_rules={config['mqtt']['trigger_rules']} "
+              f"(everything else on '{config['mqtt']['subscribe_topic']}' is "
+              f"ignored -- see DEBUG logs to check what else comes through)")
     log.info(f"event_filter: class_types={config['event_filter']['class_types']} "
               f"min_likelihood={config['event_filter']['min_likelihood']}")
 

@@ -44,6 +44,22 @@ def load_config(path: Path = None) -> dict:
 
     cfg.setdefault("model_path", "best.pt")
 
+    # Which MQTT topic segments carry the bay name and the rule/event
+    # that fired, and which rule/event combos actually trigger a
+    # collection. Topics are matched as "<...>/<bay>/.../<rule>/<event>";
+    # segment indices are 0-based. Default only accepts LineDetector/
+    # Crossed (as before) -- everything else on the subscribed wildcard
+    # is ignored and logged at DEBUG (see mqtt_bus.extract_event) rather
+    # than silently dropped, so you can see what other rule types your
+    # cameras actually send and add them here if wanted, e.g.:
+    #   "trigger_rules": [{"rule": "LineDetector", "event": "Crossed"},
+    #                      {"rule": "RuleEngine", "event": "Crossed"}]
+    mqtt = cfg["mqtt"]
+    mqtt.setdefault("bay_segment_index", 1)
+    mqtt.setdefault("rule_segment_index", 4)
+    mqtt.setdefault("event_segment_index", 5)
+    mqtt.setdefault("trigger_rules", [{"rule": "LineDetector", "event": "Crossed"}])
+
     # Incoming MQTT trigger events carry a VCA classification per detected
     # object (Data.Object.Object[].Appearance.Class.Type[]: "#text" is the
     # class name, "@Likelihood" its confidence, e.g. {"#text": "Vehicle",

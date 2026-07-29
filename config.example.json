@@ -1,0 +1,63 @@
+{
+  "_notes": {
+    "usage": "Copy this file to config.json and fill in real values. config.json is gitignored-by-convention and should never be committed (it holds credentials).",
+    "rtsp.mode": "'genetec' (default) pulls the feed through a Genetec media-gateway endpoint keyed by camera GUID, using the server/port/username/password below. 'direct' connects straight to the camera's own RTSP server via IP + credentials (see rtsp.direct). Override per camera in cameras.json with 'rtsp_mode'.",
+    "rtsp.stream": "Always the camera's primary/main stream (full resolution) -- OCR needs the detail a substream throws away. Per-camera override via cameras.json 'stream'.",
+    "alpr.expected_frame_width/height": "Set to your camera's real sensor resolution (e.g. a 5MP camera is commonly 2592x1944) to catch the RTSP URL accidentally pointing at a low-res substream. Leave both null to disable the check.",
+    "logging.level": "DEBUG for troubleshooting (verbose: per-box detection reasons, OCR fragments dropped below min_ocr_conf, RTSP URL/mode chosen). INFO for normal operation."
+  },
+
+  "mqtt": {
+    "host": "mqtt.example.local",
+    "port": 1883,
+    "username": "alpr_service",
+    "password": "CHANGE_ME",
+    "subscribe_topic": "site/+/LineDetector/Crossed",
+    "result_topic_prefix": "site/alpr/result"
+  },
+
+  "rtsp": {
+    "mode": "genetec",
+    "stream": 1,
+    "timeout_ms": 8000,
+    "timeout_option_name": "stimeout",
+
+    "server": "genetec-gateway.example.local",
+    "port": 554,
+    "username": "genetec_rtsp_user",
+    "password": "CHANGE_ME",
+    "path_suffix": "",
+
+    "direct": {
+      "port": 554,
+      "username": "camera_admin",
+      "password": "CHANGE_ME",
+      "url_template": "rtsp://{username}:{password}@{ip}:{port}/Streaming/Channels/{channel}0{stream}"
+    }
+  },
+
+  "alpr": {
+    "collection_timeout": 8,
+    "frame_skip": 3,
+    "max_raw_samples": 12,
+    "best_samples": 5,
+    "min_plate_width": 60,
+    "min_plate_height": 20,
+    "center_distance_limit": 400,
+    "cooldown_sec": 90,
+    "audit_retention_days": 14,
+    "debug_save_images": true,
+    "min_ocr_conf": 0.35,
+    "expected_frame_width": 2592,
+    "expected_frame_height": 1944,
+    "frame_size_tolerance_pct": 10
+  },
+
+  "logging": {
+    "level": "INFO",
+    "console": true,
+    "file": "logs/alpr_service.log",
+    "max_bytes": 10485760,
+    "backup_count": 5
+  }
+}

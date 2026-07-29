@@ -1,0 +1,20 @@
+{
+  "AR-FS": {
+    "guid": "01000000001babe00c81f7ff9",
+    "ip": "10.69.10.100",
+    "roi": [850, 250, 1750, 1800],
+    "enabled": true,
+    "rtsp_mode": "genetec"
+  },
+
+  "AR-DIRECT-EXAMPLE": {
+    "ip": "10.69.10.101",
+    "roi": [800, 300, 1700, 1750],
+    "enabled": false,
+    "rtsp_mode": "direct",
+    "username": "camera_admin",
+    "password": "CHANGE_ME",
+    "channel": 1,
+    "stream": 1
+  }
+}

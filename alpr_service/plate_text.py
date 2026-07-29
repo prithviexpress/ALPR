@@ -5,7 +5,11 @@ import re
 from collections import Counter, defaultdict
 
 PLATE_PATTERNS = [
-    re.compile(r'^[A-Z]{2}\d{2}[A-Z]{1,3}\d{4}$'),
+    # State(2 letters) + RTO code(1-2 digits, some states/eras drop the
+    # leading zero, e.g. Delhi "DL1LAJ8068") + series(0-3 letters, legacy
+    # plates from some states carry none at all, e.g. "HR842403") +
+    # number(4 digits).
+    re.compile(r'^[A-Z]{2}\d{1,2}[A-Z]{0,3}\d{4}$'),
     re.compile(r'^\d{2}BH\d{4}[A-Z]{1,2}$'),
 ]
 BH_PATTERN = PLATE_PATTERNS[1]
@@ -27,7 +31,12 @@ def is_valid(text):
 
 def fix_indian_plate(text):
     text = normalize(text)
-    if BH_PATTERN.fullmatch(text):
+    # Already matches a known format (standard or BH-series) -- leave it
+    # alone. The character-remapping below assumes a FIXED 2-digit RTO
+    # code position, which is wrong for a 1-digit-RTO plate (e.g.
+    # "DL1LAJ8068"): without this check it would "fix" the series' first
+    # letter into a digit, corrupting an already-correct read.
+    if is_valid(text):
         return text
     if len(text) < 8:
         return text

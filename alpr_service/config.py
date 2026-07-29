@@ -100,6 +100,15 @@ def load_config(path: Path = None) -> dict:
     # to 0 to disable the check entirely) -- otherwise correctly detected
     # plates get silently discarded as "upper_half" rejections.
     alpr.setdefault("upper_half_fraction", 0.45)
+    # Expand each detected box by this percent of its own width/height
+    # (each side) before cropping for OCR, clamped to the ROI's bounds.
+    # A YOLO box that's a little too narrow/short clips characters off
+    # the edge of the plate -- e.g. two adjacent, overlapping detections
+    # each only capturing half a plate ("HR47E" / "E4812" for what's
+    # actually "HR47E4812"). Padding gives OCR a small margin so a
+    # slightly-undersized box still captures the whole plate. Set to 0
+    # to disable.
+    alpr.setdefault("plate_crop_padding_pct", 15)
     # Expected sensor resolution (e.g. a 5MP camera -> 2592x1944). Leave
     # both null to disable the check. Used to catch a snapshot endpoint
     # unexpectedly serving a lower-res image than the camera's real sensor.

@@ -63,6 +63,7 @@ class Worker(threading.Thread):
         self.min_plate_height = alpr["min_plate_height"]
         self.center_distance_limit = alpr["center_distance_limit"]
         self.upper_half_fraction = alpr.get("upper_half_fraction", 0.45)
+        self.plate_crop_padding_pct = alpr.get("plate_crop_padding_pct", 15)
         self.troubleshooting = alpr.get("diagnostics_mode", "basic") == "troubleshooting"
         self.publish_no_valid_plate = alpr.get("publish_no_valid_plate", False)
         self.expected_frame_width = alpr.get("expected_frame_width")
@@ -345,7 +346,17 @@ class Worker(threading.Thread):
                                         (0, 0, 255), 1)
                         continue
 
-                    crop = roi[by1:by2, bx1:bx2]
+                    # Pad the crop beyond the detected box so a slightly
+                    # undersized box (common cause of a plate getting
+                    # clipped/split across two adjacent detections)
+                    # doesn't cut off a character at the edge.
+                    pad_x = int(w * self.plate_crop_padding_pct / 100)
+                    pad_y = int(h * self.plate_crop_padding_pct / 100)
+                    px1 = max(0, bx1 - pad_x)
+                    py1 = max(0, by1 - pad_y)
+                    px2 = min(roi.shape[1], bx2 + pad_x)
+                    py2 = min(roi.shape[0], by2 + pad_y)
+                    crop = roi[py1:py2, px1:px2]
                     if any(duplicate(crop, c['crop']) for c in cands):
                         rejected['duplicate'] += 1
                         if annotated is not None and self.troubleshooting:

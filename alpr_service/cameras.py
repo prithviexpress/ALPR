@@ -1,17 +1,16 @@
 """cameras.json loading and validation (the per-bay registry).
 
-Each entry is just {guid, ip, roi, enabled} -- no RTSP mode or credentials
-here. Whether guid (genetec) or ip (direct) is actually used, and what
-credentials go with it, is decided globally by config.json "rtsp" (see
-service.check_camera_rtsp_fields, which validates the active mode's
-required field is present on every camera at startup).
+Each entry is just {ip, roi, enabled} -- every camera is reached via its
+HTTP snapshot endpoint (config.json "snapshot"), using one common
+username/password for all cameras, so there's nothing camera-specific to
+store here beyond where it is and what to crop. A leftover "guid" key
+from an earlier Genetec-based setup is harmless and ignored.
 """
 import json
 from pathlib import Path
 
 TEMPLATE = {
     "AR-FS": {
-        "guid": "01000000001babe00c81f7ff9",
         "ip": "10.69.10.100",
         "roi": [850, 250, 1750, 1800],
         "enabled": True

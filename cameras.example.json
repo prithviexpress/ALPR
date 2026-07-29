@@ -1,15 +1,13 @@
 {
-  "_comment": "Every entry carries both 'guid' (used in rtsp.mode='genetec') and 'ip' (used in rtsp.mode='direct') so switching config.json's rtsp.mode repoints every camera without editing this file. Credentials for direct mode are NOT per-camera -- they're the one common username/password in config.json rtsp.direct.",
+  "_comment": "Every camera is reached via its HTTP snapshot endpoint (config.json 'snapshot'), so only 'ip' is needed here -- no guid, no per-camera credentials. The one common username/password lives in config.json snapshot.username/password.",
 
   "AR-FS": {
-    "guid": "01000000001babe00c81f7ff9",
     "ip": "10.69.10.100",
     "roi": [850, 250, 1750, 1800],
     "enabled": true
   },
 
   "AR-DOCK2": {
-    "guid": "01000000002cafe00d81f7abc",
     "ip": "10.69.10.101",
     "roi": [800, 300, 1700, 1750],
     "enabled": true

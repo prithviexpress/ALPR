@@ -14,6 +14,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import requests
 from ultralytics import YOLO
 from paddleocr import PaddleOCR
 
@@ -21,21 +22,20 @@ from .config import BASE_DIR
 from .image_ops import prep, sharpness, duplicate, save_debug_image, check_frame_size
 from .logging_setup import get_logger
 from .plate_text import is_valid, fix_indian_plate, weighted_vote
-from .rtsp import build_rtsp_url, open_capture, redact, RtspOpenError
+from .snapshot import build_snapshot_url, build_auth, fetch_snapshot, SnapshotError
 
 # Collection-stage error reasons mapped to a result-level status, so a
 # downstream consumer waiting on RESULT_TOPIC_PREFIX/<bay> can tell
 # "camera/stream problem" apart from a normal "no plate visible" miss --
 # in R2 both cases were reported as NO_VALID_PLATE.
 ERROR_STATUS = {
-    'rtsp_config_error': 'CAMERA_CONFIG_ERROR',
-    'rtsp_open_failed': 'CAMERA_UNREACHABLE',
+    'snapshot_config_error': 'CAMERA_CONFIG_ERROR',
     'no_frame_received': 'CAMERA_UNREACHABLE',
     'frame_size_mismatch': 'FRAME_SIZE_ERROR',
 }
 
-MAX_CONSECUTIVE_READ_FAILURES = 30
-READ_FAILURE_BACKOFF_SEC = 0.05
+MAX_CONSECUTIVE_FETCH_FAILURES = 10
+FETCH_FAILURE_BACKOFF_SEC = 0.2
 
 
 class Worker(threading.Thread):
@@ -51,11 +51,12 @@ class Worker(threading.Thread):
         self.audit_dir = audit_dir
         self.model = None
         self.ocr = None
+        self.session = None
+        self.auth = None
         self.log = get_logger(f"WORKER-{wid}")
 
         alpr = config["alpr"]
         self.collection_timeout = alpr["collection_timeout"]
-        self.frame_skip = alpr["frame_skip"]
         self.max_raw_samples = alpr["max_raw_samples"]
         self.best_samples = alpr["best_samples"]
         self.min_plate_width = alpr["min_plate_width"]
@@ -66,16 +67,23 @@ class Worker(threading.Thread):
         self.expected_frame_height = alpr.get("expected_frame_height")
         self.frame_size_tolerance_pct = alpr.get("frame_size_tolerance_pct", 10)
         self.min_ocr_conf = alpr.get("min_ocr_conf", 0.35)
-        self.rtsp_timeout_ms = config["rtsp"].get("timeout_ms", 8000)
-        self.rtsp_timeout_option = config["rtsp"].get("timeout_option_name", "stimeout")
-        self.rtsp_mode = config["rtsp"].get("mode")
-        self.rtsp_stream = config["rtsp"].get("stream")
+        snap_cfg = config["snapshot"]
+        self.connect_timeout_ms = snap_cfg.get("connect_timeout_ms", 3000)
+        self.read_timeout_ms = snap_cfg.get("read_timeout_ms", 3000)
+        self.poll_interval_ms = snap_cfg.get("poll_interval_ms", 0)
 
     def run(self):
         self.log.info("loading models...")
         t = time.time()
         self.model = YOLO(str(BASE_DIR / self.config["model_path"]))
         self.ocr = PaddleOCR(lang='en', use_angle_cls=False, show_log=False)
+        # One Session/HTTPDigestAuth per worker thread, reused across every
+        # job it handles: a Session keeps the TCP connection (and, for
+        # HTTPDigestAuth, the last nonce) alive across requests, so only
+        # the first snapshot fetch to a given camera pays for a fresh
+        # handshake -- not every single one.
+        self.session = requests.Session()
+        self.auth = build_auth(self.config)
         self.log.info(f"ready ({round(time.time() - t, 1)}s)")
 
         while True:
@@ -137,12 +145,13 @@ class Worker(threading.Thread):
         samples, cstats = self.collect(cam, debug_dir)
         self.log.info(
             f"({bay}) frames={cstats['frames_read']} "
-            f"evaluated={cstats['frames_evaluated']} "
             f"raw_cands={cstats['raw_candidates']} "
             f"kept={len(samples)} "
             f"rejected={cstats['rejected']} "
             f"in {cstats['collect_sec']}s "
-            f"(rtsp open {cstats['rtsp_open_ms']}ms)")
+            f"(first fetch {cstats['first_fetch_ms']}ms, "
+            f"avg fetch {cstats['avg_fetch_ms']}ms, "
+            f"{cstats['total_bytes'] // 1024}KB total)")
         if cstats.get('error'):
             self.log.error(f"({bay}) collection aborted: {cstats['error']}")
 
@@ -201,60 +210,57 @@ class Worker(threading.Thread):
                        f"({elapsed}s total, {len(reads)} reads)")
 
     def collect(self, cam: dict, debug_dir=None):
-        stats = {'rtsp_open_ms': 0, 'frames_read': 0,
-                  'frames_evaluated': 0, 'raw_candidates': 0,
+        stats = {'first_fetch_ms': 0, 'avg_fetch_ms': 0.0, 'total_bytes': 0,
+                  'frames_read': 0, 'raw_candidates': 0,
                   'rejected': {}, 'collect_sec': 0.0}
 
         try:
-            rtsp_url = build_rtsp_url(cam, self.config)
-        except RtspOpenError as e:
-            self.log.error(f"({cam.get('ip', cam.get('guid', '?'))}) "
-                            f"RTSP config error: {e}")
-            stats['error'] = 'rtsp_config_error'
+            url = build_snapshot_url(cam, self.config)
+        except SnapshotError as e:
+            self.log.error(f"({cam.get('ip', '?')}) snapshot config error: {e}")
+            stats['error'] = 'snapshot_config_error'
             return [], stats
 
-        self.log.debug(f"opening {redact(rtsp_url)} "
-                        f"(mode={self.rtsp_mode}, stream={self.rtsp_stream}, "
-                        f"timeout={self.rtsp_timeout_ms}ms)")
-        cap, open_ms = open_capture(rtsp_url, self.rtsp_timeout_ms,
-                                     self.rtsp_timeout_option)
-        stats['rtsp_open_ms'] = open_ms
-
-        if not cap.isOpened():
-            self.log.error(f"FAILED to open stream ({cam.get('ip', '?')}) "
-                            f"after {open_ms}ms")
-            cap.release()
-            stats['error'] = 'rtsp_open_failed'
-            return [], stats
-        self.log.info(f"stream open in {open_ms}ms ({cam.get('ip', '?')})")
+        self.log.debug(f"polling {url} "
+                        f"(connect_timeout={self.connect_timeout_ms}ms, "
+                        f"read_timeout={self.read_timeout_ms}ms)")
 
         cands = []
         rejected = Counter()
-        frame_no = 0
         first_saved = False
         annotated = None
         start = time.time()
-        consecutive_read_failures = 0
+        consecutive_failures = 0
+        fetch_ms_total = 0
 
         while time.time() - start < self.collection_timeout:
-            ok, frame = cap.read()
-            if not ok:
-                rejected['read_fail'] += 1
-                consecutive_read_failures += 1
-                if consecutive_read_failures >= MAX_CONSECUTIVE_READ_FAILURES:
+            try:
+                frame, fetch_ms, size_bytes = fetch_snapshot(
+                    self.session, url, self.auth,
+                    self.connect_timeout_ms, self.read_timeout_ms)
+            except SnapshotError as e:
+                rejected['fetch_fail'] += 1
+                consecutive_failures += 1
+                self.log.debug(f"({cam.get('ip', '?')}) snapshot fetch failed: {e}")
+                if consecutive_failures >= MAX_CONSECUTIVE_FETCH_FAILURES:
                     self.log.error(
-                        f"({cam.get('ip', '?')}) {consecutive_read_failures} "
-                        f"consecutive read failures, aborting collection")
+                        f"({cam.get('ip', '?')}) {consecutive_failures} "
+                        f"consecutive snapshot failures, aborting collection")
                     if not stats['frames_read']:
                         stats['error'] = 'no_frame_received'
                     break
-                time.sleep(READ_FAILURE_BACKOFF_SEC)
+                time.sleep(FETCH_FAILURE_BACKOFF_SEC)
                 continue
-            consecutive_read_failures = 0
+            consecutive_failures = 0
             stats['frames_read'] += 1
-            frame_no += 1
+            fetch_ms_total += fetch_ms
+            stats['total_bytes'] += size_bytes
+            self.log.debug(f"({cam.get('ip', '?')}) fetched frame "
+                            f"{stats['frames_read']} in {fetch_ms}ms "
+                            f"({size_bytes // 1024}KB)")
 
             if stats['frames_read'] == 1:
+                stats['first_fetch_ms'] = fetch_ms
                 ok_size, actual_w, actual_h = check_frame_size(
                     frame, self.expected_frame_width, self.expected_frame_height,
                     self.frame_size_tolerance_pct)
@@ -264,17 +270,11 @@ class Worker(threading.Thread):
                         f"({cam.get('ip', '?')}) frame size {actual_w}x{actual_h} "
                         f"does not match expected "
                         f"{self.expected_frame_width}x{self.expected_frame_height} "
-                        f"(tolerance {self.frame_size_tolerance_pct}%) -- check "
-                        f"RTSP stream selection (got a substream instead of the "
-                        f"main stream?)")
+                        f"(tolerance {self.frame_size_tolerance_pct}%)")
                     stats['error'] = 'frame_size_mismatch'
                     break
                 self.log.debug(f"({cam.get('ip', '?')}) frame size OK: "
                                 f"{actual_w}x{actual_h}")
-
-            if frame_no % self.frame_skip:
-                continue
-            stats['frames_evaluated'] += 1
 
             if self.debug_save_images and debug_dir and not first_saved:
                 save_debug_image(debug_dir, "00_first_frame.jpg", frame, self.log)
@@ -328,13 +328,17 @@ class Worker(threading.Thread):
             if len(cands) >= self.max_raw_samples:
                 break
 
-        cap.release()
+            if self.poll_interval_ms:
+                time.sleep(self.poll_interval_ms / 1000)
+
         if self.debug_save_images and debug_dir and annotated is not None:
             save_debug_image(debug_dir, "01_annotated_roi.jpg", annotated, self.log)
 
         stats['raw_candidates'] = len(cands)
         stats['rejected'] = dict(rejected)
         stats['collect_sec'] = round(time.time() - start, 1)
+        if stats['frames_read']:
+            stats['avg_fetch_ms'] = round(fetch_ms_total / stats['frames_read'], 1)
         cands.sort(key=lambda x: x['score'], reverse=True)
         return cands[:self.best_samples], stats
 

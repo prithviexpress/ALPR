@@ -16,23 +16,26 @@ QUEUE_MAX = 50
 AUDIT_DIR = BASE_DIR / "audit"
 CAMERAS_FILE = BASE_DIR / "cameras.json"
 
-# The field each rtsp.mode needs from every camera entry.
-_RTSP_MODE_REQUIRES = {"genetec": "guid", "direct": "ip"}
 
-
-def check_camera_rtsp_fields(cameras: dict, rtsp_mode: str, log):
-    """Fail fast at startup if rtsp.mode is set globally but some camera
-    is missing the field that mode needs, rather than discovering it one
-    RTSP_CONFIG_ERROR job at a time."""
-    required = _RTSP_MODE_REQUIRES.get(rtsp_mode)
-    if required is None:
-        log.error(f"unknown rtsp.mode '{rtsp_mode}' "
-                  f"(expected 'genetec' or 'direct')")
-        raise SystemExit(1)
-    missing = [bay for bay, cam in cameras.items() if not cam.get(required)]
+def check_camera_ip_fields(cameras: dict, log):
+    """Fail fast at startup if any camera is missing 'ip' -- every camera
+    is reached via its HTTP snapshot endpoint now, so this is required
+    for all of them, rather than discovering it one CAMERA_CONFIG_ERROR
+    job at a time."""
+    missing = [bay for bay, cam in cameras.items() if not cam.get("ip")]
     if missing:
-        log.error(f"rtsp.mode='{rtsp_mode}' requires '{required}' on every "
-                  f"camera, but it's missing for: {missing}")
+        log.error(f"snapshot capture requires 'ip' on every camera, but "
+                  f"it's missing for: {missing}")
+        raise SystemExit(1)
+
+
+def check_snapshot_credentials(config: dict, log):
+    """Fail fast at startup if snapshot.username/password aren't set --
+    every camera uses this one common credential pair."""
+    snap_cfg = config["snapshot"]
+    if snap_cfg.get("username") is None or snap_cfg.get("password") is None:
+        log.error("snapshot.username and snapshot.password must be set in "
+                  "config.json (one common set of credentials for every camera)")
         raise SystemExit(1)
 
 
@@ -116,18 +119,19 @@ def main():
     alpr = config["alpr"]
     log.info(f"workers={NUM_WORKERS} queue_max={QUEUE_MAX} "
               f"cooldown={alpr['cooldown_sec']}s "
-              f"collect_timeout={alpr['collection_timeout']}s "
-              f"frame_skip={alpr['frame_skip']}")
+              f"collect_timeout={alpr['collection_timeout']}s")
     log.info(f"samples: raw<={alpr['max_raw_samples']} best={alpr['best_samples']} "
               f"min_plate={alpr['min_plate_width']}x{alpr['min_plate_height']} "
               f"center_limit={alpr['center_distance_limit']}")
     log.info(f"debug_images={alpr['debug_save_images']} "
               f"audit_retention={alpr['audit_retention_days']}d "
               f"log_level={config['logging']['level']}")
-    log.info(f"rtsp: mode={config['rtsp']['mode']} stream={config['rtsp']['stream']} "
-              f"timeout={config['rtsp']['timeout_ms']}ms "
+    log.info(f"snapshot: url_template={config['snapshot']['url_template']} "
+              f"connect_timeout={config['snapshot']['connect_timeout_ms']}ms "
+              f"read_timeout={config['snapshot']['read_timeout_ms']}ms "
               f"expected_frame="
               f"{alpr['expected_frame_width']}x{alpr['expected_frame_height']}")
+    check_snapshot_credentials(config, log)
 
     try:
         cameras = load_cameras(CAMERAS_FILE)
@@ -138,9 +142,9 @@ def main():
     enabled = [b for b, c in cameras.items() if c.get('enabled', True)]
     log.info(f"Loaded {len(cameras)} cameras from {CAMERAS_FILE} "
               f"({len(enabled)} enabled: {enabled})")
-    check_camera_rtsp_fields(cameras, config['rtsp']['mode'], log)
+    check_camera_ip_fields(cameras, log)
     for bay, cam in cameras.items():
-        log.debug(f"camera '{bay}': guid={cam.get('guid')} ip={cam.get('ip')} "
+        log.debug(f"camera '{bay}': ip={cam.get('ip')} "
                   f"roi={cam.get('roi')} enabled={cam.get('enabled', True)}")
 
     AUDIT_DIR.mkdir(exist_ok=True)

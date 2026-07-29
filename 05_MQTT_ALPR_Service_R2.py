@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # 05_MQTT_ALPR_Service_R2.py -- entry point. Implementation now lives in
-# alpr_service/ (config, logging, cameras, rtsp, plate_text, image_ops,
+# alpr_service/ (config, logging, cameras, snapshot, plate_text, image_ops,
 # audit, mqtt_bus, worker, service), split so each concern can be edited
 # and tested independently instead of one 570-line file. This filename is
 # kept as-is so existing deployment/service configs that invoke
@@ -11,44 +11,45 @@
 #      level selectable via config.json "logging.level" (DEBUG/INFO/
 #      WARNING/ERROR) and an optional rotating log file -- no code change
 #      needed to get verbose troubleshooting output in the field.
-#   2. RTSP capture hardened: explicit connect/read socket timeout (R2 had
-#      none, so a dead camera could hang a worker thread indefinitely);
-#      cap.release() on open failure (R2 leaked the handle); read failures
-#      now back off and abort after 30 consecutive misses instead of
-#      busy-spinning for the full collection window.
-#   3. A camera/stream failure (RTSP unreachable, config error, or a wrong
-#      first-frame resolution) is now reported as a distinct MQTT status
-#      (CAMERA_UNREACHABLE / CAMERA_CONFIG_ERROR / FRAME_SIZE_ERROR)
-#      instead of being indistinguishable from a normal NO_VALID_PLATE
-#      miss. An unhandled worker exception now also publishes an ERROR
-#      result instead of silently dropping the job.
-#   4. First captured frame's resolution is checked against config
+#   2. Capture is now HTTP snapshot polling (a single GET to each camera's
+#      /snap.jpg per sample, HTTP Digest auth, config "snapshot") instead
+#      of RTSP/Genetec entirely -- Genetec support has been removed. This
+#      fits the trigger pattern here (trucks crawling in slowly, not fast
+#      drive-bys) without needing RTSP's much higher frame rate, and
+#      avoids the whole class of RTSP-stream-hang/leak failure modes.
+#      Every camera uses one common username/password (config "snapshot.
+#      username"/"password"); cameras.json only holds {ip, roi, enabled}.
+#      A worker keeps one requests.Session + HTTPDigestAuth for its
+#      lifetime so only the first fetch per camera pays for the digest
+#      handshake, not every one.
+#   3. A camera/config failure (snapshot endpoint unreachable, missing
+#      credentials, or a wrong first-frame resolution) is now reported as
+#      a distinct MQTT status (CAMERA_UNREACHABLE / CAMERA_CONFIG_ERROR /
+#      FRAME_SIZE_ERROR) instead of being indistinguishable from a normal
+#      NO_VALID_PLATE miss. An unhandled worker exception now also
+#      publishes an ERROR result instead of silently dropping the job.
+#   4. First fetched frame's resolution is checked against config
 #      "alpr.expected_frame_width/height" (e.g. a 5MP camera); a mismatch
-#      aborts the job as FRAME_SIZE_ERROR -- catches a misconfigured RTSP
-#      URL pointed at a low-res substream before wasting a collection
+#      aborts the job as FRAME_SIZE_ERROR before wasting a collection
 #      cycle on frames that could never hold a readable plate.
-#   5. RTSP source is now selectable via config "rtsp.mode": "genetec"
-#      (GUID via the Genetec media gateway, R1/R2 behavior) or "direct"
-#      (straight to each camera's own RTSP server via its IP, using one
-#      common username/password for all cameras in "rtsp.direct"). This
-#      is a single global switch, not per-camera -- cameras.json only
-#      holds {guid, ip, roi, enabled} per bay, so flipping rtsp.mode
-#      repoints every camera without editing cameras.json. Both modes
-#      always request the camera's primary/main stream (stream 1, full
-#      resolution), never a substream.
-#   6. Initial MQTT connect now retries with exponential backoff instead
+#   5. Initial MQTT connect now retries with exponential backoff instead
 #      of crashing the process if the broker isn't reachable yet at boot;
 #      SIGTERM (not just Ctrl+C/SIGINT) now triggers a clean shutdown.
-#   7. config.json/cameras.json/best.pt are resolved relative to this
+#   6. config.json/cameras.json/best.pt are resolved relative to this
 #      file's directory, not the process's current working directory.
-#   8. Incoming MQTT trigger events are now filtered by their VCA
+#   7. Incoming MQTT trigger events are now filtered by their VCA
 #      classification before anything else runs: only events with a
 #      detection (Data.Object.Object[].Appearance.Class.Type[]) matching
 #      config "event_filter.class_types" (default ["Vehicle"]) at or above
 #      "event_filter.min_likelihood" are queued for ALPR. Everything else
 #      (Person/Bicycle detections, low-confidence hits, events with no
-#      classified object) is discarded before it ever opens an RTSP stream
-#      -- R2 queued every line-crossing event regardless of what triggered it.
+#      classified object) is discarded before a single snapshot is
+#      fetched -- R2 queued every line-crossing event regardless of what
+#      triggered it.
+#
+# New dependency: the `requests` package (HTTP snapshot fetch + digest
+# auth) -- `pip install requests` on any machine that didn't already have
+# it for other reasons.
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 

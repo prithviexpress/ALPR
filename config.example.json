@@ -1,12 +1,11 @@
 {
   "_notes": {
     "usage": "Copy this file to config.json and fill in real values. config.json is gitignored-by-convention and should never be committed (it holds credentials).",
-    "rtsp.mode": "'genetec' (default) pulls the feed through a Genetec media-gateway endpoint keyed by camera GUID, using the server/port/username/password below. 'direct' connects straight to each camera's own RTSP server via its IP (from cameras.json) plus rtsp.direct's username/password -- one common set of credentials for ALL cameras, not per-camera. This is a single global switch for every camera; cameras.json has no per-camera 'rtsp_mode', so every camera entry should carry both 'guid' and 'ip' so either mode works without editing cameras.json.",
-    "rtsp.direct.url_template": "Default is Bosch-style (FLEXIDOME 3000i/5000i etc.): rtsp://user:pass@ip:554/video1 for the main stream, /video2 for the substream, /video3 if trip-streaming is enabled -- no NVR channel prefix, since these are single-sensor domes. Confirm on your specific unit's web UI under RTSP/streaming settings if plates don't OCR from the direct path.",
-    "rtsp.stream": "Always the camera's primary/main stream (full resolution) -- OCR needs the detail a substream throws away. Applies to every camera.",
-    "alpr.expected_frame_width/height": "Set to your camera's real sensor resolution (e.g. a 5MP camera is commonly 2592x1944) to catch the RTSP URL accidentally pointing at a low-res substream. Leave both null to disable the check.",
-    "logging.level": "DEBUG for troubleshooting (verbose: per-box detection reasons, OCR fragments dropped below min_ocr_conf, RTSP URL/mode chosen). INFO for normal operation.",
-    "event_filter": "Trigger events carry a VCA classification per detected object, e.g. Data.Object.Object.Appearance.Class.Type = {\"#text\": \"Vehicle\", \"@Likelihood\": 0.91}. Only events with a detection matching one of class_types (case-insensitive) at or above min_likelihood are queued for ALPR -- everything else (Person/Bicycle detections, low-confidence hits, events with no classified object) is discarded before opening an RTSP stream. Tune min_likelihood against the values your camera actually reports (0.91 in the sample payload this was built from)."
+    "snapshot": "Every camera is pulled via a single HTTP GET to its snapshot endpoint (e.g. a Bosch dome's /snap.jpg), authenticated with HTTP Digest, using one common username/password for ALL cameras -- there's no per-camera override and no RTSP/Genetec path anymore (removed in favor of this). During a collection window the service polls this endpoint repeatedly (as fast as the HTTP round trip allows, or paced by poll_interval_ms) instead of decoding a continuous video stream. Chosen because trigger events here are trucks crawling in slowly, not fast drive-bys, so RTSP's much higher frame rate wasn't needed to catch a good shot.",
+    "snapshot.url_template": "Default matches a Bosch FLEXIDOME 3000i/5000i's snapshot path: http://ip:80/snap.jpg. Confirm on your specific unit's web UI under RTSP/streaming (or HTTP) settings if snapshots fail or come back low-res.",
+    "alpr.expected_frame_width/height": "Set to your camera's real sensor resolution (e.g. a 5MP camera is commonly 2592x1944) to catch the snapshot endpoint unexpectedly serving a lower-res image than the camera's actual sensor. Leave both null to disable the check.",
+    "logging.level": "DEBUG for troubleshooting (verbose: per-box detection reasons, OCR fragments dropped below min_ocr_conf, every snapshot fetch's timing/size). INFO for normal operation.",
+    "event_filter": "Trigger events carry a VCA classification per detected object, e.g. Data.Object.Object.Appearance.Class.Type = {\"#text\": \"Vehicle\", \"@Likelihood\": 0.91}. Only events with a detection matching one of class_types (case-insensitive) at or above min_likelihood are queued for ALPR -- everything else (Person/Bicycle detections, low-confidence hits, events with no classified object) is discarded before a single snapshot is fetched. Tune min_likelihood against the values your camera actually reports (0.91 in the sample payload this was built from)."
   },
 
   "mqtt": {
@@ -23,29 +22,18 @@
     "min_likelihood": 0.7
   },
 
-  "rtsp": {
-    "mode": "genetec",
-    "stream": 1,
-    "timeout_ms": 8000,
-    "timeout_option_name": "stimeout",
-
-    "server": "genetec-gateway.example.local",
-    "port": 554,
-    "username": "genetec_rtsp_user",
+  "snapshot": {
+    "url_template": "http://{ip}:{port}/snap.jpg",
+    "port": 80,
+    "username": "camera_admin",
     "password": "CHANGE_ME",
-    "path_suffix": "",
-
-    "direct": {
-      "port": 554,
-      "username": "camera_admin",
-      "password": "CHANGE_ME",
-      "url_template": "rtsp://{username}:{password}@{ip}:{port}/video{stream}"
-    }
+    "connect_timeout_ms": 3000,
+    "read_timeout_ms": 3000,
+    "poll_interval_ms": 0
   },
 
   "alpr": {
     "collection_timeout": 8,
-    "frame_skip": 3,
     "max_raw_samples": 12,
     "best_samples": 5,
     "min_plate_width": 60,

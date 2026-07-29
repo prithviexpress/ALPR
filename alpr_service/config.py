@@ -1,7 +1,7 @@
 """Load and validate config.json, filling in defaults for optional keys.
 
 Everything that used to be a module-level constant in the monolithic
-script (cooldown, audit retention, RTSP timeouts, debug image toggle,
+script (cooldown, audit retention, snapshot timeouts, debug image toggle,
 expected frame size, log level, ...) is a config key now, so ops can
 retune the service without a code change/redeploy.
 """
@@ -14,7 +14,7 @@ DEFAULT_CONFIG_PATH = BASE_DIR / "config.json"
 
 REQUIRED_KEYS = {
     "mqtt": ["host", "port", "subscribe_topic", "result_topic_prefix"],
-    "alpr": ["collection_timeout", "frame_skip", "max_raw_samples",
+    "alpr": ["collection_timeout", "max_raw_samples",
              "best_samples", "min_plate_width", "min_plate_height",
              "center_distance_limit"],
 }
@@ -29,7 +29,7 @@ def load_config(path: Path = None) -> dict:
     if not path.exists():
         raise ConfigError(
             f"Config file not found: {path}. Copy config.example.json to "
-            f"{path.name} and fill in your MQTT/RTSP/camera details.")
+            f"{path.name} and fill in your MQTT/snapshot/camera details.")
     try:
         cfg = json.loads(path.read_text())
     except json.JSONDecodeError as e:
@@ -50,8 +50,8 @@ def load_config(path: Path = None) -> dict:
     # "@Likelihood": 0.91}). Only events with a detection matching one of
     # class_types at or above min_likelihood get queued for ALPR; anything
     # else (Person/Bicycle detections, low-confidence hits, events with no
-    # classified object at all) is discarded before it ever opens an RTSP
-    # stream. Comparison is case-insensitive.
+    # classified object at all) is discarded before a single snapshot is
+    # fetched. Comparison is case-insensitive.
     event_filter = cfg.setdefault("event_filter", {})
     class_types = event_filter.get("class_types", ["Vehicle"])
     if isinstance(class_types, str):
@@ -65,46 +65,26 @@ def load_config(path: Path = None) -> dict:
     alpr.setdefault("debug_save_images", True)
     alpr.setdefault("min_ocr_conf", 0.35)
     # Expected sensor resolution (e.g. a 5MP camera -> 2592x1944). Leave
-    # both null to disable the check. Used to catch a mis-selected RTSP
-    # stream (e.g. accidentally pointed at a low-res substream).
+    # both null to disable the check. Used to catch a snapshot endpoint
+    # unexpectedly serving a lower-res image than the camera's real sensor.
     alpr.setdefault("expected_frame_width", None)
     alpr.setdefault("expected_frame_height", None)
     alpr.setdefault("frame_size_tolerance_pct", 10)
 
-    rtsp = cfg.setdefault("rtsp", {})
-    # "genetec": pull the feed through a Genetec media-gateway endpoint
-    #            keyed by camera GUID (server/port/username/password below,
-    #            same fields as R1/R2).
-    # "direct":  connect straight to each camera's own RTSP server using its
-    #            IP (from cameras.json) plus one common username/password
-    #            for all cameras (rtsp.direct below), bypassing Genetec.
-    # Applies to every camera -- there is no per-camera override. cameras.json
-    # only carries guid/ip/roi/enabled, so every entry has both a guid and an
-    # ip and flipping this one setting repoints all cameras at once.
-    rtsp.setdefault("mode", "genetec")
-    # Always the camera's primary/main stream (full resolution) -- OCR
-    # needs the detail a substream throws away. Applies to every camera.
-    rtsp.setdefault("stream", 1)
-    rtsp.setdefault("timeout_ms", 8000)
-    # ffmpeg RTSP option name for the socket timeout. Some ffmpeg builds
-    # use "stimeout" (older), others "timeout" (newer libavformat) --
-    # override here if your build needs the other name.
-    rtsp.setdefault("timeout_option_name", "stimeout")
-    direct = rtsp.setdefault("direct", {})
-    direct.setdefault("port", 554)
-    # One common username/password for every camera in direct mode.
-    direct.setdefault("username", None)
-    direct.setdefault("password", None)
-    direct.setdefault("channel", 1)
-    # Bosch-style main-stream URL by default: single-sensor domes (the
-    # 3000i/5000i FLEXIDOME line included) serve stream N at "/videoN" --
-    # no NVR-style channel prefix, so {channel} is unused here but still
-    # passed through for templates that do need it. Override per camera
-    # vendor, e.g. Hikvision: ".../Streaming/Channels/{channel}0{stream}",
-    # Dahua: ".../cam/realmonitor?channel={channel}&subtype=0"
-    direct.setdefault(
-        "url_template",
-        "rtsp://{username}:{password}@{ip}:{port}/video{stream}")
+    # Every camera is polled via its HTTP snapshot endpoint (e.g. a Bosch
+    # dome's /snap.jpg) using one common username/password for all
+    # cameras -- there is no per-camera override, and no RTSP/Genetec path
+    # (removed entirely in favor of this).
+    snapshot = cfg.setdefault("snapshot", {})
+    snapshot.setdefault("url_template", "http://{ip}:{port}/snap.jpg")
+    snapshot.setdefault("port", 80)
+    snapshot.setdefault("username", None)
+    snapshot.setdefault("password", None)
+    snapshot.setdefault("connect_timeout_ms", 3000)
+    snapshot.setdefault("read_timeout_ms", 3000)
+    # Optional pacing between fetches within one collection window; 0 =
+    # fetch as fast as the HTTP round trip allows.
+    snapshot.setdefault("poll_interval_ms", 0)
 
     log_cfg = cfg.setdefault("logging", {})
     log_cfg.setdefault("level", "INFO")  # DEBUG / INFO / WARNING / ERROR

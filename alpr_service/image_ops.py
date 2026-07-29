@@ -49,10 +49,10 @@ def check_frame_size(frame, expected_width, expected_height, tolerance_pct):
     Returns (ok, actual_w, actual_h). If expected_width/height are not
     configured, the check is disabled and this always reports ok=True.
 
-    This exists to catch the RTSP stream silently pointing at the wrong
-    source -- most commonly a low-res substream instead of the camera's
-    main stream -- before wasting a whole collection cycle running YOLO
-    and OCR against frames that can never hold a readable plate.
+    This exists to catch the snapshot endpoint silently serving a lower
+    resolution than the camera's real sensor -- before wasting a whole
+    collection cycle running YOLO and OCR against frames that can never
+    hold a readable plate.
     """
     if not expected_width or not expected_height:
         return True, frame.shape[1], frame.shape[0]

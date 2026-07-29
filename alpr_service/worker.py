@@ -191,7 +191,13 @@ class Worker(threading.Thread):
 
         status = ERROR_STATUS.get(cstats.get('error'))
         if status is None:
-            status = 'SUCCESS' if final else 'NO_VALID_PLATE'
+            # weighted_vote() falls back to voting among invalid reads
+            # when nothing valid exists (a best-effort guess, e.g. OCR
+            # fragments like "4551" or "SEDRAD" that never matched a
+            # plate pattern) -- that vote must not count as SUCCESS just
+            # because it's non-empty, or garbage gets published as a
+            # "read" plate.
+            status = 'SUCCESS' if final and is_valid(final) else 'NO_VALID_PLATE'
 
         result = {
             'bay': bay,

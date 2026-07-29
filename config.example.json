@@ -4,7 +4,8 @@
     "snapshot": "Every camera is pulled via a single HTTP GET to its snapshot endpoint (e.g. a Bosch dome's /snap.jpg), authenticated with HTTP Digest, using one common username/password for ALL cameras -- there's no per-camera override and no RTSP/Genetec path anymore (removed in favor of this). During a collection window the service polls this endpoint repeatedly (as fast as the HTTP round trip allows, or paced by poll_interval_ms) instead of decoding a continuous video stream. Chosen because trigger events here are trucks crawling in slowly, not fast drive-bys, so RTSP's much higher frame rate wasn't needed to catch a good shot.",
     "snapshot.url_template": "Default matches a Bosch FLEXIDOME 3000i/5000i's snapshot path: http://ip:80/snap.jpg. Confirm on your specific unit's web UI under RTSP/streaming (or HTTP) settings if snapshots fail or come back low-res.",
     "alpr.expected_frame_width/height": "Set to your camera's real sensor resolution (e.g. a 5MP camera is commonly 2592x1944) to catch the snapshot endpoint unexpectedly serving a lower-res image than the camera's actual sensor. Leave both null to disable the check.",
-    "logging.level": "DEBUG for troubleshooting (verbose: per-box detection reasons, OCR fragments dropped below min_ocr_conf, every snapshot fetch's timing/size). INFO for normal operation.",
+    "logging.level": "Text log verbosity: DEBUG / INFO / WARNING / ERROR. Independent of alpr.diagnostics_mode below, but diagnostics_mode='troubleshooting' forces this to DEBUG regardless of what's set here.",
+    "alpr.diagnostics_mode": "'basic' (default): saves the first fetched frame + its ROI crop, the selected plate crops, and the OCR-prep images -- fine for normal operation. 'troubleshooting': all of that PLUS every fetched frame (full image and ROI), the ROI annotated with every box the model returned (green=kept, red=rejected-by-size/position, orange=rejected-as-duplicate, with the rejection reason labeled), and every raw candidate crop saved the instant it's found rather than just the final best_samples -- and forces logging to DEBUG. Use this to see WHY, e.g., raw_cands stays at 0 (wrong ROI vs. camera framing? model detecting nothing at all vs. detecting boxes but all getting filtered out?). Generates a lot more files per event -- meant to be turned on temporarily while diagnosing, then switched back to 'basic'.",
     "event_filter": "Trigger events carry a VCA classification per detected object, e.g. Data.Object.Object.Appearance.Class.Type = {\"#text\": \"Vehicle\", \"@Likelihood\": 0.91}. Only events with a detection matching one of class_types (case-insensitive) at or above min_likelihood are queued for ALPR -- everything else (Person/Bicycle detections, low-confidence hits, events with no classified object) is discarded before a single snapshot is fetched. Tune min_likelihood against the values your camera actually reports (0.91 in the sample payload this was built from)."
   },
 
@@ -41,7 +42,7 @@
     "center_distance_limit": 400,
     "cooldown_sec": 90,
     "audit_retention_days": 14,
-    "debug_save_images": true,
+    "diagnostics_mode": "basic",
     "min_ocr_conf": 0.35,
     "expected_frame_width": 2592,
     "expected_frame_height": 1944,

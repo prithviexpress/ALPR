@@ -62,7 +62,19 @@ def load_config(path: Path = None) -> dict:
     alpr = cfg["alpr"]
     alpr.setdefault("cooldown_sec", 90)
     alpr.setdefault("audit_retention_days", 14)
-    alpr.setdefault("debug_save_images", True)
+    # "basic": save the first fetched frame + its ROI crop, the selected
+    #          plate crops, and the OCR-prep images (as before). Fine for
+    #          normal operation.
+    # "troubleshooting": all of the above, PLUS every fetched frame (full
+    #          image and ROI, the ROI annotated with every box the model
+    #          returned -- green=kept, red/orange=rejected with reason)
+    #          and every raw candidate crop saved the moment it's found,
+    #          not just the final best_samples. Also forces the log level
+    #          to DEBUG regardless of "logging.level". Generates
+    #          noticeably more files/log volume -- meant to be turned on
+    #          only while actively diagnosing an issue (e.g. raw_cands
+    #          staying at 0), then switched back to "basic".
+    alpr.setdefault("diagnostics_mode", "basic")
     alpr.setdefault("min_ocr_conf", 0.35)
     # Expected sensor resolution (e.g. a 5MP camera -> 2592x1944). Leave
     # both null to disable the check. Used to catch a snapshot endpoint

@@ -105,7 +105,16 @@ def main():
         print(f"[SETUP] FATAL: {e}", flush=True)
         raise SystemExit(1)
 
-    configure_logging(config["logging"])
+    alpr = config["alpr"]
+    troubleshooting = alpr["diagnostics_mode"] == "troubleshooting"
+    # diagnostics_mode is a one-variable shortcut: "troubleshooting" forces
+    # verbose logging regardless of logging.level, so switching one setting
+    # gets both the extra debug images (see worker.py) and the logs to
+    # explain them, without also having to remember to bump logging.level.
+    log_cfg = dict(config["logging"])
+    if troubleshooting:
+        log_cfg["level"] = "DEBUG"
+    configure_logging(log_cfg)
     log = get_logger("SETUP")
 
     log.info("=" * 60)
@@ -116,16 +125,16 @@ def main():
     log.info(f"event_filter: class_types={config['event_filter']['class_types']} "
               f"min_likelihood={config['event_filter']['min_likelihood']}")
 
-    alpr = config["alpr"]
     log.info(f"workers={NUM_WORKERS} queue_max={QUEUE_MAX} "
               f"cooldown={alpr['cooldown_sec']}s "
               f"collect_timeout={alpr['collection_timeout']}s")
     log.info(f"samples: raw<={alpr['max_raw_samples']} best={alpr['best_samples']} "
               f"min_plate={alpr['min_plate_width']}x{alpr['min_plate_height']} "
               f"center_limit={alpr['center_distance_limit']}")
-    log.info(f"debug_images={alpr['debug_save_images']} "
+    log.info(f"diagnostics_mode={alpr['diagnostics_mode']} "
               f"audit_retention={alpr['audit_retention_days']}d "
-              f"log_level={config['logging']['level']}")
+              f"log_level={log_cfg['level']}"
+              + (" (forced DEBUG by diagnostics_mode)" if troubleshooting else ""))
     log.info(f"snapshot: url_template={config['snapshot']['url_template']} "
               f"connect_timeout={config['snapshot']['connect_timeout_ms']}ms "
               f"read_timeout={config['snapshot']['read_timeout_ms']}ms "

@@ -62,6 +62,7 @@ class Worker(threading.Thread):
         self.min_plate_width = alpr["min_plate_width"]
         self.min_plate_height = alpr["min_plate_height"]
         self.center_distance_limit = alpr["center_distance_limit"]
+        self.upper_half_fraction = alpr.get("upper_half_fraction", 0.45)
         self.troubleshooting = alpr.get("diagnostics_mode", "basic") == "troubleshooting"
         self.expected_frame_width = alpr.get("expected_frame_width")
         self.expected_frame_height = alpr.get("expected_frame_height")
@@ -314,7 +315,7 @@ class Worker(threading.Thread):
                     reason = None
                     if w < self.min_plate_width or h < self.min_plate_height:
                         reason = 'too_small'
-                    elif ((by1 + by2) / 2) < roi.shape[0] * 0.45:
+                    elif ((by1 + by2) / 2) < roi.shape[0] * self.upper_half_fraction:
                         reason = 'upper_half'
                     else:
                         dist = abs((bx1 + bx2) / 2 - center)

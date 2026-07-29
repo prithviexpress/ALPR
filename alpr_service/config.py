@@ -76,6 +76,14 @@ def load_config(path: Path = None) -> dict:
     #          staying at 0), then switched back to "basic".
     alpr.setdefault("diagnostics_mode", "basic")
     alpr.setdefault("min_ocr_conf", 0.35)
+    # Reject a detected box if its vertical center sits above this
+    # fraction of the ROI's height (0.45 = top 45%) -- meant to filter
+    # out false positives from cab signage/mounting structure above the
+    # real plate. Tune per camera angle: a mounting position where the
+    # plate legitimately sits high in the ROI needs this lowered (or set
+    # to 0 to disable the check entirely) -- otherwise correctly detected
+    # plates get silently discarded as "upper_half" rejections.
+    alpr.setdefault("upper_half_fraction", 0.45)
     # Expected sensor resolution (e.g. a 5MP camera -> 2592x1944). Leave
     # both null to disable the check. Used to catch a snapshot endpoint
     # unexpectedly serving a lower-res image than the camera's real sensor.

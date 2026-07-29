@@ -2,6 +2,7 @@
   "_notes": {
     "usage": "Copy this file to config.json and fill in real values. config.json is gitignored-by-convention and should never be committed (it holds credentials).",
     "rtsp.mode": "'genetec' (default) pulls the feed through a Genetec media-gateway endpoint keyed by camera GUID, using the server/port/username/password below. 'direct' connects straight to the camera's own RTSP server via IP + credentials (see rtsp.direct). Override per camera in cameras.json with 'rtsp_mode'.",
+    "rtsp.direct.url_template": "Default is Bosch-style (FLEXIDOME 3000i/5000i etc.): rtsp://user:pass@ip:554/video1 for the main stream, /video2 for the substream, /video3 if trip-streaming is enabled -- no NVR channel prefix, since these are single-sensor domes. Confirm on your specific unit's web UI under RTSP/streaming settings if plates don't OCR from the direct path.",
     "rtsp.stream": "Always the camera's primary/main stream (full resolution) -- OCR needs the detail a substream throws away. Per-camera override via cameras.json 'stream'.",
     "alpr.expected_frame_width/height": "Set to your camera's real sensor resolution (e.g. a 5MP camera is commonly 2592x1944) to catch the RTSP URL accidentally pointing at a low-res substream. Leave both null to disable the check.",
     "logging.level": "DEBUG for troubleshooting (verbose: per-box detection reasons, OCR fragments dropped below min_ocr_conf, RTSP URL/mode chosen). INFO for normal operation."
@@ -32,7 +33,7 @@
       "port": 554,
       "username": "camera_admin",
       "password": "CHANGE_ME",
-      "url_template": "rtsp://{username}:{password}@{ip}:{port}/Streaming/Channels/{channel}0{stream}"
+      "url_template": "rtsp://{username}:{password}@{ip}:{port}/video{stream}"
     }
   },
 

@@ -78,12 +78,15 @@ def load_config(path: Path = None) -> dict:
     direct.setdefault("port", 554)
     direct.setdefault("username", None)
     direct.setdefault("password", None)
-    # Hikvision-style main-stream URL by default (channel 1, stream 1 ->
-    # ".../Channels/101"). Override per camera vendor, e.g. Dahua:
-    # "rtsp://{username}:{password}@{ip}:{port}/cam/realmonitor?channel={channel}&subtype=0"
+    # Bosch-style main-stream URL by default: single-sensor domes (the
+    # 3000i/5000i FLEXIDOME line included) serve stream N at "/videoN" --
+    # no NVR-style channel prefix, so {channel} is unused here but still
+    # passed through for templates that do need it. Override per camera
+    # vendor, e.g. Hikvision: ".../Streaming/Channels/{channel}0{stream}",
+    # Dahua: ".../cam/realmonitor?channel={channel}&subtype=0"
     direct.setdefault(
         "url_template",
-        "rtsp://{username}:{password}@{ip}:{port}/Streaming/Channels/{channel}0{stream}")
+        "rtsp://{username}:{password}@{ip}:{port}/video{stream}")
 
     log_cfg = cfg.setdefault("logging", {})
     log_cfg.setdefault("level", "INFO")  # DEBUG / INFO / WARNING / ERROR

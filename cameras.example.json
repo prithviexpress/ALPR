@@ -8,13 +8,13 @@
   },
 
   "AR-DIRECT-EXAMPLE": {
+    "_comment": "Bosch FLEXIDOME 3000i dome, connected directly (bypassing Genetec). Builds rtsp://camera_admin:...@10.69.10.101:554/video1 via config.json rtsp.direct.url_template.",
     "ip": "10.69.10.101",
     "roi": [800, 300, 1700, 1750],
     "enabled": false,
     "rtsp_mode": "direct",
     "username": "camera_admin",
     "password": "CHANGE_ME",
-    "channel": 1,
     "stream": 1
   }
 }

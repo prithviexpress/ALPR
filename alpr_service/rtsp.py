@@ -13,8 +13,8 @@ resolution) -- OCR needs the detail a substream throws away:
 
   - "direct" mode builds the URL from a template with a {stream} placeholder
     that defaults to 1 (see config.json "rtsp.direct.url_template"; the
-    stock template is Hikvision-style "Channels/101" = channel 1, stream 1
-    -- adjust the template for other camera vendors).
+    stock template is Bosch-style "/video1" -- adjust the template for
+    other camera vendors, e.g. Hikvision "Streaming/Channels/{channel}0{stream}").
   - "genetec" mode's gateway endpoint (".../<guid>/live") already serves a
     single, pre-selected stream per GUID in the deployments this was built
     against. If your Genetec gateway exposes multiple streams behind that

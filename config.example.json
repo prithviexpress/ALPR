@@ -5,7 +5,8 @@
     "rtsp.direct.url_template": "Default is Bosch-style (FLEXIDOME 3000i/5000i etc.): rtsp://user:pass@ip:554/video1 for the main stream, /video2 for the substream, /video3 if trip-streaming is enabled -- no NVR channel prefix, since these are single-sensor domes. Confirm on your specific unit's web UI under RTSP/streaming settings if plates don't OCR from the direct path.",
     "rtsp.stream": "Always the camera's primary/main stream (full resolution) -- OCR needs the detail a substream throws away. Per-camera override via cameras.json 'stream'.",
     "alpr.expected_frame_width/height": "Set to your camera's real sensor resolution (e.g. a 5MP camera is commonly 2592x1944) to catch the RTSP URL accidentally pointing at a low-res substream. Leave both null to disable the check.",
-    "logging.level": "DEBUG for troubleshooting (verbose: per-box detection reasons, OCR fragments dropped below min_ocr_conf, RTSP URL/mode chosen). INFO for normal operation."
+    "logging.level": "DEBUG for troubleshooting (verbose: per-box detection reasons, OCR fragments dropped below min_ocr_conf, RTSP URL/mode chosen). INFO for normal operation.",
+    "event_filter": "Trigger events carry a VCA classification per detected object, e.g. Data.Object.Object.Appearance.Class.Type = {\"#text\": \"Vehicle\", \"@Likelihood\": 0.91}. Only events with a detection matching one of class_types (case-insensitive) at or above min_likelihood are queued for ALPR -- everything else (Person/Bicycle detections, low-confidence hits, events with no classified object) is discarded before opening an RTSP stream. Tune min_likelihood against the values your camera actually reports (0.91 in the sample payload this was built from)."
   },
 
   "mqtt": {
@@ -15,6 +16,11 @@
     "password": "CHANGE_ME",
     "subscribe_topic": "site/+/LineDetector/Crossed",
     "result_topic_prefix": "site/alpr/result"
+  },
+
+  "event_filter": {
+    "class_types": ["Vehicle"],
+    "min_likelihood": 0.7
   },
 
   "rtsp": {

@@ -8,7 +8,7 @@ from .audit import prune_audit
 from .cameras import CamerasError, load_cameras
 from .config import BASE_DIR, ConfigError, load_config
 from .logging_setup import configure_logging, get_logger
-from .mqtt_bus import JobBus, connect_with_retry, extract_event
+from .mqtt_bus import JobBus, connect_with_retry, extract_event, matches_class_filter
 from .worker import Worker
 
 NUM_WORKERS = 3     # ~= max concurrent dockings; ~2GB RAM each
@@ -26,6 +26,8 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus) -> mqtt.Client:
         client = mqtt.Client()
 
     trigger_topic = config["mqtt"]["subscribe_topic"]
+    class_types = config["event_filter"]["class_types"]
+    min_likelihood = config["event_filter"]["min_likelihood"]
 
     def on_connect(client, userdata, flags, rc, *args):
         log.info(f"connected rc={rc}, subscribing {trigger_topic}")
@@ -44,7 +46,24 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus) -> mqtt.Client:
             return
         if not cameras[bay].get("enabled", True):
             return
-        if bus.try_enqueue(event):
+
+        matched, cls_text, likelihood = matches_class_filter(
+            event["data"], class_types, min_likelihood)
+        if not matched:
+            log.debug(f"({bay}) event discarded: no detection matching "
+                      f"class in {class_types} at likelihood>={min_likelihood} "
+                      f"(topic {msg.topic})")
+            return
+        log.info(f"({bay}) event matched class='{cls_text}' "
+                 f"likelihood={likelihood:.2f}")
+
+        queued_event = {
+            "bay": bay,
+            "event_time": event["event_time"],
+            "detected_class": cls_text,
+            "detected_likelihood": likelihood,
+        }
+        if bus.try_enqueue(queued_event):
             log.info(f"({bay}) event queued for processing")
 
     client.on_connect = on_connect
@@ -72,6 +91,8 @@ def main():
     log.info(f"mqtt={config['mqtt']['host']}:{config['mqtt']['port']} "
               f"trigger='{config['mqtt']['subscribe_topic']}' "
               f"results='{config['mqtt']['result_topic_prefix']}/<bay>'")
+    log.info(f"event_filter: class_types={config['event_filter']['class_types']} "
+              f"min_likelihood={config['event_filter']['min_likelihood']}")
 
     alpr = config["alpr"]
     log.info(f"workers={NUM_WORKERS} queue_max={QUEUE_MAX} "

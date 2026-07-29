@@ -38,6 +38,14 @@
 #      SIGTERM (not just Ctrl+C/SIGINT) now triggers a clean shutdown.
 #   7. config.json/cameras.json/best.pt are resolved relative to this
 #      file's directory, not the process's current working directory.
+#   8. Incoming MQTT trigger events are now filtered by their VCA
+#      classification before anything else runs: only events with a
+#      detection (Data.Object.Object[].Appearance.Class.Type[]) matching
+#      config "event_filter.class_types" (default ["Vehicle"]) at or above
+#      "event_filter.min_likelihood" are queued for ALPR. Everything else
+#      (Person/Bicycle detections, low-confidence hits, events with no
+#      classified object) is discarded before it ever opens an RTSP stream
+#      -- R2 queued every line-crossing event regardless of what triggered it.
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 

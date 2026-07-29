@@ -44,6 +44,21 @@ def load_config(path: Path = None) -> dict:
 
     cfg.setdefault("model_path", "best.pt")
 
+    # Incoming MQTT trigger events carry a VCA classification per detected
+    # object (Data.Object.Object[].Appearance.Class.Type[]: "#text" is the
+    # class name, "@Likelihood" its confidence, e.g. {"#text": "Vehicle",
+    # "@Likelihood": 0.91}). Only events with a detection matching one of
+    # class_types at or above min_likelihood get queued for ALPR; anything
+    # else (Person/Bicycle detections, low-confidence hits, events with no
+    # classified object at all) is discarded before it ever opens an RTSP
+    # stream. Comparison is case-insensitive.
+    event_filter = cfg.setdefault("event_filter", {})
+    class_types = event_filter.get("class_types", ["Vehicle"])
+    if isinstance(class_types, str):
+        class_types = [class_types]
+    event_filter["class_types"] = class_types
+    event_filter.setdefault("min_likelihood", 0.7)
+
     alpr = cfg["alpr"]
     alpr.setdefault("cooldown_sec", 90)
     alpr.setdefault("audit_retention_days", 14)

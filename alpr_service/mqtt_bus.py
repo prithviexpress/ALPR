@@ -11,6 +11,19 @@ log = get_logger("QUEUE")
 
 
 def extract_event(topic: str, payload: bytes):
+    """Map a raw MQTT message to a bay + its parsed VCA payload.
+
+    "data" is the full parsed JSON body (Genetec/Bosch-style, XML-derived:
+    "@Attr" for attributes, "#text" for element text), e.g.:
+
+        {"UtcTime": "...", "Data": {"Object": {"Object": {
+            "Appearance": {"Class": {"Type": {
+                "@Likelihood": 0.91, "#text": "Vehicle"}}}}}}}
+
+    "data" is {} if the payload wasn't valid JSON -- matches_class_filter()
+    treats that the same as "no detections", so it's discarded rather than
+    raising further down the pipeline.
+    """
     parts = topic.split('/')
     if len(parts) < 6:
         return None
@@ -21,10 +34,53 @@ def extract_event(topic: str, payload: bytes):
     bay = parts[1]
     try:
         data = json.loads(payload.decode())
-        event_time = data.get("UtcTime")
     except Exception:
-        event_time = None
-    return {"bay": bay, "event_time": event_time}
+        data = {}
+    event_time = data.get("UtcTime")
+    return {"bay": bay, "event_time": event_time, "data": data}
+
+
+def _iter_detections(data: dict):
+    """Yield (class_text, likelihood) pairs out of a VCA event payload's
+    Data.Object.Object[].Appearance.Class.Type[]. Both "Object" and "Type"
+    may be a single dict or a list, depending on how many objects/
+    classifications the camera reports in one event."""
+    objects = data.get("Data", {}).get("Object", {}).get("Object", [])
+    if isinstance(objects, dict):
+        objects = [objects]
+    elif not isinstance(objects, list):
+        objects = []
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        types = obj.get("Appearance", {}).get("Class", {}).get("Type", [])
+        if isinstance(types, dict):
+            types = [types]
+        elif not isinstance(types, list):
+            types = []
+        for t in types:
+            if isinstance(t, dict):
+                yield t.get("#text"), t.get("@Likelihood")
+
+
+def matches_class_filter(data: dict, class_types, min_likelihood: float):
+    """True if any detection in the payload is one of `class_types`
+    (case-insensitive) at or above `min_likelihood`. Returns
+    (matched: bool, class_text, likelihood) -- the latter two are the
+    best-matching detection's values (or None) for logging/audit."""
+    wanted = {c.strip().lower() for c in class_types}
+    best = (False, None, None)
+    for text, likelihood in _iter_detections(data):
+        if text is None or likelihood is None:
+            continue
+        try:
+            likelihood = float(likelihood)
+        except (TypeError, ValueError):
+            continue
+        if text.strip().lower() in wanted and likelihood >= min_likelihood:
+            if best[2] is None or likelihood > best[2]:
+                best = (True, text, likelihood)
+    return best
 
 
 class JobBus:

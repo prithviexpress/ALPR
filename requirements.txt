@@ -1,0 +1,12 @@
+# Core detection + OCR
+ultralytics
+paddleocr
+paddlepaddle
+
+# Image handling
+opencv-python
+numpy
+
+# MQTT + HTTP snapshot fetch
+paho-mqtt
+requests

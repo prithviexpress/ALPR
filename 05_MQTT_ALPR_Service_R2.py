@@ -46,6 +46,19 @@
 #      classified object) is discarded before a single snapshot is
 #      fetched -- R2 queued every line-crossing event regardless of what
 #      triggered it.
+#   8. Entering and leaving are now two independent triggers, confirmed
+#      against real captured events for the same tracked object: enter
+#      matches config "mqtt.enter_subscribe_topic" (LineDetector/Crossed
+#      rules -- covers both "Crossing line N" and "Entering field N"),
+#      leave matches "mqtt.leave_subscribe_topic" (ObjectTrack/Aggregation
+#      rules -- "Leaving field N"). Each publishes a lean
+#      {bay, direction, truck_number, confidence, status, event_time}
+#      reply to its own topic (mqtt.enter_result_topic_prefix /
+#      leave_result_topic_prefix + "/<bay>"); the full per-read detail
+#      still goes to the audit folder's result.json regardless. Cooldown/
+#      dedup is now tracked per (bay, direction), so an enter trigger's
+#      cooldown never blocks a leave trigger for the same bay. The
+#      Vehicle-class event_filter applies to both directions identically.
 #
 # New dependency: the `requests` package (HTTP snapshot fetch + digest
 # auth) -- `pip install requests` on any machine that didn't already have

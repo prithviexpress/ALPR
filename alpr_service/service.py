@@ -47,55 +47,66 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus) -> mqtt.Client:
     except (AttributeError, TypeError):
         client = mqtt.Client()
 
-    trigger_topic = config["mqtt"]["subscribe_topic"]
+    enter_topic = config["mqtt"]["enter_subscribe_topic"]
+    leave_topic = config["mqtt"]["leave_subscribe_topic"]
     bay_segment_index = config["mqtt"]["bay_segment_index"]
     class_types = config["event_filter"]["class_types"]
     min_likelihood = config["event_filter"]["min_likelihood"]
 
     def on_connect(client, userdata, flags, rc, *args):
-        log.info(f"connected rc={rc}, subscribing {trigger_topic}")
-        client.subscribe(trigger_topic, qos=1)
+        log.info(f"connected rc={rc}, subscribing enter='{enter_topic}' "
+                  f"leave='{leave_topic}'")
+        client.subscribe(enter_topic, qos=1)
+        client.subscribe(leave_topic, qos=1)
 
     def on_disconnect(client, userdata, *args):
         log.warning("disconnected -- paho will auto-reconnect")
 
-    def on_message(client, userdata, msg):
-        event = extract_event(msg.topic, msg.payload, bay_segment_index)
-        if event is None:
-            return
-        bay = event["bay"]
-        if bay not in cameras:
-            log.warning(f"event for unknown bay '{bay}' (topic {msg.topic})")
-            return
-        if not cameras[bay].get("enabled", True):
-            return
+    def make_on_message(direction):
+        def on_message(client, userdata, msg):
+            event = extract_event(msg.topic, msg.payload, bay_segment_index)
+            if event is None:
+                return
+            bay = event["bay"]
+            if bay not in cameras:
+                log.warning(f"({direction}) event for unknown bay '{bay}' "
+                            f"(topic {msg.topic})")
+                return
+            if not cameras[bay].get("enabled", True):
+                return
 
-        matched, cls_text, likelihood = matches_class_filter(
-            event["data"], class_types, min_likelihood)
-        if not matched:
-            log.debug(f"({bay}) event discarded: no detection matching "
-                      f"class in {class_types} at likelihood>={min_likelihood} "
-                      f"(topic {msg.topic})")
-            return
-        if likelihood is None:
-            log.info(f"({bay}) event_filter disabled (empty class_types), "
-                     f"accepting event unconditionally")
-        else:
-            log.info(f"({bay}) event matched class='{cls_text}' "
-                     f"likelihood={likelihood:.2f}")
+            matched, cls_text, likelihood = matches_class_filter(
+                event["data"], class_types, min_likelihood)
+            if not matched:
+                log.debug(f"({bay}/{direction}) event discarded: no detection "
+                          f"matching class in {class_types} at "
+                          f"likelihood>={min_likelihood} (topic {msg.topic})")
+                return
+            if likelihood is None:
+                log.info(f"({bay}/{direction}) event_filter disabled (empty "
+                         f"class_types), accepting event unconditionally")
+            else:
+                log.info(f"({bay}/{direction}) event matched class='{cls_text}' "
+                         f"likelihood={likelihood:.2f}")
 
-        queued_event = {
-            "bay": bay,
-            "event_time": event["event_time"],
-            "detected_class": cls_text,
-            "detected_likelihood": likelihood,
-        }
-        if bus.try_enqueue(queued_event):
-            log.info(f"({bay}) event queued for processing")
+            queued_event = {
+                "bay": bay,
+                "direction": direction,
+                "event_time": event["event_time"],
+                "detected_class": cls_text,
+                "detected_likelihood": likelihood,
+            }
+            if bus.try_enqueue(queued_event):
+                log.info(f"({bay}/{direction}) event queued for processing")
+        return on_message
 
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
-    client.on_message = on_message
+    # Two independent triggers on two independent topic filters -- each
+    # gets its own callback rather than one handler branching on topic
+    # shape, so enter/leave logic stays easy to read and change separately.
+    client.message_callback_add(enter_topic, make_on_message("enter"))
+    client.message_callback_add(leave_topic, make_on_message("leave"))
     client.reconnect_delay_set(min_delay=1, max_delay=60)
     if config["mqtt"].get("username"):
         client.username_pw_set(config["mqtt"]["username"],
@@ -125,13 +136,14 @@ def main():
     log.info("=" * 60)
     log.info("ALPR MQTT service starting")
     log.info(f"mqtt={config['mqtt']['host']}:{config['mqtt']['port']} "
-              f"trigger='{config['mqtt']['subscribe_topic']}' "
-              f"results='{config['mqtt']['result_topic_prefix']}/<bay>'")
-    log.info(f"mqtt bay_segment_index={config['mqtt']['bay_segment_index']} -- "
-              f"which rule/event types reach this service at all is controlled "
-              f"by subscribe_topic's own wildcards, not code-side filtering")
+              f"bay_segment_index={config['mqtt']['bay_segment_index']}")
+    log.info(f"  enter: trigger='{config['mqtt']['enter_subscribe_topic']}' "
+              f"results='{config['mqtt']['enter_result_topic_prefix']}/<bay>'")
+    log.info(f"  leave: trigger='{config['mqtt']['leave_subscribe_topic']}' "
+              f"results='{config['mqtt']['leave_result_topic_prefix']}/<bay>'")
     log.info(f"event_filter: class_types={config['event_filter']['class_types']} "
-              f"min_likelihood={config['event_filter']['min_likelihood']}")
+              f"min_likelihood={config['event_filter']['min_likelihood']} "
+              f"(applies to both enter and leave triggers)")
 
     log.info(f"workers={NUM_WORKERS} queue_max={QUEUE_MAX} "
               f"cooldown={alpr['cooldown_sec']}s "

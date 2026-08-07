@@ -15,16 +15,18 @@ def extract_event(topic: str, payload: bytes, bay_segment_index=1):
     """Map a raw MQTT message to a bay + its parsed VCA payload.
 
     Which rule/event types actually reach this function is decided by
-    the MQTT subscription itself (config.json "mqtt.subscribe_topic"),
-    not here -- the broker only delivers topics matching that filter, so
-    a precise topic (e.g. "Camera_Events/+/+/+/LineDetector/Crossed",
-    where "+" matches exactly one segment) means this never even sees
-    other rule types. A broad wildcard (e.g. "Camera_Events/#") means it
-    sees everything, in which case matches_class_filter() downstream is
-    what actually protects against non-vehicle events -- most other rule
-    types (tamper alerts, field-detector entries, ...) won't carry a
-    "Vehicle" classification in their payload at all and get discarded
-    there instead.
+    the MQTT subscription itself (config.json "mqtt.enter_subscribe_topic"
+    / "mqtt.leave_subscribe_topic"), not here -- the broker only delivers
+    topics matching those filters. A precise topic (e.g.
+    "Camera_Events/+/+/RuleEngine/LineDetector/Crossed/#", where "+"
+    matches exactly one segment) means this never even sees other rule
+    types. A broad wildcard means it sees everything, in which case
+    matches_class_filter() downstream is what actually protects against
+    non-vehicle events -- most other rule types (tamper alerts, ...) won't
+    carry a "Vehicle" classification in their payload at all and get
+    discarded there instead. The direction (enter/leave) isn't in the
+    payload -- the caller attaches it based on which subscription
+    delivered the message (see service.build_mqtt).
 
     "data" is the full parsed JSON body (Genetec/Bosch-style, XML-derived:
     "@Attr" for attributes, "#text" for element text), e.g.:
@@ -105,12 +107,18 @@ def matches_class_filter(data: dict, class_types, min_likelihood: float):
 
 
 class JobBus:
-    """Owns the job queue plus the per-bay active-set/cooldown debounce.
+    """Owns the job queue plus the per-(bay, direction) active-set/cooldown
+    debounce.
 
     This used to be three bare module globals (JOBS/ACTIVE/LAST_FIRED)
     plus a lock, with one mutation site (ACTIVE.discard in the worker's
     finally block) that didn't take the lock. Bundling the state here
     means every mutation goes through the same locked methods.
+
+    Keyed by (bay, direction) rather than bay alone: entering and leaving
+    are independent triggers (separate MQTT subscriptions, separate result
+    topics), so an "enter" job's cooldown must not block a "leave" job for
+    the same bay shortly after, and vice versa.
     """
 
     def __init__(self, queue_max: int, cooldown_sec: int):
@@ -122,30 +130,32 @@ class JobBus:
 
     def try_enqueue(self, event: dict) -> bool:
         bay = event['bay']
+        direction = event.get('direction', '')
+        key = (bay, direction)
         now = time.time()
         with self._lock:
-            if bay in self.active:
-                log.info(f"({bay}) rejected: job already active")
+            if key in self.active:
+                log.info(f"({bay}/{direction}) rejected: job already active")
                 return False
-            remaining = self.cooldown_sec - (now - self.last_fired.get(bay, 0))
+            remaining = self.cooldown_sec - (now - self.last_fired.get(key, 0))
             if remaining > 0:
-                log.info(f"({bay}) rejected: cooldown, {remaining:.0f}s left")
+                log.info(f"({bay}/{direction}) rejected: cooldown, {remaining:.0f}s left")
                 return False
             try:
                 self.jobs.put_nowait(event)
             except queue.Full:
-                log.warning(f"({bay}) rejected: job queue FULL "
+                log.warning(f"({bay}/{direction}) rejected: job queue FULL "
                             f"({self.jobs.qsize()}/{self.jobs.maxsize}), dropping event")
                 return False
-            self.active.add(bay)
-            self.last_fired[bay] = now
-            log.info(f"({bay}) accepted (queue depth {self.jobs.qsize()}, "
+            self.active.add(key)
+            self.last_fired[key] = now
+            log.info(f"({bay}/{direction}) accepted (queue depth {self.jobs.qsize()}, "
                       f"active {sorted(self.active)})")
             return True
 
-    def release(self, bay: str):
+    def release(self, bay: str, direction: str = ''):
         with self._lock:
-            self.active.discard(bay)
+            self.active.discard((bay, direction))
 
 
 def connect_with_retry(client, host, port, keepalive=60, log=log,

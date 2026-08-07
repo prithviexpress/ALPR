@@ -13,7 +13,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = BASE_DIR / "config.json"
 
 REQUIRED_KEYS = {
-    "mqtt": ["host", "port", "subscribe_topic", "result_topic_prefix"],
+    "mqtt": ["host", "port",
+             "enter_subscribe_topic", "leave_subscribe_topic",
+             "enter_result_topic_prefix", "leave_result_topic_prefix"],
     "alpr": ["collection_timeout", "max_raw_samples",
              "best_samples", "min_plate_width", "min_plate_height",
              "center_distance_limit"],
@@ -44,11 +46,19 @@ def load_config(path: Path = None) -> dict:
 
     cfg.setdefault("model_path", "best.pt")
 
-    # Which MQTT topic segment carries the bay name, e.g. "Camera_Events/
-    # AR-M4/onvif-ej/RuleEngine/LineDetector/Crossed/&1" -> bay is segment
-    # 1 ("AR-M4"). Which rule/event types actually reach this service at
-    # all is controlled by "mqtt.subscribe_topic" itself (MQTT wildcards),
-    # not by any code-side filtering -- see config.example.json.
+    # Entering and leaving are two independent triggers, confirmed against
+    # real captured topics to have distinct, non-overlapping shapes:
+    #   enter: "Camera_Events/<bay>/onvif-ej/RuleEngine/LineDetector/Crossed/&1/..."
+    #   leave: "Camera_Events/<bay>/onvif-ej/RuleEngine/ObjectTrack/Aggregation/&1/..."
+    # Each is its own MQTT subscription (mqtt.enter_subscribe_topic /
+    # mqtt.leave_subscribe_topic) -- which rule/event types reach this
+    # service at all is controlled by those topic filters (MQTT
+    # wildcards), not by any code-side filtering. Results are published
+    # to a direction-specific topic (mqtt.enter_result_topic_prefix /
+    # mqtt.leave_result_topic_prefix + "/<bay>") so downstream consumers
+    # can subscribe to entries and exits separately. Which topic segment
+    # carries the bay name (default 1, "Camera_Events/<bay>/...") is
+    # shared by both.
     mqtt = cfg["mqtt"]
     mqtt.setdefault("bay_segment_index", 1)
 

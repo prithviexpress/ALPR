@@ -92,23 +92,36 @@ class Worker(threading.Thread):
         while True:
             job = self.jobs.get()
             bay = job['bay']
+            direction = job.get('direction', '')
             try:
                 self.handle(job)
             except Exception:
                 tb = traceback.format_exc()
-                self.log.error(f"({bay}) job failed unexpectedly:\n{tb}")
+                self.log.error(f"({bay}/{direction}) job failed unexpectedly:\n{tb}")
                 self._publish_error(job, "WORKER_EXCEPTION", tb)
             finally:
-                self.job_bus.release(bay)
+                self.job_bus.release(bay, direction)
                 self.jobs.task_done()
+
+    def _result_topic(self, direction: str, bay: str) -> str:
+        prefix_key = f"{direction}_result_topic_prefix"
+        prefix = self.config['mqtt'].get(prefix_key)
+        if not prefix:
+            # Shouldn't happen -- both are required config keys -- but
+            # fail toward a topic that's at least identifiable rather
+            # than raising and losing the result entirely.
+            prefix = f"alpr_result/{direction or 'unknown'}"
+        return f"{prefix}/{bay}"
 
     def _publish_error(self, job, reason, detail=""):
         """Last-resort publish so a downstream consumer waiting on this
         bay's result topic gets a signal instead of hanging forever --
         used both for camera/config errors and unhandled exceptions."""
         bay = job.get('bay', 'unknown')
+        direction = job.get('direction', '')
         result = {
             'bay': bay,
+            'direction': direction,
             'truck_number': None,
             'status': 'ERROR',
             'error_reason': reason,
@@ -117,37 +130,38 @@ class Worker(threading.Thread):
             'ocr_time': datetime.now(timezone.utc).isoformat(),
         }
         try:
-            topic = f"{self.config['mqtt']['result_topic_prefix']}/{bay}"
+            topic = self._result_topic(direction, bay)
             self.publish(topic, json.dumps(result, default=str))
-            self.log.error(f"({bay}) published ERROR result: {reason}")
+            self.log.error(f"({bay}/{direction}) published ERROR result: {reason}")
         except Exception:
-            self.log.error(f"({bay}) failed to publish ERROR result:\n"
+            self.log.error(f"({bay}/{direction}) failed to publish ERROR result:\n"
                             f"{traceback.format_exc()}")
 
     # --------- per-job pipeline ---------
     def handle(self, job):
         bay = job['bay']
+        direction = job.get('direction', '')
         event_time = job['event_time']
         cam = self.cameras.get(bay)
         if cam is None:
-            self.log.warning(f"({bay}) no camera config, skipping")
+            self.log.warning(f"({bay}/{direction}) no camera config, skipping")
             self._publish_error(job, "UNKNOWN_CAMERA")
             return
         if not cam.get('enabled', True):
-            self.log.info(f"({bay}) camera disabled, skipping")
+            self.log.info(f"({bay}/{direction}) camera disabled, skipping")
             return
 
         t0 = time.time()
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        folder = self.audit_dir / bay / ts
+        folder = self.audit_dir / bay / f"{ts}_{direction}"
         debug_dir = folder / "debug"
         folder.mkdir(parents=True, exist_ok=True)
         debug_dir.mkdir(exist_ok=True)
-        self.log.info(f"({bay}) started, audit -> {folder}")
+        self.log.info(f"({bay}/{direction}) started, audit -> {folder}")
 
         samples, cstats = self.collect(cam, debug_dir)
         self.log.info(
-            f"({bay}) frames={cstats['frames_read']} "
+            f"({bay}/{direction}) frames={cstats['frames_read']} "
             f"boxes_detected={cstats['total_boxes_detected']} "
             f"raw_cands={cstats['raw_candidates']} "
             f"kept={len(samples)} "
@@ -157,10 +171,10 @@ class Worker(threading.Thread):
             f"avg fetch {cstats['avg_fetch_ms']}ms, "
             f"{cstats['total_bytes'] // 1024}KB total)")
         if cstats.get('error'):
-            self.log.error(f"({bay}) collection aborted: {cstats['error']}")
+            self.log.error(f"({bay}/{direction}) collection aborted: {cstats['error']}")
         elif cstats['total_boxes_detected'] == 0:
             self.log.warning(
-                f"({bay}) model returned zero boxes across all "
+                f"({bay}/{direction}) model returned zero boxes across all "
                 f"{cstats['frames_read']} frames -- check ROI placement, "
                 f"model file, and camera framing (see debug/ images; "
                 f"set alpr.diagnostics_mode='troubleshooting' for a full "
@@ -172,7 +186,7 @@ class Worker(threading.Thread):
             prep_path = debug_dir / f"prep_{i:02d}.jpg"
             plate, conf, valid, raw = self.ocr_image(s['crop'], prep_path)
             self.log.debug(
-                f"({bay}) sample {i}: raw='{raw}' fixed='{plate}' "
+                f"({bay}/{direction}) sample {i}: raw='{raw}' fixed='{plate}' "
                 f"conf={conf:.2f} valid={valid} score={s['score']:.2f}")
             if plate:
                 reads.append({'plate': plate, 'conf': round(conf, 3),
@@ -186,7 +200,7 @@ class Worker(threading.Thread):
             if matches:
                 confidence = round(sum(matches) / len(matches), 3)
                 supporting_reads = len(matches)
-        self.log.info(f"({bay}) {len(reads)} reads -> "
+        self.log.info(f"({bay}/{direction}) {len(reads)} reads -> "
                        f"'{final}' (support {supporting_reads}, conf {confidence})")
         elapsed = round(time.time() - t0, 1)
 
@@ -200,8 +214,10 @@ class Worker(threading.Thread):
             # "read" plate.
             status = 'SUCCESS' if final and is_valid(final) else 'NO_VALID_PLATE'
 
+        # Full detail for the audit trail on disk.
         result = {
             'bay': bay,
+            'direction': direction,
             'truck_number': final,
             'confidence': confidence,
             'supporting_reads': supporting_reads,
@@ -215,21 +231,34 @@ class Worker(threading.Thread):
             'collection': cstats,
             'audit_folder': str(folder),
         }
-
         (folder / 'result.json').write_text(
             json.dumps(result, indent=2, default=str))
         (folder / 'event.json').write_text(
             json.dumps(job, indent=2, default=str))
 
+        # Lean payload for the MQTT reply -- just what a downstream gate/
+        # dock system needs (truck number, bay, which direction, and
+        # enough to sanity-check the read) -- the full reads/collection
+        # detail stays in result.json on disk for troubleshooting.
+        reply = {
+            'bay': bay,
+            'direction': direction,
+            'truck_number': final,
+            'confidence': confidence,
+            'status': status,
+            'event_time': event_time,
+            'ocr_time': result['ocr_time'],
+        }
+
         if status == 'NO_VALID_PLATE' and not self.publish_no_valid_plate:
-            self.log.info(f"({bay}) no valid plate found, result saved to "
-                           f"{folder} but not published ({elapsed}s total, "
-                           f"{len(reads)} reads)")
-        else:
-            topic = f"{self.config['mqtt']['result_topic_prefix']}/{bay}"
-            self.publish(topic, json.dumps(result, default=str))
-            self.log.info(f"({bay}) {final or status} published to {topic} "
+            self.log.info(f"({bay}/{direction}) no valid plate found, result "
+                           f"saved to {folder} but not published "
                            f"({elapsed}s total, {len(reads)} reads)")
+        else:
+            topic = self._result_topic(direction, bay)
+            self.publish(topic, json.dumps(reply, default=str))
+            self.log.info(f"({bay}/{direction}) {final or status} published "
+                           f"to {topic} ({elapsed}s total, {len(reads)} reads)")
 
     def collect(self, cam: dict, debug_dir=None):
         stats = {'first_fetch_ms': 0, 'avg_fetch_ms': 0.0, 'total_bytes': 0,

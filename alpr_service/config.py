@@ -44,6 +44,12 @@ def load_config(path: Path = None) -> dict:
             if k not in cfg[section]:
                 raise ConfigError(f"Config missing required key '{section}.{k}'")
 
+    # The directory config.json actually loaded from -- model_path and
+    # the PaddleOCR model dirs below are resolved relative to THIS, not
+    # BASE_DIR, so "next to config.json" holds even if config.json isn't
+    # sitting next to the code (e.g. a future packaged .exe).
+    cfg["_config_dir"] = str(path.resolve().parent)
+
     cfg.setdefault("model_path", "best.pt")
 
     # Entering and leaving are two independent triggers, confirmed against
@@ -94,6 +100,15 @@ def load_config(path: Path = None) -> dict:
     #          staying at 0), then switched back to "basic".
     alpr.setdefault("diagnostics_mode", "basic")
     alpr.setdefault("min_ocr_conf", 0.35)
+    # Where PaddleOCR looks for (and, if missing, downloads) its
+    # detection/recognition model files. Relative paths are resolved
+    # against the config.json directory (see "_config_dir" above), so by
+    # default everything -- config.json, model_path (YOLO), and these --
+    # lives in one folder instead of PaddleOCR silently caching to the
+    # user's home directory (~/.paddleocr), which is what it does if
+    # these aren't set.
+    alpr.setdefault("paddleocr_det_model_dir", "paddleocr_models/det")
+    alpr.setdefault("paddleocr_rec_model_dir", "paddleocr_models/rec")
     # Publish a result to MQTT even when no valid plate was found
     # (status NO_VALID_PLATE) -- a downstream consumer gets an update on
     # every trigger regardless of read success, not just successful

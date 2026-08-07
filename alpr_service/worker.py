@@ -18,7 +18,6 @@ import requests
 from ultralytics import YOLO
 from paddleocr import PaddleOCR
 
-from .config import BASE_DIR
 from .image_ops import prep, sharpness, duplicate, save_debug_image, check_frame_size
 from .logging_setup import get_logger
 from .plate_text import is_valid, fix_indian_plate, weighted_vote
@@ -78,8 +77,22 @@ class Worker(threading.Thread):
     def run(self):
         self.log.info("loading models...")
         t = time.time()
-        self.model = YOLO(str(BASE_DIR / self.config["model_path"]))
-        self.ocr = PaddleOCR(lang='en', use_angle_cls=False, show_log=False)
+        # Resolved against the directory config.json actually loaded
+        # from (see config._config_dir) -- not BASE_DIR -- so both the
+        # YOLO weights and PaddleOCR's det/rec models live next to
+        # config.json rather than assuming they're next to the code.
+        config_dir = Path(self.config["_config_dir"])
+        model_path = config_dir / self.config["model_path"]
+        self.model = YOLO(str(model_path))
+
+        det_dir = config_dir / self.config["alpr"]["paddleocr_det_model_dir"]
+        rec_dir = config_dir / self.config["alpr"]["paddleocr_rec_model_dir"]
+        det_dir.mkdir(parents=True, exist_ok=True)
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        self.log.info(f"model_path={model_path} "
+                       f"paddleocr det={det_dir} rec={rec_dir}")
+        self.ocr = PaddleOCR(lang='en', use_angle_cls=False, show_log=False,
+                              det_model_dir=str(det_dir), rec_model_dir=str(rec_dir))
         # One Session/HTTPDigestAuth per worker thread, reused across every
         # job it handles: a Session keeps the TCP connection (and, for
         # HTTPDigestAuth, the last nonce) alive across requests, so only

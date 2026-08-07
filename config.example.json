@@ -1,6 +1,7 @@
 {
   "_notes": {
     "usage": "Copy this file to config.json and fill in real values. config.json is gitignored-by-convention and should never be committed (it holds credentials).",
+    "model_path / paddleocr model dirs": "model_path (the YOLO weights, e.g. best.pt) and alpr.paddleocr_det_model_dir/paddleocr_rec_model_dir are all resolved relative to the FOLDER config.json ACTUALLY LOADED FROM, not the code's location -- so by default everything lives together in one folder. Without paddleocr_det_model_dir/rec_model_dir set, PaddleOCR silently downloads its models to the user's home directory (~/.paddleocr) instead; setting them (as below) makes it look there first and download there if missing, keeping every model artifact next to config.json.",
     "snapshot": "Every camera is pulled via a single HTTP GET to its snapshot endpoint (e.g. a Bosch dome's /snap.jpg), authenticated with HTTP Digest, using one common username/password for ALL cameras -- there's no per-camera override and no RTSP/Genetec path anymore (removed in favor of this). During a collection window the service polls this endpoint repeatedly (as fast as the HTTP round trip allows, or paced by poll_interval_ms) instead of decoding a continuous video stream. Chosen because trigger events here are trucks crawling in slowly, not fast drive-bys, so RTSP's much higher frame rate wasn't needed to catch a good shot.",
     "snapshot.url_template": "Default matches a Bosch FLEXIDOME 3000i/5000i's snapshot path: http://ip:80/snap.jpg. Confirm on your specific unit's web UI under RTSP/streaming (or HTTP) settings if snapshots fail or come back low-res.",
     "alpr.expected_frame_width/height": "Set to your camera's real sensor resolution (e.g. a 5MP camera is commonly 2592x1944) to catch the snapshot endpoint unexpectedly serving a lower-res image than the camera's actual sensor. Leave both null to disable the check.",
@@ -15,6 +16,8 @@
     "mqtt enter/leave (results)": "Each direction publishes to its own topic (enter_result_topic_prefix/<bay> or leave_result_topic_prefix/<bay>) with a lean payload -- bay, direction, truck_number, confidence, status, event_time/ocr_time -- so a downstream gate/dock system can subscribe to entries and exits separately without parsing the fuller record. The complete detail (every OCR read, collection stats, rejection reasons) is still written to the audit folder's result.json regardless.",
     "mqtt.bay_segment_index": "0-based position of the bay name within the subscribe topics, e.g. 1 for 'Camera_Events/<bay>/...'. Shared by both enter and leave since they use the same layout; adjust if yours differs."
   },
+
+  "model_path": "best.pt",
 
   "mqtt": {
     "host": "mqtt.example.local",
@@ -57,6 +60,8 @@
     "publish_no_valid_plate": true,
     "diagnostics_mode": "basic",
     "min_ocr_conf": 0.35,
+    "paddleocr_det_model_dir": "paddleocr_models/det",
+    "paddleocr_rec_model_dir": "paddleocr_models/rec",
     "expected_frame_width": 2592,
     "expected_frame_height": 1944,
     "frame_size_tolerance_pct": 10

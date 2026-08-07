@@ -112,14 +112,19 @@ def load_config(path: Path = None) -> dict:
     alpr.setdefault("diagnostics_mode", "basic")
     alpr.setdefault("min_ocr_conf", 0.35)
     # Where PaddleOCR looks for (and, if missing, downloads) its
-    # detection/recognition model files. Relative paths are resolved
-    # against the config.json directory (see "_config_dir" above), so by
-    # default everything -- config.json, model_path (YOLO), and these --
-    # lives in one folder instead of PaddleOCR silently caching to the
-    # user's home directory (~/.paddleocr), which is what it does if
-    # these aren't set.
+    # detection/recognition/angle-classifier model files. Relative paths
+    # are resolved against the config.json directory (see "_config_dir"
+    # above), so by default everything -- config.json, model_path (YOLO),
+    # and these -- lives in one folder instead of PaddleOCR silently
+    # caching to the user's home directory (~/.paddleocr), which is what
+    # it does if these aren't set. The cls (angle classifier) model is
+    # downloaded unconditionally by PaddleOCR's constructor even though
+    # use_angle_cls=False means it's never actually used for inference --
+    # without cls_model_dir set explicitly it still goes to ~/.paddleocr,
+    # so it's included here too for full offline/self-contained portability.
     alpr.setdefault("paddleocr_det_model_dir", "paddleocr_models/det")
     alpr.setdefault("paddleocr_rec_model_dir", "paddleocr_models/rec")
+    alpr.setdefault("paddleocr_cls_model_dir", "paddleocr_models/cls")
     # Publish a result to MQTT even when no valid plate was found
     # (status NO_VALID_PLATE) -- a downstream consumer gets an update on
     # every trigger regardless of read success, not just successful

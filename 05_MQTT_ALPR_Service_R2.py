@@ -59,6 +59,22 @@
 #      dedup is now tracked per (bay, direction), so an enter trigger's
 #      cooldown never blocks a leave trigger for the same bay. The
 #      Vehicle-class event_filter applies to both directions identically.
+#   9. YOLO weights and all three PaddleOCR model folders (det/rec/cls)
+#      are now resolved relative to the directory config.json actually
+#      loaded from (config "model_path", "alpr.paddleocr_det_model_dir",
+#      "alpr.paddleocr_rec_model_dir", "alpr.paddleocr_cls_model_dir"),
+#      instead of PaddleOCR's own default of caching to ~/.paddleocr.
+#      This includes the cls (angle classifier) model, which PaddleOCR
+#      downloads unconditionally at construction time even with
+#      use_angle_cls=False -- without cls_model_dir set explicitly it
+#      was still going to ~/.paddleocr unnoticed. Model loading across
+#      the NUM_WORKERS threads is serialized with a shared lock so a
+#      fresh install doesn't race multiple workers into downloading the
+#      same files into the same folder at once. Also fixed BASE_DIR to
+#      resolve from sys.executable (not Path(__file__)) when frozen by
+#      PyInstaller, so a packaged .exe finds config.json/best.pt/
+#      paddleocr_models sitting next to it rather than inside
+#      PyInstaller's internal temp extraction folder.
 #
 # New dependency: the `requests` package (HTTP snapshot fetch + digest
 # auth) -- `pip install requests` on any machine that didn't already have

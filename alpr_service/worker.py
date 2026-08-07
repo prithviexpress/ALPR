@@ -89,14 +89,19 @@ class Worker(threading.Thread):
         t = time.time()
         # Resolved against the directory config.json actually loaded
         # from (see config._config_dir) -- not BASE_DIR -- so both the
-        # YOLO weights and PaddleOCR's det/rec models live next to
+        # YOLO weights and PaddleOCR's det/rec/cls models live next to
         # config.json rather than assuming they're next to the code.
         config_dir = Path(self.config["_config_dir"])
         model_path = config_dir / self.config["model_path"]
         det_dir = config_dir / self.config["alpr"]["paddleocr_det_model_dir"]
         rec_dir = config_dir / self.config["alpr"]["paddleocr_rec_model_dir"]
+        # cls (angle classifier): PaddleOCR downloads this unconditionally
+        # at construction time even though use_angle_cls=False below means
+        # it's never actually used for inference -- pointed at a local
+        # folder same as det/rec so it doesn't fall back to ~/.paddleocr.
+        cls_dir = config_dir / self.config["alpr"]["paddleocr_cls_model_dir"]
         self.log.info(f"model_path={model_path} "
-                       f"paddleocr det={det_dir} rec={rec_dir}")
+                       f"paddleocr det={det_dir} rec={rec_dir} cls={cls_dir}")
 
         # Serialized across all workers -- see model_load_lock's comment
         # in __init__. Only matters for the one-time download; once the
@@ -106,8 +111,10 @@ class Worker(threading.Thread):
             self.model = YOLO(str(model_path))
             det_dir.mkdir(parents=True, exist_ok=True)
             rec_dir.mkdir(parents=True, exist_ok=True)
+            cls_dir.mkdir(parents=True, exist_ok=True)
             self.ocr = PaddleOCR(lang='en', use_angle_cls=False, show_log=False,
-                                  det_model_dir=str(det_dir), rec_model_dir=str(rec_dir))
+                                  det_model_dir=str(det_dir), rec_model_dir=str(rec_dir),
+                                  cls_model_dir=str(cls_dir))
         # One Session/HTTPDigestAuth per worker thread, reused across every
         # job it handles: a Session keeps the TCP connection (and, for
         # HTTPDigestAuth, the last nonce) alive across requests, so only

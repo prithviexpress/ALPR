@@ -1,12 +1,18 @@
 # Core detection + OCR
-ultralytics
-paddleocr
-paddlepaddle
+# paddleocr/paddlepaddle are pinned to the last 2.x line deliberately --
+# PaddleOCR 3.x changed its constructor API (use_angle_cls/show_log) and
+# call pattern in ways that break worker.py's ocr_image(). Do not bump
+# these to 3.x without updating that code to match the new API.
+ultralytics==8.3.40
+paddleocr==2.7.3
+paddlepaddle==2.6.2
 
 # Image handling
-opencv-python
-numpy
+# numpy pinned below 2.0: paddlepaddle==2.6.2 predates NumPy 2.0 and
+# compatibility with it is unverified.
+opencv-python==4.10.0.84
+numpy==1.26.4
 
 # MQTT + HTTP snapshot fetch
-paho-mqtt
-requests
+paho-mqtt==2.1.0
+requests==2.32.3

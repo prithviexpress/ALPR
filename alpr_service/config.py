@@ -6,10 +6,21 @@ expected frame size, log level, ...) is a config key now, so ops can
 retune the service without a code change/redeploy.
 """
 import json
+import sys
 from pathlib import Path
 
-# Repo root: this file lives in alpr_service/, so the root is one level up.
-BASE_DIR = Path(__file__).resolve().parent.parent
+# In a normal source checkout, this file lives in alpr_service/, so the
+# repo root is one level up. But under a PyInstaller-frozen exe,
+# Path(__file__) resolves inside PyInstaller's internal temp extraction
+# folder, not the folder the .exe actually sits in -- sys.executable is
+# the one thing that reliably points at the real exe location in both
+# --onefile and --onedir builds. Getting this wrong means a frozen exe
+# would look for config.json/best.pt/paddleocr_models in the wrong
+# place even when they're sitting right next to it.
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = BASE_DIR / "config.json"
 
 REQUIRED_KEYS = {

@@ -94,14 +94,15 @@ def load_config(path: Path = None) -> dict:
     #          staying at 0), then switched back to "basic".
     alpr.setdefault("diagnostics_mode", "basic")
     alpr.setdefault("min_ocr_conf", 0.35)
-    # When no valid plate is found (status NO_VALID_PLATE), don't publish
-    # a result to MQTT -- the audit folder (result.json/event.json) is
-    # still written either way, this only controls the MQTT side. Camera/
-    # system error statuses (CAMERA_UNREACHABLE, CAMERA_CONFIG_ERROR,
-    # FRAME_SIZE_ERROR, ERROR) are unaffected and always publish, since
-    # those need a downstream consumer's attention regardless. Set to
-    # true to publish every result, including plain misses.
-    alpr.setdefault("publish_no_valid_plate", False)
+    # Publish a result to MQTT even when no valid plate was found
+    # (status NO_VALID_PLATE) -- a downstream consumer gets an update on
+    # every trigger regardless of read success, not just successful
+    # reads. The audit folder (result.json/event.json) is always written
+    # either way; this only controls the MQTT side. Camera/system error
+    # statuses (CAMERA_UNREACHABLE, CAMERA_CONFIG_ERROR, FRAME_SIZE_ERROR,
+    # ERROR) are unaffected and always publish regardless of this
+    # setting. Set to false to go back to only publishing actual reads.
+    alpr.setdefault("publish_no_valid_plate", True)
     # Reject a detected box if its vertical center sits above this
     # fraction of the ROI's height (0.45 = top 45%) -- meant to filter
     # out false positives from cab signage/mounting structure above the

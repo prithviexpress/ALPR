@@ -1,6 +1,7 @@
 """Process entry point: wires config, logging, cameras, MQTT, and workers
 together. Import and call main() from the top-level entry script."""
 import signal
+import threading
 
 import paho.mqtt.client as mqtt
 
@@ -185,8 +186,14 @@ def main():
     def publish(topic, payload):
         client.publish(topic, payload, qos=1)
 
+    # Shared by every worker so their first-run model loading (in
+    # particular PaddleOCR's download-if-missing check against the one
+    # shared local model folder) is serialized instead of racing --
+    # see Worker.model_load_lock.
+    model_load_lock = threading.Lock()
     workers = [
-        Worker(i + 1, bus.jobs, cameras, config, publish, bus, AUDIT_DIR)
+        Worker(i + 1, bus.jobs, cameras, config, publish, bus, AUDIT_DIR,
+               model_load_lock)
         for i in range(NUM_WORKERS)
     ]
     for w in workers:

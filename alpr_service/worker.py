@@ -39,7 +39,7 @@ FETCH_FAILURE_BACKOFF_SEC = 0.2
 
 class Worker(threading.Thread):
     def __init__(self, wid, jobs, cameras: dict, config: dict, publish_fn,
-                 job_bus, audit_dir: Path):
+                 job_bus, audit_dir: Path, model_load_lock: threading.Lock = None):
         super().__init__(daemon=True, name=f"worker-{wid}")
         self.wid = wid
         self.jobs = jobs
@@ -48,6 +48,16 @@ class Worker(threading.Thread):
         self.publish = publish_fn
         self.job_bus = job_bus
         self.audit_dir = audit_dir
+        # Shared across every Worker: all workers point at the same local
+        # PaddleOCR model folder, and on a fresh install nothing's
+        # downloaded there yet. Without this lock, every worker thread
+        # hits PaddleOCR's download-if-missing check at once and they all
+        # race to fetch + extract the same .tar into the same path --
+        # confirmed in the field: three concurrent downloads to one
+        # target file, any of which could corrupt/truncate what another
+        # was still writing. Serializing means only the first worker
+        # downloads; the rest find the files already there and just load.
+        self.model_load_lock = model_load_lock or threading.Lock()
         self.model = None
         self.ocr = None
         self.session = None
@@ -83,16 +93,21 @@ class Worker(threading.Thread):
         # config.json rather than assuming they're next to the code.
         config_dir = Path(self.config["_config_dir"])
         model_path = config_dir / self.config["model_path"]
-        self.model = YOLO(str(model_path))
-
         det_dir = config_dir / self.config["alpr"]["paddleocr_det_model_dir"]
         rec_dir = config_dir / self.config["alpr"]["paddleocr_rec_model_dir"]
-        det_dir.mkdir(parents=True, exist_ok=True)
-        rec_dir.mkdir(parents=True, exist_ok=True)
         self.log.info(f"model_path={model_path} "
                        f"paddleocr det={det_dir} rec={rec_dir}")
-        self.ocr = PaddleOCR(lang='en', use_angle_cls=False, show_log=False,
-                              det_model_dir=str(det_dir), rec_model_dir=str(rec_dir))
+
+        # Serialized across all workers -- see model_load_lock's comment
+        # in __init__. Only matters for the one-time download; once the
+        # files exist this lock is held only as long as it takes each
+        # worker to load from disk.
+        with self.model_load_lock:
+            self.model = YOLO(str(model_path))
+            det_dir.mkdir(parents=True, exist_ok=True)
+            rec_dir.mkdir(parents=True, exist_ok=True)
+            self.ocr = PaddleOCR(lang='en', use_angle_cls=False, show_log=False,
+                                  det_model_dir=str(det_dir), rec_model_dir=str(rec_dir))
         # One Session/HTTPDigestAuth per worker thread, reused across every
         # job it handles: a Session keeps the TCP connection (and, for
         # HTTPDigestAuth, the last nonce) alive across requests, so only

@@ -1,7 +1,8 @@
 {
   "_notes": {
     "usage": "Copy this file to config.json and fill in real values. config.json is gitignored-by-convention and should never be committed (it holds credentials).",
-    "model_path / paddleocr model dirs": "model_path (the YOLO weights, e.g. best.pt) and alpr.paddleocr_det_model_dir/paddleocr_rec_model_dir are all resolved relative to the FOLDER config.json ACTUALLY LOADED FROM, not the code's location -- so by default everything lives together in one folder. Without paddleocr_det_model_dir/rec_model_dir set, PaddleOCR silently downloads its models to the user's home directory (~/.paddleocr) instead; setting them (as below) makes it look there first and download there if missing, keeping every model artifact next to config.json.",
+    "model_path / paddleocr model dirs": "model_path (the YOLO weights, e.g. best.pt) and alpr.paddleocr_det_model_dir/paddleocr_rec_model_dir/paddleocr_cls_model_dir are all resolved relative to the FOLDER config.json ACTUALLY LOADED FROM, not the code's location -- so by default everything lives together in one folder. Without these set, PaddleOCR silently downloads its models to the user's home directory (~/.paddleocr) instead -- including the cls (angle classifier) model, which PaddleOCR downloads unconditionally at startup even though use_angle_cls=false means it's never used for inference. Setting all three (as below) makes PaddleOCR look there first and download there if missing, keeping every model artifact next to config.json.",
+    "mqtt.trigger_enabled / http_trigger": "Two independent, combinable trigger sources. mqtt.trigger_enabled (default true) subscribes to the VCA event topics below as before. http_trigger.enabled (default false) instead/additionally runs a small HTTP server that a camera's own alarm task (e.g. a Bosch dome's built-in 'HTTP notification' action) calls directly on a rule trigger, bypassing Genetec/MQTT for the trigger itself. MQTT stays connected and is always used to publish results either way -- disabling mqtt.trigger_enabled only stops it from subscribing. At least one of the two must be enabled. See the 'http_trigger' block below for its own settings.",
     "snapshot": "Every camera is pulled via a single HTTP GET to its snapshot endpoint (e.g. a Bosch dome's /snap.jpg), authenticated with HTTP Digest, using one common username/password for ALL cameras -- there's no per-camera override and no RTSP/Genetec path anymore (removed in favor of this). During a collection window the service polls this endpoint repeatedly (as fast as the HTTP round trip allows, or paced by poll_interval_ms) instead of decoding a continuous video stream. Chosen because trigger events here are trucks crawling in slowly, not fast drive-bys, so RTSP's much higher frame rate wasn't needed to catch a good shot.",
     "snapshot.url_template": "Default matches a Bosch FLEXIDOME 3000i/5000i's snapshot path: http://ip:80/snap.jpg. Confirm on your specific unit's web UI under RTSP/streaming (or HTTP) settings if snapshots fail or come back low-res.",
     "alpr.expected_frame_width/height": "Set to your camera's real sensor resolution (e.g. a 5MP camera is commonly 2592x1944) to catch the snapshot endpoint unexpectedly serving a lower-res image than the camera's actual sensor. Leave both null to disable the check.",
@@ -28,12 +29,23 @@
     "leave_subscribe_topic": "Camera_Events/+/+/RuleEngine/ObjectTrack/Aggregation/#",
     "enter_result_topic_prefix": "site/alpr/result/enter",
     "leave_result_topic_prefix": "site/alpr/result/leave",
-    "bay_segment_index": 1
+    "bay_segment_index": 1,
+    "trigger_enabled": true
   },
 
   "event_filter": {
     "class_types": ["Vehicle"],
     "min_likelihood": 0.7
+  },
+
+  "http_trigger": {
+    "enabled": false,
+    "host": "0.0.0.0",
+    "port": 8080,
+    "path": "/alert",
+    "rule_param": "rule",
+    "enter_rule_codes": [2],
+    "exit_rule_codes": [3]
   },
 
   "snapshot": {

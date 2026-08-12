@@ -40,7 +40,8 @@ def check_snapshot_credentials(config: dict, log):
         raise SystemExit(1)
 
 
-def build_mqtt(cameras: dict, config: dict, bus: JobBus) -> mqtt.Client:
+def build_mqtt(cameras: dict, config: dict, bus: JobBus,
+               subscribe_enabled: bool = True) -> mqtt.Client:
     log = get_logger("MQTT")
     try:
         client = mqtt.Client(
@@ -55,10 +56,16 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus) -> mqtt.Client:
     min_likelihood = config["event_filter"]["min_likelihood"]
 
     def on_connect(client, userdata, flags, rc, *args):
-        log.info(f"connected rc={rc}, subscribing enter='{enter_topic}' "
-                  f"leave='{leave_topic}'")
-        client.subscribe(enter_topic, qos=1)
-        client.subscribe(leave_topic, qos=1)
+        log.info(f"connected rc={rc}")
+        if subscribe_enabled:
+            log.info(f"subscribing enter='{enter_topic}' "
+                      f"leave='{leave_topic}'")
+            client.subscribe(enter_topic, qos=1)
+            client.subscribe(leave_topic, qos=1)
+        else:
+            log.info("mqtt.trigger_enabled=false -- not subscribing "
+                      "(http_trigger is the active trigger source); "
+                      "this connection is publish-only")
 
     def on_disconnect(client, userdata, *args):
         log.warning("disconnected -- paho will auto-reconnect")
@@ -103,16 +110,40 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus) -> mqtt.Client:
 
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
-    # Two independent triggers on two independent topic filters -- each
-    # gets its own callback rather than one handler branching on topic
-    # shape, so enter/leave logic stays easy to read and change separately.
-    client.message_callback_add(enter_topic, make_on_message("enter"))
-    client.message_callback_add(leave_topic, make_on_message("leave"))
+    if subscribe_enabled:
+        # Two independent triggers on two independent topic filters --
+        # each gets its own callback rather than one handler branching on
+        # topic shape, so enter/leave logic stays easy to read and change
+        # separately.
+        client.message_callback_add(enter_topic, make_on_message("enter"))
+        client.message_callback_add(leave_topic, make_on_message("leave"))
     client.reconnect_delay_set(min_delay=1, max_delay=60)
     if config["mqtt"].get("username"):
         client.username_pw_set(config["mqtt"]["username"],
                                 config["mqtt"].get("password"))
     return client
+
+
+def start_http_trigger(cameras: dict, config: dict, bus: JobBus, log) -> threading.Thread:
+    """Starts the HTTP webhook trigger server (config "http_trigger") in a
+    background thread. Import is local so Flask is only required when
+    this trigger source is actually turned on."""
+    from .http_trigger import build_http_trigger_app
+
+    http_cfg = config["http_trigger"]
+    app = build_http_trigger_app(cameras, config, bus)
+
+    def _run():
+        app.run(host=http_cfg["host"], port=http_cfg["port"],
+                 debug=False, use_reloader=False)
+
+    t = threading.Thread(target=_run, daemon=True, name="http-trigger")
+    t.start()
+    log.info(f"HTTP trigger listening on http://{http_cfg['host']}:"
+              f"{http_cfg['port']}{http_cfg['path']} "
+              f"(enter rule codes={http_cfg['enter_rule_codes']}, "
+              f"exit rule codes={http_cfg['exit_rule_codes']})")
+    return t
 
 
 def main():
@@ -144,7 +175,17 @@ def main():
               f"results='{config['mqtt']['leave_result_topic_prefix']}/<bay>'")
     log.info(f"event_filter: class_types={config['event_filter']['class_types']} "
               f"min_likelihood={config['event_filter']['min_likelihood']} "
-              f"(applies to both enter and leave triggers)")
+              f"(applies to mqtt triggers only -- http_trigger has no VCA "
+              f"classification to filter on)")
+
+    mqtt_trigger_enabled = config["mqtt"]["trigger_enabled"]
+    http_trigger_enabled = config["http_trigger"]["enabled"]
+    if not mqtt_trigger_enabled and not http_trigger_enabled:
+        log.error("no trigger source enabled -- set mqtt.trigger_enabled "
+                  "and/or http_trigger.enabled to true in config.json")
+        raise SystemExit(1)
+    log.info(f"trigger sources: mqtt={mqtt_trigger_enabled} "
+              f"http={http_trigger_enabled}")
 
     log.info(f"workers={NUM_WORKERS} queue_max={QUEUE_MAX} "
               f"cooldown={alpr['cooldown_sec']}s "
@@ -181,10 +222,20 @@ def main():
     prune_audit(AUDIT_DIR, alpr['audit_retention_days'])
 
     bus = JobBus(queue_max=QUEUE_MAX, cooldown_sec=alpr['cooldown_sec'])
-    client = build_mqtt(cameras, config, bus)
+    # MQTT is always connected (results are always published over it);
+    # subscribe_enabled only controls whether it also *subscribes* to the
+    # VCA event topics as a trigger source.
+    client = build_mqtt(cameras, config, bus, subscribe_enabled=mqtt_trigger_enabled)
 
     def publish(topic, payload):
         client.publish(topic, payload, qos=1)
+
+    if http_trigger_enabled:
+        try:
+            start_http_trigger(cameras, config, bus, log)
+        except ValueError as e:
+            log.error(str(e))
+            raise SystemExit(1)
 
     # Shared by every worker so their first-run model loading (in
     # particular PaddleOCR's download-if-missing check against the one

@@ -16,3 +16,8 @@ numpy==1.26.4
 # MQTT + HTTP snapshot fetch
 paho-mqtt==2.1.0
 requests==2.32.3
+
+# HTTP webhook trigger source (config "http_trigger.enabled") -- only
+# needed if a camera calls this service directly over HTTP instead of/
+# alongside the MQTT VCA-event trigger.
+flask==3.0.3

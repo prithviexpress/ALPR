@@ -78,6 +78,31 @@ def load_config(path: Path = None) -> dict:
     # shared by both.
     mqtt = cfg["mqtt"]
     mqtt.setdefault("bay_segment_index", 1)
+    # Whether the service subscribes to the VCA event topics at all --
+    # false relies solely on http_trigger below for triggers. MQTT is
+    # still connected and used to publish results either way; this only
+    # controls the *subscribe* side.
+    mqtt.setdefault("trigger_enabled", True)
+
+    # An alternative trigger source to the MQTT VCA events above: some
+    # cameras (e.g. a Bosch dome's built-in "HTTP notification" alarm
+    # task) can be configured to call this service directly over HTTP on
+    # a rule trigger, instead of going through Genetec/MQTT for the
+    # trigger itself. Can run alongside mqtt.trigger_enabled, or be the
+    # only trigger source (set mqtt.trigger_enabled to false). The
+    # camera identifies itself only by source IP, matched against
+    # cameras.json's "ip" field to resolve the bay -- so every enabled
+    # camera needs a unique ip for this to work. enter_rule_codes /
+    # exit_rule_codes map the camera's numeric alarm rule id to a
+    # direction; a rule id in neither list is logged and ignored.
+    http_trigger = cfg.setdefault("http_trigger", {})
+    http_trigger.setdefault("enabled", False)
+    http_trigger.setdefault("host", "0.0.0.0")
+    http_trigger.setdefault("port", 8080)
+    http_trigger.setdefault("path", "/alert")
+    http_trigger.setdefault("rule_param", "rule")
+    http_trigger.setdefault("enter_rule_codes", [2])
+    http_trigger.setdefault("exit_rule_codes", [3])
 
     # Incoming MQTT trigger events carry a VCA classification per detected
     # object (Data.Object.Object[].Appearance.Class.Type[]: "#text" is the

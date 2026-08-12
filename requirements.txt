@@ -19,5 +19,7 @@ requests==2.32.3
 
 # HTTP webhook trigger source (config "http_trigger.enabled") -- only
 # needed if a camera calls this service directly over HTTP instead of/
-# alongside the MQTT VCA-event trigger.
+# alongside the MQTT VCA-event trigger. waitress serves it (a production
+# WSGI server) instead of Flask's own dev server.
 flask==3.0.3
+waitress==3.0.0

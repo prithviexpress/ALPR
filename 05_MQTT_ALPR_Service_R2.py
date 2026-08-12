@@ -76,22 +76,27 @@
 #      paddleocr_models sitting next to it rather than inside
 #      PyInstaller's internal temp extraction folder.
 #   10. Added a second, optional trigger source: config "http_trigger"
-#       runs a small Flask server a camera's own alarm task can call
-#       directly (e.g. a Bosch dome's built-in "HTTP notification" alarm
-#       task GET-ing a URL with a numeric rule id) instead of going
-#       through Genetec/MQTT for the trigger. It can run alongside the
-#       MQTT trigger or replace it (config "mqtt.trigger_enabled"); MQTT
-#       is still connected and used to publish results either way. The
+#       runs an HTTP server a camera's own alarm task can call directly
+#       (e.g. a Bosch dome's built-in "HTTP notification" alarm task
+#       GET-ing a URL with a numeric rule id) instead of going through
+#       Genetec/MQTT for the trigger. It can run alongside the MQTT
+#       trigger or replace it (config "mqtt.trigger_enabled"); MQTT is
+#       still connected and used to publish results either way. The
 #       calling camera is matched to a bay purely by its source IP against
 #       cameras.json's "ip" field (same field the snapshot fetcher already
 #       uses), and enter/exit is decided by "http_trigger.enter_rule_codes"
 #       / "exit_rule_codes" -- everything downstream (collection, OCR,
 #       audit, per-direction result topics) is identical to an MQTT-
-#       triggered job; only the trigger's entry point differs.
+#       triggered job; only the trigger's entry point differs. Served by
+#       waitress (a production WSGI server, not Flask's own dev server);
+#       adds a GET /healthz liveness endpoint and logs unhandled request
+#       errors as JSON 500s instead of Flask's default HTML error page.
+#       waitress's own log output is routed through the same logging
+#       setup as the rest of the service (see logging_setup.py).
 #
-# New dependencies: `requests` (HTTP snapshot fetch + digest auth) and
-# `flask` (only actually used if http_trigger.enabled is true) -- see
-# requirements.txt for pinned versions.
+# New dependencies: `requests` (HTTP snapshot fetch + digest auth),
+# `flask` and `waitress` (only actually used if http_trigger.enabled is
+# true) -- see requirements.txt for pinned versions.
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 

@@ -103,6 +103,12 @@ def load_config(path: Path = None) -> dict:
     http_trigger.setdefault("rule_param", "rule")
     http_trigger.setdefault("enter_rule_codes", [2])
     http_trigger.setdefault("exit_rule_codes", [3])
+    # Served by waitress (a production WSGI server, not Flask's own dev
+    # server) -- this is its worker thread pool size. The default is
+    # generous for what this endpoint actually does (a handful of alarm
+    # hits per truck, each just doing a dict lookup + queue put), no need
+    # to tune unless a very large number of bays fire in the same instant.
+    http_trigger.setdefault("threads", 4)
 
     # Incoming MQTT trigger events carry a VCA classification per detected
     # object (Data.Object.Object[].Appearance.Class.Type[]: "#text" is the

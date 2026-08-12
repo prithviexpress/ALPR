@@ -126,22 +126,36 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus,
 
 def start_http_trigger(cameras: dict, config: dict, bus: JobBus, log) -> threading.Thread:
     """Starts the HTTP webhook trigger server (config "http_trigger") in a
-    background thread. Import is local so Flask is only required when
-    this trigger source is actually turned on."""
+    background thread, served by waitress rather than Flask's own app.run()
+    -- Flask's built-in server is single-threaded-by-default and explicitly
+    labels itself "not for production use"; waitress is a pure-Python
+    production WSGI server (no C extension, so it survives PyInstaller
+    freezing the same as everything else here) that handles concurrent
+    requests properly. Imports are local so Flask/waitress are only
+    required when this trigger source is actually turned on."""
+    from waitress import serve
     from .http_trigger import build_http_trigger_app
 
     http_cfg = config["http_trigger"]
     app = build_http_trigger_app(cameras, config, bus)
 
     def _run():
-        app.run(host=http_cfg["host"], port=http_cfg["port"],
-                 debug=False, use_reloader=False)
+        try:
+            serve(app, host=http_cfg["host"], port=http_cfg["port"],
+                  threads=http_cfg["threads"])
+        except OSError as e:
+            # e.g. port already in use -- surfaced from a background
+            # thread, so log it explicitly rather than letting it vanish
+            # into an unhandled-thread-exception with no context.
+            log.error(f"HTTP trigger server failed to start on "
+                      f"{http_cfg['host']}:{http_cfg['port']}: {e}")
 
     t = threading.Thread(target=_run, daemon=True, name="http-trigger")
     t.start()
     log.info(f"HTTP trigger listening on http://{http_cfg['host']}:"
               f"{http_cfg['port']}{http_cfg['path']} "
-              f"(enter rule codes={http_cfg['enter_rule_codes']}, "
+              f"(threads={http_cfg['threads']}, "
+              f"enter rule codes={http_cfg['enter_rule_codes']}, "
               f"exit rule codes={http_cfg['exit_rule_codes']})")
     return t
 

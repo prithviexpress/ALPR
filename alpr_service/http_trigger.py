@@ -63,6 +63,24 @@ def build_http_trigger_app(cameras: dict, config: dict, bus) -> Flask:
 
     app = Flask(__name__)
 
+    @app.errorhandler(Exception)
+    def _on_error(exc):
+        # Flask's default for an unhandled exception is an HTML 500 page --
+        # log it (so it shows up in the same log stream as everything
+        # else) and return JSON instead, consistent with every other
+        # response this app gives.
+        log.error(f"unhandled error in http_trigger request "
+                  f"{request.path}?{request.query_string.decode()}: {exc}",
+                  exc_info=True)
+        return jsonify({"status": "error", "reason": "internal_error"}), 500
+
+    @app.route("/healthz", methods=["GET"])
+    def healthz():
+        # Cheap liveness check for a process supervisor / load balancer --
+        # confirms the webhook server thread is up and serving, not that
+        # ALPR itself is healthy (workers/MQTT have their own logging).
+        return jsonify({"status": "ok"}), 200
+
     @app.route(http_cfg["path"], methods=["GET"])
     def alert():
         camera_ip = request.remote_addr

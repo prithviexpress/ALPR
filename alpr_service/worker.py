@@ -1,8 +1,8 @@
 """Per-job pipeline: capture -> detect -> OCR -> vote -> publish.
 
-One Worker thread per NUM_WORKERS, each owning its own YOLO + PaddleOCR
-model instances (loaded once at thread start) so concurrent jobs don't
-share model state across threads.
+One Worker thread per config "service.num_workers", each owning its own
+YOLO + PaddleOCR model instances (loaded once at thread start) so
+concurrent jobs don't share model state across threads.
 """
 import json
 import threading
@@ -32,10 +32,6 @@ ERROR_STATUS = {
     'no_frame_received': 'CAMERA_UNREACHABLE',
     'frame_size_mismatch': 'FRAME_SIZE_ERROR',
 }
-
-MAX_CONSECUTIVE_FETCH_FAILURES = 10
-FETCH_FAILURE_BACKOFF_SEC = 0.2
-
 
 class Worker(threading.Thread):
     def __init__(self, wid, jobs, cameras: dict, config: dict, publish_fn,
@@ -88,6 +84,21 @@ class Worker(threading.Thread):
         self.expected_frame_height = alpr.get("expected_frame_height")
         self.frame_size_tolerance_pct = alpr.get("frame_size_tolerance_pct", 10)
         self.min_ocr_conf = alpr.get("min_ocr_conf", 0.35)
+        self.yolo_conf_threshold = alpr.get("yolo_conf_threshold", 0.25)
+        self.max_consecutive_fetch_failures = alpr.get(
+            "max_consecutive_fetch_failures", 10)
+        self.fetch_failure_backoff_sec = alpr.get("fetch_failure_backoff_sec", 0.2)
+        self.score_weights = alpr.get(
+            "score_weights",
+            {"yolo_conf": 0.4, "area": 0.25, "sharpness": 0.2, "center": 0.15})
+        self.score_area_norm = alpr.get("score_area_norm", 25000)
+        self.score_sharpness_norm = alpr.get("score_sharpness_norm", 600)
+        self.duplicate_resize = (
+            alpr.get("duplicate_resize_width", 300),
+            alpr.get("duplicate_resize_height", 100))
+        self.duplicate_diff_threshold = alpr.get("duplicate_diff_threshold", 5)
+        self.ocr_prep_target_height = alpr.get("ocr_prep_target_height", 220)
+        self.ocr_prep_padding = alpr.get("ocr_prep_padding", 24)
         snap_cfg = config["snapshot"]
         self.connect_timeout_ms = snap_cfg.get("connect_timeout_ms", 3000)
         self.read_timeout_ms = snap_cfg.get("read_timeout_ms", 3000)
@@ -351,14 +362,14 @@ class Worker(threading.Thread):
                 rejected['fetch_fail'] += 1
                 consecutive_failures += 1
                 self.log.debug(f"({cam.get('ip', '?')}) snapshot fetch failed: {e}")
-                if consecutive_failures >= MAX_CONSECUTIVE_FETCH_FAILURES:
+                if consecutive_failures >= self.max_consecutive_fetch_failures:
                     self.log.error(
                         f"({cam.get('ip', '?')}) {consecutive_failures} "
                         f"consecutive snapshot failures, aborting collection")
                     if not stats['frames_read']:
                         stats['error'] = 'no_frame_received'
                     break
-                time.sleep(FETCH_FAILURE_BACKOFF_SEC)
+                time.sleep(self.fetch_failure_backoff_sec)
                 continue
             consecutive_failures = 0
             stats['frames_read'] += 1
@@ -405,7 +416,7 @@ class Worker(threading.Thread):
             # all) and, in troubleshooting mode, for every frame.
             annotated = roi.copy() if (frame_no == 1 or self.troubleshooting) else None
 
-            results = self.model(roi, verbose=False)
+            results = self.model(roi, conf=self.yolo_conf_threshold, verbose=False)
             boxes_this_frame = 0
             for r in results:
                 for b in r.boxes:
@@ -444,7 +455,9 @@ class Worker(threading.Thread):
                     px2 = min(roi.shape[1], bx2 + pad_x)
                     py2 = min(roi.shape[0], by2 + pad_y)
                     crop = roi[py1:py2, px1:px2]
-                    if any(duplicate(crop, c['crop']) for c in cands):
+                    if any(duplicate(crop, c['crop'], self.duplicate_resize,
+                                      self.duplicate_diff_threshold)
+                           for c in cands):
                         rejected['duplicate'] += 1
                         if annotated is not None and self.troubleshooting:
                             cv2.rectangle(annotated, (bx1, by1), (bx2, by2),
@@ -454,10 +467,12 @@ class Worker(threading.Thread):
                                         (0, 165, 255), 1)
                         continue
 
-                    area = min(crop.shape[0] * crop.shape[1] / 25000, 1.0)
-                    shp = min(sharpness(crop) / 600, 1.0)
-                    sc = (float(b.conf[0]) * 0.4 + area * 0.25 +
-                          shp * 0.2 + (1 - dist / center) * 0.15)
+                    w_cfg = self.score_weights
+                    area = min(crop.shape[0] * crop.shape[1] / self.score_area_norm, 1.0)
+                    shp = min(sharpness(crop) / self.score_sharpness_norm, 1.0)
+                    sc = (float(b.conf[0]) * w_cfg["yolo_conf"] +
+                          area * w_cfg["area"] + shp * w_cfg["sharpness"] +
+                          (1 - dist / center) * w_cfg["center"])
                     cands.append({'crop': crop, 'score': sc})
                     candidate_no += 1
                     self.log.debug(
@@ -508,7 +523,7 @@ class Worker(threading.Thread):
         return cands[:self.best_samples], stats
 
     def ocr_image(self, img, debug_path=None):
-        pimg = prep(img)
+        pimg = prep(img, self.ocr_prep_target_height, self.ocr_prep_padding)
         if debug_path is not None:
             save_debug_image(debug_path.parent, debug_path.name, pimg, self.log)
         result = self.ocr.ocr(pimg, cls=False)

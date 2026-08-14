@@ -189,7 +189,8 @@ def run_bay_monitor(cameras: dict, config: dict, publish_fn, stop_event: threadi
                 if not state.zoomed_in:
                     x1, y1, x2, y2 = cam["roi"]
                     roi = frame[y1:y2, x1:x2]
-                    results = model(roi, verbose=False)
+                    results = model(roi, conf=bm_cfg.get("presence_conf_threshold", 0.25),
+                                     verbose=False)
                     if any(len(r.boxes) > 0 for r in results):
                         state.zoomed_in = True
                         state.consecutive_empty = 0

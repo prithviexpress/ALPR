@@ -142,6 +142,40 @@ def load_config(path: Path = None) -> dict:
     #          staying at 0), then switched back to "basic".
     alpr.setdefault("diagnostics_mode", "basic")
     alpr.setdefault("min_ocr_conf", 0.35)
+    # Minimum YOLO box confidence for a plate detection to be considered
+    # at all (Ultralytics' own default is 0.25 if this isn't passed
+    # explicitly -- surfaced here so it's tunable without a code change).
+    alpr.setdefault("yolo_conf_threshold", 0.25)
+    # Collection aborts after this many consecutive snapshot fetch
+    # failures (reported as CAMERA_UNREACHABLE if no frame was ever
+    # read), pausing this many seconds between retries.
+    alpr.setdefault("max_consecutive_fetch_failures", 10)
+    alpr.setdefault("fetch_failure_backoff_sec", 0.2)
+    # Weights (should sum to ~1.0) for ranking multiple candidate crops
+    # from the same collection window: yolo_conf (the model's own
+    # confidence), area (bigger crop = more pixels for OCR, normalized by
+    # score_area_norm), sharpness (Laplacian variance, normalized by
+    # score_sharpness_norm), center (how close to the ROI's horizontal
+    # center -- plates dead-center in frame tend to be the real target,
+    # not a passing vehicle at the edge).
+    alpr.setdefault("score_weights", {
+        "yolo_conf": 0.4, "area": 0.25, "sharpness": 0.2, "center": 0.15,
+    })
+    alpr.setdefault("score_area_norm", 25000)
+    alpr.setdefault("score_sharpness_norm", 600)
+    # A candidate crop is discarded as a near-duplicate of one already
+    # kept if, after both are resized to duplicate_resize_width x
+    # _height, their mean pixel difference is below duplicate_diff_
+    # threshold -- avoids voting on the same plate sighting twice just
+    # because consecutive frames caught it almost identically.
+    alpr.setdefault("duplicate_resize_width", 300)
+    alpr.setdefault("duplicate_resize_height", 100)
+    alpr.setdefault("duplicate_diff_threshold", 5)
+    # Crop is upscaled to this height (proportionally) and padded by this
+    # many pixels on each side before OCR -- PaddleOCR reads small/tight
+    # crops less reliably than a properly-sized, bordered one.
+    alpr.setdefault("ocr_prep_target_height", 220)
+    alpr.setdefault("ocr_prep_padding", 24)
     # Where PaddleOCR looks for (and, if missing, downloads) its
     # detection/recognition/angle-classifier model files. Relative paths
     # are resolved against the config.json directory (see "_config_dir"
@@ -221,6 +255,13 @@ def load_config(path: Path = None) -> dict:
     bay_monitor.setdefault("baseline_scan_interval_ms", 2000)
     bay_monitor.setdefault("classify_interval_sec", 60)
     bay_monitor.setdefault("empty_debounce_count", 3)
+    # Minimum YOLO box confidence for the baseline presence check to
+    # count as "something's there" -- separate from alpr.yolo_conf_
+    # threshold since presence-detection intentionally wants to catch
+    # weak/partial hints of a truck (no size/position filtering at all
+    # here, unlike ALPR's own plate detection), so this can reasonably
+    # be set lower than alpr.yolo_conf_threshold.
+    bay_monitor.setdefault("presence_conf_threshold", 0.25)
     bay_monitor.setdefault("ollama_host", "http://localhost:11434")
     bay_monitor.setdefault("ollama_model", None)
     bay_monitor.setdefault("ollama_timeout_sec", 30)
@@ -264,6 +305,15 @@ def load_config(path: Path = None) -> dict:
     # second, independently-configured debounce would be unsafe here).
     bay_state_engine = cfg.setdefault("bay_state_engine", {})
     bay_state_engine.setdefault("enabled", False)
+
+    # Worker pool sizing -- num_workers is roughly "max concurrent
+    # dockings this instance can process at once" (each Worker owns its
+    # own loaded YOLO+PaddleOCR models, ~2GB RAM apiece); queue_max caps
+    # how many pending jobs can sit in JobBus before try_enqueue starts
+    # dropping new ones rather than growing unbounded.
+    service_cfg = cfg.setdefault("service", {})
+    service_cfg.setdefault("num_workers", 3)
+    service_cfg.setdefault("queue_max", 50)
 
     log_cfg = cfg.setdefault("logging", {})
     log_cfg.setdefault("level", "INFO")  # DEBUG / INFO / WARNING / ERROR

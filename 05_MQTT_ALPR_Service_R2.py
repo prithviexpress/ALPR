@@ -68,7 +68,7 @@
 #      downloads unconditionally at construction time even with
 #      use_angle_cls=False -- without cls_model_dir set explicitly it
 #      was still going to ~/.paddleocr unnoticed. Model loading across
-#      the NUM_WORKERS threads is serialized with a shared lock so a
+#      the worker threads (service.num_workers) is serialized with a shared lock so a
 #      fresh install doesn't race multiple workers into downloading the
 #      same files into the same folder at once. Also fixed BASE_DIR to
 #      resolve from sys.executable (not Path(__file__)) when frozen by

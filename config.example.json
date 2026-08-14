@@ -21,7 +21,9 @@
     "bay_monitor": "A separate, optional feature from the enter/leave ALPR pipeline above -- off by default (enabled: false). Continuously round-robins every enabled camera (independent of MQTT/HTTP triggers) looking for presence, reusing the ALPR plate model as a cheap 'something's there' signal with no filtering. Once a bay shows a detection it's 'zoomed in': every classify_interval_sec (default 60s) a frame is sent to a local Ollama-hosted vision model and the reply (one of status_values) is published to mqtt.bay_status_topic_prefix + '/<bay>'. After empty_debounce_count consecutive 'empty' replies it reverts to baseline scanning. ollama_model has NO working default -- it must be set to a vision-capable model tag you've actually pulled locally (`ollama pull <tag>`), and the service fails fast at startup if enabled without one set, rather than silently misclassifying everything.",
     "bay_monitor.baseline_scan_interval_ms": "Pacing between each camera checked in the round-robin (applies whether or not anything was found) -- keeps the scanner from hammering every camera back-to-back with zero gap. Does not apply to the classify_interval_sec cadence of a zoomed-in bay's LLM calls, which is separately paced.",
     "bay_monitor.reference_images": "Optional few-shot exemplars sent alongside every classification call, e.g. [{\"path\": \"reference_images/empty.jpg\", \"label\": \"empty\"}, {\"path\": \"reference_images/door_open.jpg\", \"label\": \"occupied (bay door open)\"}]. Paths resolve relative to config.json's directory, like model_path. Loaded once at startup, not re-read per call -- a missing file is logged and skipped, not fatal. Helps most on real ambiguous cases a text-only prompt undersells, e.g. an open bay/cargo door that can otherwise get misread as empty or throw off the model.",
-    "bay_state_engine": "Off by default; depends entirely on bay_monitor also being enabled (fails startup otherwise). When on, it becomes the authority for enter/leave direction and timing INSTEAD of the MQTT/HTTP trigger source: bay_monitor's own empty->occupied transition enqueues an ALPR read via the normal Worker pool, and (unlike a one-shot trigger) keeps retrying every time bay_monitor reclassifies the bay as still occupied, until a read actually succeeds -- so a bad read caused by e.g. a bay/cargo door being open doesn't cost the whole visit's identity, just that one attempt. occupied->empty then publishes the leave result using whatever plate got confirmed at ANY point during the stay (there's no fresh camera read at that instant to attempt, since 'empty' means the truck's no longer in frame). If mqtt.trigger_enabled or http_trigger.enabled are ALSO on at the same time, both paths independently decide enter/leave for the same bays -- a startup warning (not a hard failure) flags this, since it usually means redundant or conflicting publishes; turn the old trigger(s) off if bay_state_engine is meant to be the sole source of truth. State is in-memory only -- a restart loses any truck currently mid-visit."
+    "bay_state_engine": "Off by default; depends entirely on bay_monitor also being enabled (fails startup otherwise). When on, it becomes the authority for enter/leave direction and timing INSTEAD of the MQTT/HTTP trigger source: bay_monitor's own empty->occupied transition enqueues an ALPR read via the normal Worker pool, and (unlike a one-shot trigger) keeps retrying every time bay_monitor reclassifies the bay as still occupied, until a read actually succeeds -- so a bad read caused by e.g. a bay/cargo door being open doesn't cost the whole visit's identity, just that one attempt. occupied->empty then publishes the leave result using whatever plate got confirmed at ANY point during the stay (there's no fresh camera read at that instant to attempt, since 'empty' means the truck's no longer in frame). If mqtt.trigger_enabled or http_trigger.enabled are ALSO on at the same time, both paths independently decide enter/leave for the same bays -- a startup warning (not a hard failure) flags this, since it usually means redundant or conflicting publishes; turn the old trigger(s) off if bay_state_engine is meant to be the sole source of truth. State is in-memory only -- a restart loses any truck currently mid-visit.",
+    "thresholds (all in config now)": "Every numeric decision boundary the code makes is a config value with no separate code-level default of its own beyond what's documented here -- nothing requires a code change to retune. alpr.yolo_conf_threshold is the minimum YOLO box confidence for a plate detection to be considered at all (Ultralytics' own unstated default is 0.25 if not set). bay_monitor.presence_conf_threshold is the same idea for bay_monitor's baseline presence check, kept separate from alpr.yolo_conf_threshold since presence-detection intentionally wants to catch weaker/partial hints of a truck (no size/position filtering there at all, unlike ALPR's own plate detection) -- can reasonably be set lower. alpr.score_weights (plus score_area_norm/score_sharpness_norm) control how multiple candidate crops from one collection window get ranked against each other; alpr.duplicate_resize_width/_height/duplicate_diff_threshold control when two crops are treated as the same sighting rather than voted on twice; alpr.ocr_prep_target_height/ocr_prep_padding control how a crop is resized/bordered before OCR; alpr.max_consecutive_fetch_failures/fetch_failure_backoff_sec control when a collection window gives up on a camera that's not responding.",
+    "service.num_workers/queue_max": "num_workers is roughly 'how many trucks this instance can process at once' -- each Worker thread owns its own loaded YOLO+PaddleOCR models (~2GB RAM apiece), so this is a memory/CPU sizing knob, not just a throughput one. queue_max caps how many pending jobs JobBus holds before it starts dropping new ones instead of growing unbounded."
   },
 
   "model_path": "best.pt",
@@ -71,6 +73,7 @@
     "baseline_scan_interval_ms": 2000,
     "classify_interval_sec": 60,
     "empty_debounce_count": 3,
+    "presence_conf_threshold": 0.25,
     "ollama_host": "http://localhost:11434",
     "ollama_model": null,
     "ollama_timeout_sec": 30,
@@ -97,12 +100,33 @@
     "publish_no_valid_plate": true,
     "diagnostics_mode": "basic",
     "min_ocr_conf": 0.35,
+    "yolo_conf_threshold": 0.25,
+    "max_consecutive_fetch_failures": 10,
+    "fetch_failure_backoff_sec": 0.2,
+    "score_weights": {
+      "yolo_conf": 0.4,
+      "area": 0.25,
+      "sharpness": 0.2,
+      "center": 0.15
+    },
+    "score_area_norm": 25000,
+    "score_sharpness_norm": 600,
+    "duplicate_resize_width": 300,
+    "duplicate_resize_height": 100,
+    "duplicate_diff_threshold": 5,
+    "ocr_prep_target_height": 220,
+    "ocr_prep_padding": 24,
     "paddleocr_det_model_dir": "paddleocr_models/det",
     "paddleocr_rec_model_dir": "paddleocr_models/rec",
     "paddleocr_cls_model_dir": "paddleocr_models/cls",
     "expected_frame_width": 2592,
     "expected_frame_height": 1944,
     "frame_size_tolerance_pct": 10
+  },
+
+  "service": {
+    "num_workers": 3,
+    "queue_max": 50
   },
 
   "logging": {

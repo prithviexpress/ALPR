@@ -12,8 +12,6 @@ from .logging_setup import configure_logging, get_logger
 from .mqtt_bus import JobBus, connect_with_retry, extract_event, matches_class_filter
 from .worker import Worker
 
-NUM_WORKERS = 3     # ~= max concurrent dockings; ~2GB RAM each
-QUEUE_MAX = 50
 AUDIT_DIR = BASE_DIR / "audit"
 CAMERAS_FILE = BASE_DIR / "cameras.json"
 
@@ -207,6 +205,8 @@ def main():
         raise SystemExit(1)
 
     alpr = config["alpr"]
+    num_workers = config["service"]["num_workers"]
+    queue_max = config["service"]["queue_max"]
     troubleshooting = alpr["diagnostics_mode"] == "troubleshooting"
     # diagnostics_mode is a one-variable shortcut: "troubleshooting" forces
     # verbose logging regardless of logging.level, so switching one setting
@@ -242,7 +242,7 @@ def main():
     log.info(f"trigger sources: mqtt={mqtt_trigger_enabled} "
               f"http={http_trigger_enabled} bay_state_engine={bay_state_enabled}")
 
-    log.info(f"workers={NUM_WORKERS} queue_max={QUEUE_MAX} "
+    log.info(f"workers={num_workers} queue_max={queue_max} "
               f"cooldown={alpr['cooldown_sec']}s "
               f"collect_timeout={alpr['collection_timeout']}s")
     log.info(f"samples: raw<={alpr['max_raw_samples']} best={alpr['best_samples']} "
@@ -286,7 +286,7 @@ def main():
     AUDIT_DIR.mkdir(exist_ok=True)
     prune_audit(AUDIT_DIR, alpr['audit_retention_days'])
 
-    bus = JobBus(queue_max=QUEUE_MAX, cooldown_sec=alpr['cooldown_sec'])
+    bus = JobBus(queue_max=queue_max, cooldown_sec=alpr['cooldown_sec'])
     # MQTT is always connected (results are always published over it);
     # subscribe_enabled only controls whether it also *subscribes* to the
     # VCA event topics as a trigger source.
@@ -325,7 +325,7 @@ def main():
         Worker(i + 1, bus.jobs, cameras, config, publish, bus, AUDIT_DIR,
                model_load_lock,
                on_result=state_engine.on_alpr_result if state_engine else None)
-        for i in range(NUM_WORKERS)
+        for i in range(num_workers)
     ]
     for w in workers:
         w.start()

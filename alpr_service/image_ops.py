@@ -2,19 +2,26 @@
 import cv2
 import numpy as np
 
-TARGET_H = 220
-PAD = 24
+# Fallback defaults if a caller doesn't pass config-driven values -- every
+# real call site (worker.py) does, sourced from alpr.ocr_prep_target_height
+# / alpr.ocr_prep_padding / alpr.duplicate_resize_width / _height /
+# alpr.duplicate_diff_threshold, so these only matter for standalone use
+# (tests, a REPL) where reproducing prior hardcoded behavior is wanted.
+DEFAULT_TARGET_H = 220
+DEFAULT_PAD = 24
+DEFAULT_DUPLICATE_RESIZE = (300, 100)
+DEFAULT_DUPLICATE_DIFF_THRESHOLD = 5
 
 
-def prep(img):
-    scale = TARGET_H / img.shape[0]
+def prep(img, target_h=DEFAULT_TARGET_H, pad=DEFAULT_PAD):
+    scale = target_h / img.shape[0]
     if scale > 1.0:
         img = cv2.resize(img, None, fx=scale, fy=scale,
                           interpolation=cv2.INTER_CUBIC)
     edge = np.concatenate([img[0].reshape(-1, 3), img[-1].reshape(-1, 3),
                             img[:, 0].reshape(-1, 3), img[:, -1].reshape(-1, 3)])
     fill = tuple(int(v) for v in np.median(edge, axis=0))
-    return cv2.copyMakeBorder(img, PAD, PAD, PAD, PAD,
+    return cv2.copyMakeBorder(img, pad, pad, pad, pad,
                                borderType=cv2.BORDER_CONSTANT, value=fill)
 
 
@@ -23,10 +30,11 @@ def sharpness(img):
                           cv2.CV_64F).var()
 
 
-def duplicate(a, b):
+def duplicate(a, b, resize=DEFAULT_DUPLICATE_RESIZE,
+              diff_threshold=DEFAULT_DUPLICATE_DIFF_THRESHOLD):
     try:
-        a = cv2.resize(a, (300, 100)); b = cv2.resize(b, (300, 100))
-        return cv2.absdiff(a, b).mean() < 5
+        a = cv2.resize(a, resize); b = cv2.resize(b, resize)
+        return cv2.absdiff(a, b).mean() < diff_threshold
     except Exception:
         return False
 

@@ -226,6 +226,15 @@ def load_config(path: Path = None) -> dict:
     bay_monitor.setdefault("ollama_timeout_sec", 30)
     bay_monitor.setdefault("status_values",
                             ["empty", "occupied", "unloading", "loading", "idle"])
+    # Optional few-shot exemplars sent alongside every classification
+    # call, e.g. [{"path": "reference_images/empty.jpg", "label": "empty"},
+    # {"path": "reference_images/door_open.jpg", "label": "occupied (bay
+    # door open)"}]. Paths are resolved relative to config.json's
+    # directory, same as model_path. Loaded once at startup, not re-read
+    # per call. Helps most on ambiguous real-world cases a text-only
+    # prompt undersells -- e.g. an open bay/cargo door that can otherwise
+    # get misread as empty or confuse the model.
+    bay_monitor.setdefault("reference_images", [])
     bay_monitor.setdefault("classification_prompt", (
         "You are monitoring a truck loading dock bay through a fixed "
         "security camera. Classify the current activity into EXACTLY ONE "

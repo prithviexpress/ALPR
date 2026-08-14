@@ -49,23 +49,75 @@ class BayState:
         self.consecutive_empty = 0
 
 
-def classify_frame(frame, bm_cfg: dict, log, bay: str):
-    """POSTs one JPEG-encoded frame to a local Ollama vision model and
-    returns whichever of bm_cfg['status_values'] appears in its reply, or
-    None if the request/response didn't produce a usable answer (logged,
-    never raised -- a flaky local LLM call shouldn't take the scanner
-    thread down)."""
+def load_reference_images(bm_cfg: dict, config_dir: Path, log) -> list:
+    """Loads and JPEG-encodes each configured exemplar image once at
+    startup (not per-classification-call -- these are static, re-reading
+    and re-encoding them on every scan would be pure waste). A missing or
+    unreadable file is logged and skipped rather than failing startup --
+    a typo'd reference path shouldn't take down the whole monitor, it
+    just means classification runs without that one example's help."""
+    refs = []
+    for entry in bm_cfg.get("reference_images", []):
+        path = config_dir / entry["path"]
+        img = cv2.imread(str(path))
+        if img is None:
+            log.warning(f"reference image not found/unreadable: {path} "
+                        f"(label={entry.get('label')!r}), skipping")
+            continue
+        ok, buf = cv2.imencode(".jpg", img)
+        if not ok:
+            log.warning(f"failed to encode reference image {path}, skipping")
+            continue
+        refs.append((entry["label"], base64.b64encode(buf.tobytes()).decode("ascii")))
+    if refs:
+        log.info(f"loaded {len(refs)} reference image(s) as few-shot "
+                  f"classification context: {[l for l, _ in refs]}")
+    return refs
+
+
+def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = None):
+    """POSTs one JPEG-encoded frame -- plus, if configured, a set of
+    labeled exemplar images sent alongside it as few-shot context -- to a
+    local Ollama vision model, and returns whichever of
+    bm_cfg['status_values'] appears in its reply. Returns None if the
+    request/response didn't produce a usable answer (logged, never
+    raised -- a flaky local LLM call shouldn't take the scanner thread
+    down).
+
+    Few-shot exemplars matter most for exactly the ambiguous cases a bare
+    prompt gets wrong -- e.g. a truck with its bay/cargo door open, which
+    can look enough like "empty" or confuse plate detection that showing
+    the model a labeled example of that specific situation calibrates it
+    far better than describing it in words alone."""
     ok, buf = cv2.imencode(".jpg", frame)
     if not ok:
         log.warning(f"({bay}) failed to JPEG-encode frame for classification")
         return None
-    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    target_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+
+    reference_images = reference_images or []
+    images = [b64 for _, b64 in reference_images] + [target_b64]
+
+    if reference_images:
+        example_lines = "\n".join(
+            f"Image {i + 1} is a labeled example of: {label}."
+            for i, (label, _) in enumerate(reference_images))
+        prompt = (
+            f"{bm_cfg['classification_prompt']}\n\n"
+            f"For calibration, here are labeled example images:\n"
+            f"{example_lines}\n"
+            f"Image {len(reference_images) + 1} (the LAST image) is the "
+            f"one you must classify now. The earlier images are only "
+            f"reference examples, not the subject of your answer."
+        )
+    else:
+        prompt = bm_cfg["classification_prompt"]
 
     url = f"{bm_cfg['ollama_host'].rstrip('/')}/api/generate"
     payload = {
         "model": bm_cfg["ollama_model"],
-        "prompt": bm_cfg["classification_prompt"],
-        "images": [b64],
+        "prompt": prompt,
+        "images": images,
         "stream": False,
     }
     try:
@@ -94,6 +146,7 @@ def run_bay_monitor(cameras: dict, config: dict, publish_fn, stop_event: threadi
     config_dir = Path(config["_config_dir"])
     model_path = config_dir / config["model_path"]
     model = YOLO(str(model_path))
+    reference_images = load_reference_images(bm_cfg, config_dir, log)
     log.info(f"bay monitor started: model={model_path} "
               f"baseline_interval={bm_cfg['baseline_scan_interval_ms']}ms "
               f"classify_interval={bm_cfg['classify_interval_sec']}s "
@@ -142,7 +195,7 @@ def run_bay_monitor(cameras: dict, config: dict, publish_fn, stop_event: threadi
                         log.info(f"({bay}) presence detected, zooming in")
 
                 if state.zoomed_in:
-                    status = classify_frame(frame, bm_cfg, log, bay)
+                    status = classify_frame(frame, bm_cfg, log, bay, reference_images)
                     state.last_classify_time = time.time()
                     if status is not None:
                         payload = {

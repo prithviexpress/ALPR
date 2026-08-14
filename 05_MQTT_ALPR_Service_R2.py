@@ -383,6 +383,25 @@
 #       now right there in the SAME message, not only on the separate
 #       mqtt.bay_notification_topic_prefix (item #24) someone would have
 #       had to discover and subscribe to separately.
+#   26. Two more direct requests:
+#       (a) bay_monitor.classification_prompt's COMMENT instruction now
+#           explicitly asks for the vision model's REASONING -- the
+#           specific visual evidence it based the status on (cargo
+#           doors open/closed, boxes/pallets visible, a forklift or
+#           workers present) -- not just a restatement of the status
+#           word ("the bay is loading"). Makes mqtt.bay_notification_
+#           topic_prefix's comment field actually useful for spot-
+#           checking a classification without opening the frame.
+#       (b) mqtt.bay_snapshot_topic_prefix's periodic heartbeat payload
+#           gained "occupancy_status"/"activity", carrying this bay's
+#           last-known classification (BayState.last_status) alongside
+#           the image -- set whenever a classify actually runs, not
+#           freshly computed by the heartbeat itself (which stays a
+#           cheap JPEG-encode-only operation, no Ollama round trip). The
+#           heartbeat still fires unconditionally on its own timer --
+#           mqtt.bay_notification_topic_prefix (item #24) remains the
+#           only channel gated on an actual status CHANGE, which is the
+#           one meant to be treated as a "notification" to react to.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

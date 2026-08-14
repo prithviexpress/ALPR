@@ -85,6 +85,13 @@ class BayState:
         # classification entirely, so it keeps firing even for a bay
         # that's sitting at baseline with nothing happening.
         self.last_snapshot_publish_time = 0.0
+        # This bay's most recent successful classification word (e.g.
+        # "loading", "empty") -- so the periodic snapshot heartbeat can
+        # report current occupancy/activity alongside the image, without
+        # forcing a fresh classify call just to answer "what do we think
+        # is happening right now". None until the first classify ever
+        # succeeds.
+        self.last_status = None
 
 
 def downscale(img, max_dimension: int):
@@ -472,11 +479,17 @@ class BayMonitor:
         return changed
 
     def _publish_snapshot(self, bay: str, frame, state: BayState):
-        """Independent of classification entirely: a plain base64 image
-        heartbeat on its own timer (bay_monitor.snapshot_publish_interval_
-        sec, default 300s), so a downstream consumer has a periodic "here
-        is what this bay actually looks like right now" without needing
-        to wait for -- or trigger -- a status change. 0 disables it."""
+        """A base64 image heartbeat on its own timer (bay_monitor.
+        snapshot_publish_interval_sec, default 300s), independent of
+        whether a classify happens to run this round -- so a downstream
+        consumer has a periodic "here is what this bay looks like, and
+        what we currently believe is happening" without needing to wait
+        for -- or trigger -- a status change. occupancy_status/activity
+        report the last classification this bay actually got (state.
+        last_status, possibly from several rounds ago if nothing's
+        changed since -- not a fresh classify call, which would defeat
+        the point of this being a CHEAP heartbeat), or None if this bay
+        has never been classified yet. 0 disables it."""
         if not self.snapshot_publish_interval_sec:
             return
         if (time.time() - state.last_snapshot_publish_time
@@ -487,9 +500,15 @@ class BayMonitor:
         if image_b64 is None:
             return
         state.last_snapshot_publish_time = time.time()
+        occupancy_status = None
+        if state.last_status is not None:
+            occupancy_status = ("empty" if state.last_status == self.empty_status
+                                 else "occupied")
         topic = f"{self.snapshot_topic_prefix}/{bay}"
         self.publish(topic, json.dumps({
             "bay": bay,
+            "occupancy_status": occupancy_status,
+            "activity": state.last_status,
             "image_base64": image_b64,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }))
@@ -545,6 +564,7 @@ class BayMonitor:
         if status is None:
             return
         state.classified_once = True
+        state.last_status = status
 
         timestamp = datetime.now(timezone.utc).isoformat()
         topic = f"{self.status_topic_prefix}/{bay}"

@@ -432,8 +432,11 @@ def load_config(path: Path = None) -> dict:
         "loading or unloading (e.g. waiting, doors closed, driver break). "
         "Respond in EXACTLY this two-line format, nothing else:\n"
         "STATUS: <the single classification word>\n"
-        "COMMENT: <one short plain-English sentence describing what you "
-        "actually see happening in the bay>"
+        "COMMENT: <briefly explain WHY you chose that status -- the "
+        "specific visual evidence you reasoned from (e.g. cargo doors "
+        "open/closed, boxes or pallets visible on the ground or being "
+        "carried, a forklift or workers present, the truck bed's "
+        "visible contents), not just a restatement of the status word>"
     ))
     # Periodic image-only MQTT heartbeat, independent of classification --
     # see bay_monitor.py's _publish_snapshot. 0 disables it.

@@ -50,15 +50,48 @@ class BayState:
         self.consecutive_empty = 0
 
 
+def downscale(img, max_dimension: int):
+    """Shrink so the longest side is at most max_dimension, preserving
+    aspect. A vision model's prefill cost scales with pixel count, and a
+    raw 5MP snapshot is ~6x the pixels of a 1024-wide view -- on a
+    CPU-only box that difference routinely exceeds ollama_timeout_sec,
+    and a timeout throws away the fetch, the encode and the partial
+    inference alike, leaving the bay with no status at all. Returns the
+    image untouched if it's already small enough or if max_dimension is
+    falsy (downscaling disabled)."""
+    if not max_dimension:
+        return img
+    h, w = img.shape[:2]
+    longest = max(h, w)
+    if longest <= max_dimension:
+        return img
+    scale = max_dimension / longest
+    return cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                       interpolation=cv2.INTER_AREA)
+
+
+def encode_image(img, max_dimension: int, jpeg_quality: int):
+    """Downscale -> JPEG -> base64, the form Ollama wants."""
+    ok, buf = cv2.imencode(".jpg", downscale(img, max_dimension),
+                            [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+    if not ok:
+        return None
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
 def load_reference_images(bm_cfg: dict, config_dir: Path, log) -> list:
-    """Loads and JPEG-encodes each configured exemplar image once at
-    startup (not per-classification-call -- these are static, re-reading
-    and re-encoding them on every scan would be pure waste). A missing or
-    unreadable file is logged and skipped rather than failing startup --
-    a typo'd reference path shouldn't take down the whole monitor, it
-    just means classification runs without that one example's help."""
+    """Loads, downscales and JPEG-encodes each configured exemplar image
+    once at startup (not per-classification-call -- these are static, so
+    re-reading and re-encoding them on every scan would be pure waste,
+    and at full source resolution each one would multiply every
+    classification's prefill bill). A missing or unreadable file is
+    logged and skipped rather than failing startup -- a typo'd reference
+    path shouldn't take down the whole monitor, it just means
+    classification runs without that one example's help."""
     refs = []
-    for entry in bm_cfg.get("reference_images", []):
+    max_dim = bm_cfg["classify_max_dimension"]
+    quality = bm_cfg["classify_jpeg_quality"]
+    for entry in bm_cfg["reference_images"]:
         # A malformed entry (not a dict, or missing "path"/"label") is
         # skipped with a warning like a missing file is -- a config typo
         # here must not raise out of startup and kill the monitor thread.
@@ -72,11 +105,11 @@ def load_reference_images(bm_cfg: dict, config_dir: Path, log) -> list:
             log.warning(f"reference image not found/unreadable: {path} "
                         f"(label={entry['label']!r}), skipping")
             continue
-        ok, buf = cv2.imencode(".jpg", img)
-        if not ok:
+        b64 = encode_image(img, max_dim, quality)
+        if b64 is None:
             log.warning(f"failed to encode reference image {path}, skipping")
             continue
-        refs.append((entry["label"], base64.b64encode(buf.tobytes()).decode("ascii")))
+        refs.append((entry["label"], b64))
     if refs:
         log.info(f"loaded {len(refs)} reference image(s) as few-shot "
                   f"classification context: {[l for l, _ in refs]}")
@@ -97,11 +130,11 @@ def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = 
     can look enough like "empty" or confuse plate detection that showing
     the model a labeled example of that specific situation calibrates it
     far better than describing it in words alone."""
-    ok, buf = cv2.imencode(".jpg", frame)
-    if not ok:
+    target_b64 = encode_image(frame, bm_cfg["classify_max_dimension"],
+                               bm_cfg["classify_jpeg_quality"])
+    if target_b64 is None:
         log.warning(f"({bay}) failed to JPEG-encode frame for classification")
         return None
-    target_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
     reference_images = reference_images or []
     images = [b64 for _, b64 in reference_images] + [target_b64]
@@ -173,162 +206,194 @@ def parse_status(text: str, status_values, log, bay: str):
     return None
 
 
-def run_bay_monitor(cameras: dict, config: dict, publish_fn, stop_event: threading.Event,
-                     on_status=None):
-    log = get_logger("BAY_MONITOR")
-    bm_cfg = config["bay_monitor"]
-    snap_cfg = config["snapshot"]
-    bay_status_topic_prefix = config["mqtt"]["bay_status_topic_prefix"]
+class BayMonitor:
+    """The round-robin scanner.
 
-    from ultralytics import YOLO
-    config_dir = Path(config["_config_dir"])
-    model_path = config_dir / config["model_path"]
-    model = YOLO(str(model_path))
-    reference_images = load_reference_images(bm_cfg, config_dir, log)
-    log.info(f"bay monitor started: model={model_path} "
-              f"baseline_interval={bm_cfg['baseline_scan_interval_ms']}ms "
-              f"classify_interval={bm_cfg['classify_interval_sec']}s "
-              f"ollama={bm_cfg['ollama_host']} model={bm_cfg['ollama_model']}")
+    A class rather than functions threading a dozen loop-invariant
+    arguments through each call: the model, HTTP session, auth, encoded
+    reference images, logger and config slices are all fixed for the
+    thread's lifetime, and only (bay, cam, state) vary per turn.
+    """
 
-    session = requests.Session()
-    auth = build_auth(config)
-    states = {}
-    empty_status = bm_cfg.get("empty_status", "empty")
-    classify_region = bm_cfg.get("classify_region", "full_frame")
+    def __init__(self, cameras: dict, config: dict, publish_fn, on_status=None):
+        self.log = get_logger("BAY_MONITOR")
+        self.cameras = cameras
+        self.config = config
+        self.publish = publish_fn
+        self.on_status = on_status
+        self.cfg = config["bay_monitor"]
+        self.snap_cfg = config["snapshot"]
+        self.status_topic_prefix = config["mqtt"]["bay_status_topic_prefix"]
+        self.empty_status = self.cfg["empty_status"]
+        self.classify_region = self.cfg["classify_region"]
+        self.scan_interval_sec = self.cfg["baseline_scan_interval_ms"] / 1000
+        self.states = {}
 
-    while not stop_event.is_set():
-        for bay, cam in cameras.items():
-            if stop_event.is_set():
-                break
-            if not cam.get("enabled", True):
-                continue
-            state = states.setdefault(bay, BayState())
+        from ultralytics import YOLO
+        config_dir = Path(config["_config_dir"])
+        model_path = config_dir / config["model_path"]
+        self.model = YOLO(str(model_path))
+        self.references = load_reference_images(self.cfg, config_dir, self.log)
+        self.session = requests.Session()
+        self.auth = build_auth(config)
+        self.log.info(
+            f"bay monitor started: model={model_path} "
+            f"baseline_interval={self.cfg['baseline_scan_interval_ms']}ms "
+            f"classify_interval={self.cfg['classify_interval_sec']}s "
+            f"classify_region={self.classify_region} "
+            f"classify_max_dim={self.cfg['classify_max_dimension']} "
+            f"ollama={self.cfg['ollama_host']} model={self.cfg['ollama_model']}")
 
-            if state.zoomed_in and (time.time() - state.last_classify_time
-                                     < bm_cfg["classify_interval_sec"]):
-                # Not due yet -- skip without fetching a frame, but still
-                # pace the loop. Without this wait, a round consisting
-                # entirely of zoomed-in-but-not-due bays would busy-spin
-                # the thread at ~100% CPU checking timestamps in a tight
-                # loop instead of idling until there's real work to do.
-                if stop_event.wait(bm_cfg["baseline_scan_interval_ms"] / 1000):
+    def run(self, stop_event: threading.Event):
+        while not stop_event.is_set():
+            for bay, cam in self.cameras.items():
+                if stop_event.is_set():
                     break
-                continue
+                if not cam.get("enabled", True):
+                    continue
+                state = self.states.setdefault(bay, BayState())
 
-            # Everything per-bay is wrapped: this loop is the ONLY thing
-            # driving bay_state_engine, so an unhandled exception here
-            # would kill the thread and silently stop all ALPR while the
-            # process still looks healthy. One bad bay must cost one
-            # round, not the whole monitor.
-            try:
-                _scan_bay(bay, cam, state, config, bm_cfg, snap_cfg, model,
-                          session, auth, reference_images, publish_fn,
-                          bay_status_topic_prefix, on_status, log,
-                          empty_status, classify_region)
-            except Exception:
-                log.error(f"({bay}) scan round failed, continuing with the "
-                          f"next bay", exc_info=True)
+                if state.zoomed_in and (time.time() - state.last_classify_time
+                                         < self.cfg["classify_interval_sec"]):
+                    # Not due yet -- skip without fetching a frame, but
+                    # still pace the loop. Without this wait, a round of
+                    # zoomed-in-but-not-due bays would busy-spin the
+                    # thread at ~100% CPU checking timestamps.
+                    if stop_event.wait(self.scan_interval_sec):
+                        break
+                    continue
 
-            # Pace between bays regardless of what happened above -- keeps
-            # the round-robin from hammering every camera back-to-back
-            # with no gap. wait() returns True the moment stop_event is
-            # set, letting shutdown interrupt the pause immediately
-            # instead of waiting out the full interval.
-            if stop_event.wait(bm_cfg["baseline_scan_interval_ms"] / 1000):
-                break
+                # Every bay's turn is wrapped: this loop is the ONLY thing
+                # driving bay_state_engine, so an unhandled exception here
+                # would kill the thread and silently stop all ALPR while
+                # the process still looks healthy. One bad bay must cost
+                # one round, not the whole monitor.
+                try:
+                    self._scan_bay(bay, cam, state)
+                except Exception:
+                    self.log.error(f"({bay}) scan round failed, continuing "
+                                   f"with the next bay", exc_info=True)
 
-    log.info("bay monitor stopped")
+                # Pace between bays regardless of what happened above --
+                # keeps the round-robin from hammering every camera
+                # back-to-back. wait() returns True the moment stop_event
+                # is set, so shutdown interrupts the pause immediately.
+                if stop_event.wait(self.scan_interval_sec):
+                    break
 
+        self.log.info("bay monitor stopped")
 
-def _scan_bay(bay, cam, state, config, bm_cfg, snap_cfg, model, session, auth,
-              reference_images, publish_fn, bay_status_topic_prefix, on_status,
-              log, empty_status, classify_region):
-    """One bay's turn in the round-robin: fetch a frame, and either check
-    for presence (baseline) or classify activity (zoomed in)."""
-    try:
-        url = build_snapshot_url(cam, config)
-        frame, fetch_ms, size_bytes = fetch_snapshot(
-            session, url, auth,
-            snap_cfg["connect_timeout_ms"], snap_cfg["read_timeout_ms"])
-    except SnapshotError as e:
-        log.debug(f"({bay}) snapshot fetch failed: {e}")
-        return
-
-    roi = None
-    x1, y1, x2, y2 = cam["roi"]
-    candidate_roi = frame[y1:y2, x1:x2]
-    if candidate_roi.size == 0:
-        # Same guard worker.py's collect() applies -- an ROI that falls
-        # outside the frame slices to an empty array, which YOLO raises on.
-        log.warning(f"({bay}) roi {cam['roi']} is empty against a "
-                    f"{frame.shape[1]}x{frame.shape[0]} frame -- check the "
-                    f"roi in cameras.json")
-    else:
-        roi = candidate_roi
-
-    if not state.zoomed_in:
-        if roi is None:
-            return
-        results = model(roi, conf=bm_cfg.get("presence_conf_threshold", 0.25),
-                         verbose=False)
-        if not any(len(r.boxes) > 0 for r in results):
-            return
-        state.zoomed_in = True
-        state.consecutive_empty = 0
-        log.info(f"({bay}) presence detected, zooming in")
-
-    # Which pixels the vision model actually judges. "full_frame" (the
-    # default) shows it the whole bay -- cargo, forklifts, doors -- which
-    # is what the activity vocabulary is really about, but it also means a
-    # truck in an ADJACENT bay that happens to be in shot can drive this
-    # bay's status (and, with bay_state_engine on, open a session on the
-    # wrong bay). "roi" restricts it to the same region presence detection
-    # uses, which removes that cross-talk at the cost of a much narrower
-    # view. Switch to "roi" if bays overlap in frame.
-    classify_img = roi if (classify_region == "roi" and roi is not None) else frame
-    status = classify_frame(classify_img, bm_cfg, log, bay, reference_images)
-    state.last_classify_time = time.time()
-    if status is None:
-        return
-
-    timestamp = datetime.now(timezone.utc).isoformat()
-    payload = {"bay": bay, "status": status, "timestamp": timestamp}
-    topic = f"{bay_status_topic_prefix}/{bay}"
-    publish_fn(topic, json.dumps(payload))
-    log.info(f"({bay}) status={status} -> {topic}")
-
-    if status == empty_status:
-        state.consecutive_empty += 1
-        if state.consecutive_empty >= bm_cfg["empty_debounce_count"]:
-            state.zoomed_in = False
-            log.info(f"({bay}) {state.consecutive_empty} consecutive "
-                      f"'{empty_status}' reads, reverting to baseline scan")
-    else:
-        state.consecutive_empty = 0
-
-    # Called last, after state.zoomed_in above already reflects the
-    # post-transition truth -- so a consumer (e.g. bay_state.py's
-    # BayStateEngine) can tell "this was the empty read that made this
-    # loop give up watching closely" (zoomed_in=False) apart from "still
-    # empty, still watching" (zoomed_in=True) without re-deriving its
-    # own, potentially out-of-sync copy of this same debounce decision.
-    if on_status is not None:
+    def _fetch(self, bay: str, cam: dict):
         try:
-            on_status(bay, status, timestamp, state.zoomed_in)
+            url = build_snapshot_url(cam, self.config)
+            frame, _, _ = fetch_snapshot(
+                self.session, url, self.auth,
+                self.snap_cfg["connect_timeout_ms"],
+                self.snap_cfg["read_timeout_ms"])
+            return frame
+        except SnapshotError as e:
+            self.log.debug(f"({bay}) snapshot fetch failed: {e}")
+            return None
+
+    def _roi(self, bay: str, cam: dict, frame):
+        """The configured ROI slice, or None if it falls outside the frame
+        (the same guard worker.py's collect() applies -- an empty slice is
+        what YOLO raises on)."""
+        x1, y1, x2, y2 = cam["roi"]
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            self.log.warning(f"({bay}) roi {cam['roi']} is empty against a "
+                             f"{frame.shape[1]}x{frame.shape[0]} frame -- "
+                             f"check the roi in cameras.json")
+            return None
+        return roi
+
+    def _detect_presence(self, roi) -> bool:
+        """Cheap "is anything there at all" check -- no size/position
+        filtering, any box counts. Runs at presence_imgsz rather than the
+        detector's default, since it only needs a yes/no, not a precise box."""
+        results = self.model(roi, conf=self.cfg["presence_conf_threshold"],
+                              imgsz=self.cfg["presence_imgsz"], verbose=False)
+        return any(len(r.boxes) > 0 for r in results)
+
+    def _scan_bay(self, bay: str, cam: dict, state: BayState):
+        """One bay's turn: fetch a frame, then either check for presence
+        (baseline) or classify activity (zoomed in)."""
+        frame = self._fetch(bay, cam)
+        if frame is None:
+            return
+        roi = self._roi(bay, cam, frame)
+
+        if not state.zoomed_in:
+            if roi is None or not self._detect_presence(roi):
+                return
+            state.zoomed_in = True
+            state.consecutive_empty = 0
+            self.log.info(f"({bay}) presence detected, zooming in")
+
+        # Which pixels the vision model judges. "full_frame" (default)
+        # shows it the whole bay -- cargo, forklifts, doors -- which is
+        # what the activity vocabulary is about, but a truck in an
+        # ADJACENT bay that's in shot can then drive this bay's status.
+        # "roi" removes that cross-talk at the cost of a narrower view.
+        classify_img = roi if (self.classify_region == "roi" and roi is not None) else frame
+        status = classify_frame(classify_img, self.cfg, self.log, bay,
+                                 self.references)
+        state.last_classify_time = time.time()
+        if status is None:
+            return
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        topic = f"{self.status_topic_prefix}/{bay}"
+        self.publish(topic, json.dumps(
+            {"bay": bay, "status": status, "timestamp": timestamp}))
+        self.log.info(f"({bay}) status={status} -> {topic}")
+
+        occupied = status != self.empty_status
+        departed = False
+        if occupied:
+            state.consecutive_empty = 0
+        else:
+            state.consecutive_empty += 1
+            if state.consecutive_empty >= self.cfg["empty_debounce_count"]:
+                state.zoomed_in = False
+                departed = True
+                self.log.info(f"({bay}) {state.consecutive_empty} consecutive "
+                              f"'{self.empty_status}' reads, reverting to "
+                              f"baseline scan")
+
+        self._notify(bay, status, timestamp, occupied, departed)
+
+    def _notify(self, bay, status, timestamp, occupied, departed):
+        """Hand the reading to a consumer as an already-interpreted event.
+
+        `occupied` and `departed` are decided here rather than shipping
+        raw internal state, because this module owns both the vocabulary
+        (empty_status) and the debounce (empty_debounce_count) they
+        derive from. A consumer re-deriving either would hold a second
+        copy of a threshold that can drift out of sync with this one.
+        """
+        if self.on_status is None:
+            return
+        try:
+            self.on_status(bay, status, timestamp, occupied, departed)
         except Exception:
-            log.error(f"({bay}) on_status hook raised", exc_info=True)
+            self.log.error(f"({bay}) on_status hook raised", exc_info=True)
 
 
 def start_bay_monitor(cameras: dict, config: dict, publish_fn, on_status=None):
     """Starts the round-robin scanner in a background thread. Returns
-    (thread, stop_event) -- signal stop_event to ask the loop to exit at
-    its next check point (it won't interrupt a request already in
-    flight). on_status, if given, is called (bay, status, timestamp) after
-    every successful classification -- see bay_state.py's BayStateEngine
-    for the main consumer."""
+    (thread, stop_event) -- set stop_event to ask the loop to exit at its
+    next check point (it won't interrupt a request already in flight).
+
+    on_status, if given, is called
+    (bay, status, timestamp, occupied, departed) after every successful
+    classification -- see bay_state.py's BayStateEngine, the main
+    consumer, for what those last two mean and why they're computed here.
+    """
+    monitor = BayMonitor(cameras, config, publish_fn, on_status)
     stop_event = threading.Event()
-    t = threading.Thread(target=run_bay_monitor,
-                          args=(cameras, config, publish_fn, stop_event, on_status),
+    t = threading.Thread(target=monitor.run, args=(stop_event,),
                           daemon=True, name="bay-monitor")
     t.start()
     return t, stop_event

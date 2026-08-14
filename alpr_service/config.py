@@ -83,6 +83,10 @@ def load_config(path: Path = None) -> dict:
     # still connected and used to publish results either way; this only
     # controls the *subscribe* side.
     mqtt.setdefault("trigger_enabled", True)
+    # Where bay_monitor publishes per-bay activity status ("/<bay>" is
+    # appended). Lives here with the other topics rather than down in the
+    # bay_monitor block, since it's part of the MQTT topic contract.
+    mqtt.setdefault("bay_status_topic_prefix", "site/alpr/bay_status")
 
     # An alternative trigger source to the MQTT VCA events above: some
     # cameras (e.g. a Bosch dome's built-in "HTTP notification" alarm
@@ -150,6 +154,15 @@ def load_config(path: Path = None) -> dict:
     # something no real plate could ever be (it must not satisfy
     # plate_text.is_valid(), or it could be mistaken for a real read).
     alpr.setdefault("unknown_plate_value", "UNKNOWN")
+    # Ceiling on how many ALPR reads bay_state_engine will queue for one
+    # visit while the plate is still unconfirmed. Without a cap, a truck
+    # parked for hours with an unreadable plate re-runs a full 8s
+    # collection every cooldown window indefinitely -- each one occupying
+    # one of only service.num_workers threads and re-photographing the
+    # same obscured plate -- which starves genuinely new arrivals. Only
+    # consulted by bay_state.py; the MQTT/HTTP trigger paths are
+    # one-shot and unaffected.
+    alpr.setdefault("max_read_attempts", 20)
     # Minimum YOLO box confidence for a plate detection to be considered
     # at all (Ultralytics' own default is 0.25 if this isn't passed
     # explicitly -- surfaced here so it's tunable without a code change).
@@ -305,6 +318,21 @@ def load_config(path: Path = None) -> dict:
     # prompt undersells -- e.g. an open bay/cargo door that can otherwise
     # get misread as empty or confuse the model.
     bay_monitor.setdefault("reference_images", [])
+    # Longest side (pixels) an image is downscaled to before being JPEG
+    # encoded and sent to the vision model, and the JPEG quality used.
+    # A raw 5MP snapshot is ~6x the pixels of a 1024-wide view, and a
+    # vision model's prefill cost scales with pixel count -- on a CPU-only
+    # box that difference routinely blows past ollama_timeout_sec, and a
+    # timeout discards the fetch, the encode and the partial inference
+    # entirely, leaving the bay with no status at all. Reference exemplars
+    # are downscaled the same way, once at startup. Set to 0 to disable
+    # downscaling and send frames at full resolution.
+    bay_monitor.setdefault("classify_max_dimension", 1024)
+    bay_monitor.setdefault("classify_jpeg_quality", 80)
+    # Inference size for the cheap presence check. It only needs a
+    # yes/no "is anything there", not a precise box, so it runs well
+    # below the detector's default 640.
+    bay_monitor.setdefault("presence_imgsz", 320)
     bay_monitor.setdefault("classification_prompt", (
         "You are monitoring a truck loading dock bay through a fixed "
         "security camera. Classify the current activity into EXACTLY ONE "
@@ -316,8 +344,6 @@ def load_config(path: Path = None) -> dict:
         "loading or unloading (e.g. waiting, doors closed, driver break). "
         "Respond with only the single classification word, nothing else."
     ))
-    mqtt.setdefault("bay_status_topic_prefix", "site/alpr/bay_status")
-
     # Per-bay state engine (bay_state.py) -- fuses bay_monitor's
     # continuous status stream with ALPR plate reads into one session per
     # bay, and becomes the authority for enter/leave direction and

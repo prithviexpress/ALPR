@@ -18,8 +18,10 @@ import requests
 from ultralytics import YOLO
 from paddleocr import PaddleOCR
 
-from .image_ops import prep, sharpness, duplicate, save_debug_image, check_frame_size
+from .image_ops import (prep, sharpness, thumbnail, duplicate_thumbs,
+                         save_debug_image, check_frame_size)
 from .logging_setup import get_logger
+from .results import build_reply, result_topic, should_publish
 from .plate_text import is_valid, fix_indian_plate, weighted_vote
 from .snapshot import build_snapshot_url, build_auth, fetch_snapshot, SnapshotError
 
@@ -32,6 +34,7 @@ ERROR_STATUS = {
     'no_frame_received': 'CAMERA_UNREACHABLE',
     'frame_size_mismatch': 'FRAME_SIZE_ERROR',
 }
+
 
 class Worker(threading.Thread):
     def __init__(self, wid, jobs, cameras: dict, config: dict, publish_fn,
@@ -69,6 +72,11 @@ class Worker(threading.Thread):
         self.auth = None
         self.log = get_logger(f"WORKER-{wid}")
 
+        # Subscripted, not .get(key, default): load_config() applies every
+        # default in one place, so repeating the literals here would give
+        # each setting two homes that can silently disagree. They already
+        # had -- publish_no_valid_plate defaulted True in config.py and
+        # False here, and only the config.py one was ever reachable.
         alpr = config["alpr"]
         self.collection_timeout = alpr["collection_timeout"]
         self.max_raw_samples = alpr["max_raw_samples"]
@@ -76,37 +84,31 @@ class Worker(threading.Thread):
         self.min_plate_width = alpr["min_plate_width"]
         self.min_plate_height = alpr["min_plate_height"]
         self.center_distance_limit = alpr["center_distance_limit"]
-        self.upper_half_fraction = alpr.get("upper_half_fraction", 0.45)
-        self.plate_crop_padding_pct = alpr.get("plate_crop_padding_pct", 15)
-        self.troubleshooting = alpr.get("diagnostics_mode", "basic") == "troubleshooting"
-        self.publish_no_valid_plate = alpr.get("publish_no_valid_plate", False)
-        self.expected_frame_width = alpr.get("expected_frame_width")
-        self.expected_frame_height = alpr.get("expected_frame_height")
-        self.frame_size_tolerance_pct = alpr.get("frame_size_tolerance_pct", 10)
-        self.min_ocr_conf = alpr.get("min_ocr_conf", 0.35)
-        self.unknown_plate_value = alpr.get("unknown_plate_value", "UNKNOWN")
-        self.yolo_conf_threshold = alpr.get("yolo_conf_threshold", 0.25)
-        self.max_consecutive_fetch_failures = alpr.get(
-            "max_consecutive_fetch_failures", 10)
-        self.fetch_failure_backoff_sec = alpr.get("fetch_failure_backoff_sec", 0.2)
-        # Merged, not replaced -- load_config() already does this, but a
-        # Worker built from a hand-made config dict must not be able to
-        # KeyError mid-job on a missing weight either.
-        self.score_weights = {"yolo_conf": 0.4, "area": 0.25,
-                               "sharpness": 0.2, "center": 0.15}
-        self.score_weights.update(alpr.get("score_weights") or {})
-        self.score_area_norm = alpr.get("score_area_norm", 25000)
-        self.score_sharpness_norm = alpr.get("score_sharpness_norm", 600)
-        self.duplicate_resize = (
-            alpr.get("duplicate_resize_width", 300),
-            alpr.get("duplicate_resize_height", 100))
-        self.duplicate_diff_threshold = alpr.get("duplicate_diff_threshold", 5)
-        self.ocr_prep_target_height = alpr.get("ocr_prep_target_height", 220)
-        self.ocr_prep_padding = alpr.get("ocr_prep_padding", 24)
+        self.upper_half_fraction = alpr["upper_half_fraction"]
+        self.plate_crop_padding_pct = alpr["plate_crop_padding_pct"]
+        self.troubleshooting = alpr["diagnostics_mode"] == "troubleshooting"
+        self.publish_no_valid_plate = alpr["publish_no_valid_plate"]
+        self.expected_frame_width = alpr["expected_frame_width"]
+        self.expected_frame_height = alpr["expected_frame_height"]
+        self.frame_size_tolerance_pct = alpr["frame_size_tolerance_pct"]
+        self.min_ocr_conf = alpr["min_ocr_conf"]
+        self.unknown_plate_value = alpr["unknown_plate_value"]
+        self.yolo_conf_threshold = alpr["yolo_conf_threshold"]
+        self.max_consecutive_fetch_failures = alpr["max_consecutive_fetch_failures"]
+        self.fetch_failure_backoff_sec = alpr["fetch_failure_backoff_sec"]
+        self.score_weights = alpr["score_weights"]
+        self.score_area_norm = alpr["score_area_norm"]
+        self.score_sharpness_norm = alpr["score_sharpness_norm"]
+        self.duplicate_resize = (alpr["duplicate_resize_width"],
+                                  alpr["duplicate_resize_height"])
+        self.duplicate_diff_threshold = alpr["duplicate_diff_threshold"]
+        self.ocr_prep_target_height = alpr["ocr_prep_target_height"]
+        self.ocr_prep_padding = alpr["ocr_prep_padding"]
+        self.max_read_attempts = alpr["max_read_attempts"]
         snap_cfg = config["snapshot"]
-        self.connect_timeout_ms = snap_cfg.get("connect_timeout_ms", 3000)
-        self.read_timeout_ms = snap_cfg.get("read_timeout_ms", 3000)
-        self.poll_interval_ms = snap_cfg.get("poll_interval_ms", 0)
+        self.connect_timeout_ms = snap_cfg["connect_timeout_ms"]
+        self.read_timeout_ms = snap_cfg["read_timeout_ms"]
+        self.poll_interval_ms = snap_cfg["poll_interval_ms"]
 
     def run(self):
         self.log.info("loading models...")
@@ -162,35 +164,18 @@ class Worker(threading.Thread):
                 self.job_bus.release(bay, direction)
                 self.jobs.task_done()
 
-    def _result_topic(self, direction: str, bay: str) -> str:
-        prefix_key = f"{direction}_result_topic_prefix"
-        prefix = self.config['mqtt'].get(prefix_key)
-        if not prefix:
-            # Shouldn't happen -- both are required config keys -- but
-            # fail toward a topic that's at least identifiable rather
-            # than raising and losing the result entirely.
-            prefix = f"alpr_result/{direction or 'unknown'}"
-        return f"{prefix}/{bay}"
-
     def _publish_error(self, job, reason, detail=""):
         """Last-resort publish so a downstream consumer waiting on this
         bay's result topic gets a signal instead of hanging forever --
         used both for camera/config errors and unhandled exceptions."""
         bay = job.get('bay', 'unknown')
         direction = job.get('direction', '')
-        result = {
-            'bay': bay,
-            'direction': direction,
-            # Never null -- see handle()'s reply for the rationale.
-            'truck_number': self.unknown_plate_value,
-            'status': 'ERROR',
-            'error_reason': reason,
-            'error_detail': str(detail)[-2000:],
-            'event_time': job.get('event_time'),
-            'ocr_time': datetime.now(timezone.utc).isoformat(),
-        }
+        result = build_reply(
+            self.config, bay, direction, None, 0.0, 'ERROR',
+            job.get('event_time'),
+            error_reason=reason, error_detail=str(detail)[-2000:])
         try:
-            topic = self._result_topic(direction, bay)
+            topic = result_topic(self.config, direction, bay)
             self.publish(topic, json.dumps(result, default=str))
             self.log.error(f"({bay}/{direction}) published ERROR result: {reason}")
         except Exception:
@@ -321,22 +306,16 @@ class Worker(threading.Thread):
         # dock system needs (truck number, bay, which direction, and
         # enough to sanity-check the read) -- the full reads/collection
         # detail stays in result.json on disk for troubleshooting.
-        reply = {
-            'bay': bay,
-            'direction': direction,
-            'truck_number': truck_number,
-            'confidence': confidence,
-            'status': status,
-            'event_time': event_time,
-            'ocr_time': result['ocr_time'],
-        }
+        reply = build_reply(self.config, bay, direction, truck_number,
+                             confidence, status, event_time,
+                             ocr_time=result['ocr_time'])
 
-        if status == 'NO_VALID_PLATE' and not self.publish_no_valid_plate:
+        if not should_publish(self.config, status):
             self.log.info(f"({bay}/{direction}) no valid plate found, result "
                            f"saved to {folder} but not published "
                            f"({elapsed}s total, {len(reads)} reads)")
         else:
-            topic = self._result_topic(direction, bay)
+            topic = result_topic(self.config, direction, bay)
             self.publish(topic, json.dumps(reply, default=str))
             self.log.info(f"({bay}/{direction}) {truck_number} ({status}) "
                            f"published to {topic} ({elapsed}s total, "
@@ -473,8 +452,13 @@ class Worker(threading.Thread):
                     px2 = min(roi.shape[1], bx2 + pad_x)
                     py2 = min(roi.shape[0], by2 + pad_y)
                     crop = roi[py1:py2, px1:px2]
-                    if any(duplicate(crop, c['crop'], self.duplicate_resize,
-                                      self.duplicate_diff_threshold)
+                    # Thumbnail this crop once, then compare against each
+                    # kept candidate's already-cached thumbnail -- the
+                    # stored side used to be re-resized on every single
+                    # comparison.
+                    crop_thumb = thumbnail(crop, self.duplicate_resize)
+                    if any(duplicate_thumbs(crop_thumb, c['thumb'],
+                                             self.duplicate_diff_threshold)
                            for c in cands):
                         rejected['duplicate'] += 1
                         if annotated is not None and self.troubleshooting:
@@ -491,7 +475,7 @@ class Worker(threading.Thread):
                     sc = (float(b.conf[0]) * w_cfg["yolo_conf"] +
                           area * w_cfg["area"] + shp * w_cfg["sharpness"] +
                           (1 - dist / center) * w_cfg["center"])
-                    cands.append({'crop': crop, 'score': sc})
+                    cands.append({'crop': crop, 'thumb': crop_thumb, 'score': sc})
                     candidate_no += 1
                     self.log.debug(
                         f"candidate kept: frame={frame_no} "

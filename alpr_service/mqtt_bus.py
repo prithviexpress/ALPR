@@ -106,6 +106,27 @@ def matches_class_filter(data: dict, class_types, min_likelihood: float):
     return best
 
 
+def make_job(bay: str, direction: str, event_time,
+             detected_class=None, detected_likelihood=None) -> dict:
+    """The canonical job dict Worker.handle() consumes.
+
+    There are three trigger sources that enqueue work (the MQTT VCA
+    subscription in service.py, the HTTP webhook in http_trigger.py, and
+    bay_state.py's session engine), and each used to build this dict by
+    hand. Worker subscripts 'bay' and 'event_time' outright, so a source
+    that forgot one produced a KeyError inside a worker thread rather
+    than anything traceable to the source. One constructor means adding a
+    field is one edit, not three.
+    """
+    return {
+        "bay": bay,
+        "direction": direction,
+        "event_time": event_time,
+        "detected_class": detected_class,
+        "detected_likelihood": detected_likelihood,
+    }
+
+
 class JobBus:
     """Owns the job queue plus the per-(bay, direction) active-set/cooldown
     debounce.

@@ -9,7 +9,8 @@ from .audit import prune_audit
 from .cameras import CamerasError, load_cameras
 from .config import BASE_DIR, ConfigError, load_config
 from .logging_setup import configure_logging, get_logger
-from .mqtt_bus import JobBus, connect_with_retry, extract_event, matches_class_filter
+from .mqtt_bus import (JobBus, connect_with_retry, extract_event, make_job,
+                        matches_class_filter)
 from .worker import Worker
 
 AUDIT_DIR = BASE_DIR / "audit"
@@ -134,14 +135,8 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus,
                 log.info(f"({bay}/{direction}) event matched class='{cls_text}' "
                          f"likelihood={likelihood:.2f}")
 
-            queued_event = {
-                "bay": bay,
-                "direction": direction,
-                "event_time": event["event_time"],
-                "detected_class": cls_text,
-                "detected_likelihood": likelihood,
-            }
-            if bus.try_enqueue(queued_event):
+            if bus.try_enqueue(make_job(bay, direction, event["event_time"],
+                                         cls_text, likelihood)):
                 log.info(f"({bay}/{direction}) event queued for processing")
         return on_message
 
@@ -302,21 +297,23 @@ def main():
             log.error(str(e))
             raise SystemExit(1)
 
-    # Instantiated whether or not bay_monitor is running yet -- Worker
-    # needs state_engine.on_alpr_result wired in below regardless, and
-    # doing so is harmless if bay_state_engine ends up disabled (nothing
-    # ever calls into it in that case).
+    # Built before the monitor starts, so its on_status hook (below) and
+    # every Worker's on_result hook can both be wired to the same engine.
     state_engine = None
     if bay_state_enabled:
         from .bay_state import BayStateEngine
         state_engine = BayStateEngine(cameras, config, bus, publish)
 
-    bay_monitor_stop = None
+    # Every background component that needs telling to stop registers its
+    # Event here, so shutdown iterates one list instead of accumulating a
+    # per-component `if x is not None: x.set()` line each time one is added.
+    stoppables = []
     if bay_monitor_cfg["enabled"]:
         from .bay_monitor import start_bay_monitor
         _, bay_monitor_stop = start_bay_monitor(
             cameras, config, publish,
             on_status=state_engine.on_status if state_engine else None)
+        stoppables.append(bay_monitor_stop)
 
     # Shared by every worker so their first-run model loading (in
     # particular PaddleOCR's download-if-missing check against the one
@@ -334,12 +331,12 @@ def main():
 
     def _handle_signal(signum, frame):
         log.info(f"received signal {signum}, shutting down")
-        # Signal the bay monitor first -- without this it keeps fetching
-        # snapshots and publishing bay statuses after the MQTT client is
-        # disconnected. It exits at its next check point (it won't
-        # interrupt a request already in flight).
-        if bay_monitor_stop is not None:
-            bay_monitor_stop.set()
+        # Stop the background components before dropping the MQTT
+        # connection -- otherwise the bay monitor keeps fetching snapshots
+        # and publishing to a client that's already gone. Each exits at
+        # its next check point (nothing interrupts a request in flight).
+        for stop_event in stoppables:
+            stop_event.set()
         client.disconnect()
 
     signal.signal(signal.SIGTERM, _handle_signal)

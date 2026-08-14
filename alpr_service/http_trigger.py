@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
 from .logging_setup import get_logger
+from .mqtt_bus import make_job
 
 
 def build_camera_ip_map(cameras: dict) -> dict:
@@ -111,14 +112,8 @@ def build_http_trigger_app(cameras: dict, config: dict, bus) -> Flask:
             return jsonify({"status": "ignored",
                              "reason": "unmapped_rule"}), 200
 
-        queued_event = {
-            "bay": bay,
-            "direction": direction,
-            "event_time": datetime.now(timezone.utc).isoformat(),
-            "detected_class": None,
-            "detected_likelihood": None,
-        }
-        queued = bus.try_enqueue(queued_event)
+        queued = bus.try_enqueue(make_job(
+            bay, direction, datetime.now(timezone.utc).isoformat()))
         log.info(f"({bay}/{direction}) webhook event "
                  f"{'queued' if queued else 'skipped (cooldown)'} "
                  f"(rule={rule} from {camera_ip})")

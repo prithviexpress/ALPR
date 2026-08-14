@@ -13,19 +13,19 @@ that to retry ALPR reads across the entire stay and only closes a session
 whatever plate got confirmed at ANY point during the visit -- not just
 whatever a single trigger instant happened to catch.
 
-Wiring: bay_monitor.py calls on_status(bay, status, timestamp, zoomed_in)
-after every classification; this engine reacts to empty<->occupied
-transitions by enqueuing ALPR jobs into the existing JobBus/Worker pool
-(reusing all of worker.py's collection/OCR/voting pipeline unchanged)
-with direction always "enter" while a session is open. Worker calls
-on_alpr_result(reply) after every completed job so this engine can
-capture a confirmed plate. Departure is decided by bay_monitor's own
-zoomed_in flag going False (its empty_debounce_count, not a second copy
-of that threshold here -- see on_status below for why), at which point
-this engine publishes the "leave" result itself, directly -- bypassing
-JobBus/Worker entirely, since by the time a bay reads "empty" the truck
-is no longer in frame for a fresh read; the leave result reports the
-session's last confirmed plate instead.
+Wiring: bay_monitor.py calls
+on_status(bay, status, timestamp, occupied, departed) after every
+classification -- it reports those two booleans already interpreted,
+since it owns both the status vocabulary and the departure debounce they
+derive from. On "occupied" with no session open this engine enqueues an
+ALPR job through the normal JobBus/Worker pool (reusing worker.py's
+collection/OCR/voting pipeline unchanged), retrying while the plate stays
+unconfirmed up to alpr.max_read_attempts; Worker calls on_alpr_result()
+after every completed job so a confirmed plate can be captured. On
+"departed" it emits the "leave" result itself rather than queueing a job,
+since by then the truck is out of frame and there is nothing left to
+photograph -- the payload, topic and suppression rule all come from
+results.py, the same contract Worker publishes under.
 
 Depends entirely on bay_monitor being enabled (its status stream is the
 only thing driving this) -- see check_bay_state_config() in service.py.
@@ -34,64 +34,67 @@ State is in-memory only -- a restart loses any in-progress session.
 """
 import json
 import threading
-from datetime import datetime, timezone
 
 from .logging_setup import get_logger
+from .mqtt_bus import make_job
+from .results import build_reply, result_topic, should_publish
 
 
 class BaySession:
+    """One truck's visit. `plate` carries the whole story: None means no
+    valid read has landed yet, non-None means confirmed. There is
+    deliberately no separate `confirmed` flag -- it would be a second
+    field meaning exactly `plate is not None`, hand-synced at three reset
+    sites, and a missed update would publish SUCCESS with no plate (or a
+    plate marked NO_VALID_PLATE), which is the precise corruption this
+    module exists to prevent."""
+
     def __init__(self, bay: str):
         self.bay = bay
-        self.status = None
         self.direction = None       # "enter" while a session is open, else None
         self.plate = None
         self.confidence = 0.0
-        self.confirmed = False      # True once a SUCCESS read has landed
-        self.session_start = None
+        self.read_attempts = 0
+
+    @property
+    def open(self) -> bool:
+        return self.direction == "enter"
+
+    def reset(self):
+        self.direction = None
+        self.plate = None
+        self.confidence = 0.0
         self.read_attempts = 0
 
 
 class BayStateEngine:
     def __init__(self, cameras: dict, config: dict, bus, publish_fn):
         self.log = get_logger("BAY_STATE")
-        self.cameras = cameras
         self.config = config
         self.bus = bus
         self.publish = publish_fn
         self.lock = threading.Lock()
         self.sessions = {bay: BaySession(bay) for bay in cameras}
-        alpr_cfg = config["alpr"]
-        self.publish_no_valid_plate = alpr_cfg.get("publish_no_valid_plate", True)
-        self.unknown_plate_value = alpr_cfg.get("unknown_plate_value", "UNKNOWN")
-        self.leave_topic_prefix = config["mqtt"].get(
-            "leave_result_topic_prefix", "alpr_result/leave")
-        # "Occupied" is derived from bay_monitor's own configured
-        # vocabulary (everything that isn't its empty_status) rather than
-        # a hardcoded set here -- a custom bay_monitor.status_values would
-        # otherwise never match, and no session would ever open or close.
-        bm_cfg = config.get("bay_monitor", {})
-        empty_status = bm_cfg.get("empty_status", "empty")
-        status_values = bm_cfg.get(
-            "status_values", ["empty", "occupied", "unloading", "loading", "idle"])
-        self.occupied_statuses = {s for s in status_values if s != empty_status}
+        self.unknown_plate_value = config["alpr"]["unknown_plate_value"]
+        self.max_read_attempts = config["alpr"]["max_read_attempts"]
 
-    def on_status(self, bay: str, status: str, timestamp: str, zoomed_in: bool):
-        """Called by bay_monitor after every classification. zoomed_in is
-        bay_monitor's OWN post-transition state -- True while it's still
-        watching this bay closely, False the moment it's decided (via its
-        own empty_debounce_count) to give up and revert to baseline
-        scanning. That transition, not a separately re-counted debounce
-        here, is what this engine treats as "the truck is confirmed
-        gone" -- re-deriving a second copy of that threshold risks the
-        two falling out of sync (e.g. this engine waiting for more
-        consecutive empties than bay_monitor itself does, in which case
-        bay_monitor would stop calling this at all once it reverts,
-        leaving a session open forever)."""
+    def on_status(self, bay: str, status: str, timestamp: str,
+                  occupied: bool, departed: bool):
+        """Called by bay_monitor after every classification.
+
+        `occupied` and `departed` are bay_monitor's OWN interpretation of
+        the reading, not raw state for this engine to re-derive: it owns
+        `empty_status`, so it decides what counts as occupied, and it owns
+        `empty_debounce_count`, so it decides when a bay has truly emptied
+        out. Re-deriving either here would mean two copies of the same
+        threshold that can drift -- and if this engine ever waited for
+        more consecutive empties than bay_monitor does, bay_monitor would
+        stop reporting entirely once it reverted to baseline scanning and
+        the session would stay open forever."""
         with self.lock:
             session = self.sessions.setdefault(bay, BaySession(bay))
-            session.status = status
 
-            if status in self.occupied_statuses:
+            if occupied:
                 # Whether this is a NEW arrival is decided purely by
                 # whether a session is already open -- NOT by comparing
                 # against the previous classification. Keying off the
@@ -104,38 +107,39 @@ class BayStateEngine:
                 # publishing leave with no truck number. That is precisely
                 # the failure this module exists to prevent. With a
                 # session open, any occupied read is a continuation.
-                if session.direction != "enter":
+                if not session.open:
                     self._on_arrival(session, timestamp)
-                elif not session.confirmed:
+                elif session.plate is None:
                     self._retry_read(session, timestamp)
-            elif not zoomed_in and session.direction == "enter":
+            elif departed and session.open:
                 self._on_departure(session, timestamp)
 
     def _on_arrival(self, session: BaySession, timestamp: str):
+        session.reset()
         session.direction = "enter"
-        session.plate = None
-        session.confidence = 0.0
-        session.confirmed = False
-        session.session_start = timestamp
-        session.read_attempts = 0
         self.log.info(f"({session.bay}) arrival detected -> enter, "
                        f"enqueuing ALPR read")
         self._enqueue_read(session, timestamp)
 
     def _retry_read(self, session: BaySession, timestamp: str):
+        # Capped: the truck is stationary and the camera fixed, so attempt
+        # N photographs the same obscured plate attempt 1 did. Left
+        # uncapped, a truck parked for hours with an unreadable plate
+        # re-runs a full collection every cooldown window indefinitely,
+        # each one holding one of only service.num_workers threads and
+        # starving genuinely new arrivals.
+        if session.read_attempts >= self.max_read_attempts:
+            self.log.debug(f"({session.bay}) still occupied without a valid "
+                            f"plate, but {session.read_attempts} read attempts "
+                            f"reached (alpr.max_read_attempts) -- not retrying "
+                            f"again this visit")
+            return
         self.log.debug(f"({session.bay}) still occupied, no confirmed plate "
                         f"yet -- retrying ALPR read (attempt "
-                        f"{session.read_attempts + 1})")
+                        f"{session.read_attempts + 1}/{self.max_read_attempts})")
         self._enqueue_read(session, timestamp)
 
     def _enqueue_read(self, session: BaySession, timestamp: str):
-        queued_event = {
-            "bay": session.bay,
-            "direction": "enter",
-            "event_time": timestamp,
-            "detected_class": None,
-            "detected_likelihood": None,
-        }
         # JobBus's own (bay, direction) cooldown paces retries -- but it
         # also silently REFUSES them, so read_attempts only counts reads
         # that were actually accepted, and a refusal is logged rather than
@@ -144,48 +148,35 @@ class BayStateEngine:
         # roughly every other retry is refused this way, so effective
         # retry cadence is the cooldown, not the classify interval. Lower
         # alpr.cooldown_sec if you want a retry on every classification.
-        if self.bus.try_enqueue(queued_event):
+        if self.bus.try_enqueue(make_job(session.bay, "enter", timestamp)):
             session.read_attempts += 1
-            return True
-        self.log.debug(f"({session.bay}) ALPR read not enqueued (JobBus "
-                        f"cooldown or queue full) -- will try again on the "
-                        f"next classification")
-        return False
+        else:
+            self.log.debug(f"({session.bay}) ALPR read not enqueued (JobBus "
+                            f"cooldown or queue full) -- will try again on "
+                            f"the next classification")
 
     def _on_departure(self, session: BaySession, timestamp: str):
         self.log.info(f"({session.bay}) departure detected -> leave "
-                       f"(plate={session.plate!r} confirmed={session.confirmed}, "
-                       f"{session.read_attempts} read attempt(s) this session)")
-        status = "SUCCESS" if session.confirmed else "NO_VALID_PLATE"
-        reply = {
-            "bay": session.bay,
-            "direction": "leave",
-            # Never null -- a downstream consumer always gets a string,
-            # either the confirmed plate or alpr.unknown_plate_value. The
-            # "status" field is what distinguishes a real read from a
-            # placeholder.
-            "truck_number": session.plate or self.unknown_plate_value,
-            "confidence": session.confidence,
-            "status": status,
-            "event_time": timestamp,
-            "ocr_time": datetime.now(timezone.utc).isoformat(),
-        }
+                       f"(plate={session.plate!r}, {session.read_attempts} "
+                       f"read attempt(s) this session)")
+        status = "SUCCESS" if session.plate else "NO_VALID_PLATE"
+        # Built and published through worker.py's shared result helpers,
+        # not hand-rolled here -- this is the same contract Worker emits
+        # for trigger-driven reads, on the same topic family, to the same
+        # consumer. Two producers of one message shape is how they drift.
+        reply = build_reply(self.config, session.bay, "leave", session.plate,
+                             session.confidence, status, timestamp)
 
-        if status == "NO_VALID_PLATE" and not self.publish_no_valid_plate:
+        if not should_publish(self.config, status):
             self.log.info(f"({session.bay}) no confirmed plate at departure, "
                            f"not publishing leave result "
                            f"(alpr.publish_no_valid_plate=false)")
         else:
-            topic = f"{self.leave_topic_prefix}/{session.bay}"
+            topic = result_topic(self.config, "leave", session.bay)
             self.publish(topic, json.dumps(reply, default=str))
             self.log.info(f"({session.bay}) leave published to {topic}")
 
-        # Reset for the next arrival.
-        session.direction = None
-        session.plate = None
-        session.confidence = 0.0
-        session.confirmed = False
-        session.read_attempts = 0
+        session.reset()
 
     def on_alpr_result(self, reply: dict):
         """Called by Worker after every completed job. Only updates a
@@ -202,7 +193,7 @@ class BayStateEngine:
         bay = reply.get("bay")
         with self.lock:
             session = self.sessions.get(bay)
-            if (session is None or session.direction != "enter"
+            if (session is None or not session.open
                     or reply.get("direction") != "enter"):
                 return
             plate = reply.get("truck_number")
@@ -213,7 +204,6 @@ class BayStateEngine:
                     and plate != self.unknown_plate_value):
                 session.plate = plate
                 session.confidence = reply.get("confidence", 0.0)
-                session.confirmed = True
                 self.log.info(f"({bay}) plate confirmed this session: "
                                f"{session.plate} (conf {session.confidence})")
             # NO_VALID_PLATE / ERROR: leave session.plate exactly as it

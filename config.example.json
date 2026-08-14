@@ -14,7 +14,7 @@
     "alpr.plate_crop_padding_pct": "Expands each detected box by this percent of its own width/height (each side) before cropping for OCR, clamped to the ROI's bounds. Fixes a real observed failure: a slightly undersized YOLO box clips a character off the plate's edge -- confirmed via two adjacent, overlapping detections that each only captured half a plate ('HR47E' / 'E4812', sharing the boundary 'E', for what was actually 'HR47E4812'). Set to 0 to disable; raise it if plates are still getting clipped, lower it if crops start including too much surrounding clutter.",
     "event_filter": "Trigger events carry a VCA classification per detected object, e.g. Data.Object.Object.Appearance.Class.Type = {\"#text\": \"Vehicle\", \"@Likelihood\": 0.91}. Only events with a detection matching one of class_types (case-insensitive) at or above min_likelihood are queued for ALPR -- everything else (Person/Bicycle detections, low-confidence hits, events with no classified object) is discarded before a single snapshot is fetched. Tune min_likelihood against the values your camera actually reports (0.91 in the sample payload this was built from).",
     "event_filter.class_types (disabling)": "Set class_types to an empty array, [], to disable this filter entirely and queue EVERY line-crossing event regardless of classification -- min_likelihood is then ignored too. Do not just delete min_likelihood or set it to 0/null while leaving class_types non-empty -- the event still has to match one of class_types first, so that alone would not stop filtering.",
-    "alpr.publish_no_valid_plate": "true (default): every trigger gets an MQTT reply regardless of read success -- a NO_VALID_PLATE collection still publishes {..., \"truck_number\": null, \"status\": \"NO_VALID_PLATE\", ...} so a downstream consumer knows the event was processed, not just silence. The audit folder (result.json/event.json) is always written either way. Camera/system errors (CAMERA_UNREACHABLE, CAMERA_CONFIG_ERROR, FRAME_SIZE_ERROR, ERROR) are unaffected and always publish regardless of this setting. Set false to only publish actual successful reads.",
+    "alpr.publish_no_valid_plate": "true (default): every trigger gets an MQTT reply regardless of read success -- a NO_VALID_PLATE collection still publishes {..., \"truck_number\": \"UNKNOWN\", \"status\": \"NO_VALID_PLATE\", ...} so a downstream consumer knows the event was processed, not just silence. (truck_number is never null -- see alpr.unknown_plate_value.) The audit folder (result.json/event.json) is always written either way. Camera/system errors (CAMERA_UNREACHABLE, CAMERA_CONFIG_ERROR, FRAME_SIZE_ERROR, ERROR) are unaffected and always publish regardless of this setting. Set false to only publish actual successful reads -- note that doing so also means a no-read visit produces no message at all, which is the one case where \"always reports a truck number\" stops applying.",
     "mqtt enter/leave (filtering)": "Entering and leaving are two independent triggers, each its own MQTT subscription -- which rule/event types reach this service at all is decided by these topic filters (MQTT wildcards), not by any code-side filtering. Confirmed against real captured events for the SAME tracked object (ObjectId) a few seconds apart: enter_subscribe_topic matches 'Camera_Events/AR-H6/onvif-ej/RuleEngine/LineDetector/Crossed/&1/Entering field 2' (event_type=LineDetector; this same topic shape also covers plain 'Crossing line N' rules), and leave_subscribe_topic matches 'Camera_Events/AR-H6/onvif-ej/RuleEngine/ObjectTrack/Aggregation/&1/Leaving field 3' (event_type=ObjectTrack) -- '+' matches exactly one topic segment, '#' matches all remaining segments (only valid at the end, absorbs the varying '&1/<free text>' suffix). The two are structurally distinct (LineDetector/Crossed vs ObjectTrack/Aggregation) so there's no overlap between them.",
     "mqtt enter/leave (results)": "Each direction publishes to its own topic (enter_result_topic_prefix/<bay> or leave_result_topic_prefix/<bay>) with a lean payload -- bay, direction, truck_number, confidence, status, event_time/ocr_time -- so a downstream gate/dock system can subscribe to entries and exits separately without parsing the fuller record. The complete detail (every OCR read, collection stats, rejection reasons) is still written to the audit folder's result.json regardless.",
     "mqtt.bay_segment_index": "0-based position of the bay name within the subscribe topics, e.g. 1 for 'Camera_Events/<bay>/...'. Shared by both enter and leave since they use the same layout; adjust if yours differs.",
@@ -25,11 +25,11 @@
     "thresholds (all in config now)": "Every numeric decision boundary the code makes is a config value with no separate code-level default of its own beyond what's documented here -- nothing requires a code change to retune. alpr.yolo_conf_threshold is the minimum YOLO box confidence for a plate detection to be considered at all (Ultralytics' own unstated default is 0.25 if not set). bay_monitor.presence_conf_threshold is the same idea for bay_monitor's baseline presence check, kept separate from alpr.yolo_conf_threshold since presence-detection intentionally wants to catch weaker/partial hints of a truck (no size/position filtering there at all, unlike ALPR's own plate detection) -- can reasonably be set lower. alpr.score_weights (plus score_area_norm/score_sharpness_norm) control how multiple candidate crops from one collection window get ranked against each other; alpr.duplicate_resize_width/_height/duplicate_diff_threshold control when two crops are treated as the same sighting rather than voted on twice; alpr.ocr_prep_target_height/ocr_prep_padding control how a crop is resized/bordered before OCR; alpr.max_consecutive_fetch_failures/fetch_failure_backoff_sec control when a collection window gives up on a camera that's not responding.",
     "alpr.unknown_plate_value": "Every published result carries a truck_number STRING, never null -- anything short of a valid read reports this placeholder ('UNKNOWN' by default) instead, so a downstream consumer never has to null-check the field. The 'status' field (SUCCESS / NO_VALID_PLATE / CAMERA_UNREACHABLE / CAMERA_CONFIG_ERROR / FRAME_SIZE_ERROR / ERROR) is what distinguishes a genuine read from the placeholder. Keep it to something no real plate could be -- it must not satisfy the Indian-plate patterns in plate_text.py, or a placeholder could be mistaken for a real read. Note this is about the VALUE reported; alpr.publish_no_valid_plate separately controls whether a no-read result is published at all (leave it true if you want an update on every trigger regardless of outcome). The audit result.json additionally keeps 'raw_vote' -- whatever the OCR vote actually produced, possibly null or garbage -- so the placeholder never hides forensic detail.",
     "bay_monitor.empty_status / classify_region": "empty_status names which entry of status_values means 'nothing is there'; it drives both bay_monitor's revert-to-baseline debounce and bay_state_engine's occupied set (everything that isn't it), so a custom status_values vocabulary works end to end without either hardcoding the literal 'empty'. classify_region picks which pixels the vision model judges: 'full_frame' (default) shows it the whole bay -- cargo, forklifts, doors, which is what the activity vocabulary is really about -- but a truck in an ADJACENT bay that's also in shot can then drive this bay's status (and, with bay_state_engine on, open a session on the wrong bay). Set it to 'roi' to restrict classification to the same cameras.json roi presence detection uses, removing that cross-talk at the cost of a much narrower view (the roi is framed for plates, not for watching cargo movement). Use 'roi' if your bays overlap in frame.",
-    "service.num_workers/queue_max": "num_workers is roughly 'how many trucks this instance can process at once' -- each Worker thread owns its own loaded YOLO+PaddleOCR models (~2GB RAM apiece), so this is a memory/CPU sizing knob, not just a throughput one. queue_max caps how many pending jobs JobBus holds before it starts dropping new ones instead of growing unbounded."
+    "service.num_workers/queue_max": "num_workers is roughly 'how many trucks this instance can process at once' -- each Worker thread owns its own loaded YOLO+PaddleOCR models (~2GB RAM apiece), so this is a memory/CPU sizing knob, not just a throughput one. queue_max caps how many pending jobs JobBus holds before it starts dropping new ones instead of growing unbounded.",
+    "alpr.max_read_attempts": "Ceiling on how many ALPR reads bay_state_engine queues for one visit while the plate is still unconfirmed. The truck is stationary and the camera fixed, so attempt N photographs the same obscured plate attempt 1 did; left uncapped, a truck parked for hours with an unreadable plate re-runs a full collection every cooldown window indefinitely, each one holding one of only service.num_workers threads and starving genuinely new arrivals. Only consulted by bay_state_engine -- the MQTT/HTTP trigger paths are one-shot and unaffected.",
+    "bay_monitor.classify_max_dimension / classify_jpeg_quality / presence_imgsz": "classify_max_dimension downscales a frame so its longest side is at most this many pixels before it is JPEG-encoded and sent to the vision model (0 disables downscaling). This matters more than it looks: a vision model's prefill cost scales with pixel count, and a raw 5MP snapshot is ~6x the pixels of a 1024-wide view -- on a CPU-only box that difference routinely exceeds ollama_timeout_sec, and a timeout discards the fetch, the encode and the partial inference alike, leaving the bay with no status at all. Reference exemplars are downscaled the same way, once at startup, so they don't multiply the per-call bill. presence_imgsz is the inference size for the cheap YOLO presence check, which only needs a yes/no rather than a precise box and so runs below the detector's default 640."
   },
-
   "model_path": "best.pt",
-
   "mqtt": {
     "host": "mqtt.example.local",
     "port": 1883,
@@ -43,23 +43,26 @@
     "trigger_enabled": true,
     "bay_status_topic_prefix": "site/alpr/bay_status"
   },
-
   "event_filter": {
-    "class_types": ["Vehicle"],
+    "class_types": [
+      "Vehicle"
+    ],
     "min_likelihood": 0.7
   },
-
   "http_trigger": {
     "enabled": false,
     "host": "0.0.0.0",
     "port": 8080,
     "path": "/alert",
     "rule_param": "rule",
-    "enter_rule_codes": [2],
-    "exit_rule_codes": [3],
+    "enter_rule_codes": [
+      2
+    ],
+    "exit_rule_codes": [
+      3
+    ],
     "threads": 4
   },
-
   "snapshot": {
     "url_template": "http://{ip}:{port}/snap.jpg",
     "port": 80,
@@ -69,7 +72,6 @@
     "read_timeout_ms": 3000,
     "poll_interval_ms": 0
   },
-
   "bay_monitor": {
     "enabled": false,
     "baseline_scan_interval_ms": 2000,
@@ -78,18 +80,25 @@
     "empty_status": "empty",
     "classify_region": "full_frame",
     "presence_conf_threshold": 0.25,
+    "presence_imgsz": 320,
+    "classify_max_dimension": 1024,
+    "classify_jpeg_quality": 80,
     "ollama_host": "http://localhost:11434",
     "ollama_model": null,
     "ollama_timeout_sec": 30,
-    "status_values": ["empty", "occupied", "unloading", "loading", "idle"],
+    "status_values": [
+      "empty",
+      "occupied",
+      "unloading",
+      "loading",
+      "idle"
+    ],
     "classification_prompt": "You are monitoring a truck loading dock bay through a fixed security camera. Classify the current activity into EXACTLY ONE of these words: empty, occupied, unloading, loading, idle. 'empty' = no truck present. 'occupied' = a truck is present but no cargo movement is visible. 'unloading' = cargo is visibly being removed from the truck. 'loading' = cargo is visibly being loaded onto the truck. 'idle' = a truck is present, not actively loading or unloading (e.g. waiting, doors closed, driver break). Respond with only the single classification word, nothing else.",
     "reference_images": []
   },
-
   "bay_state_engine": {
     "enabled": false
   },
-
   "alpr": {
     "collection_timeout": 8,
     "max_raw_samples": 12,
@@ -105,6 +114,7 @@
     "diagnostics_mode": "basic",
     "min_ocr_conf": 0.35,
     "unknown_plate_value": "UNKNOWN",
+    "max_read_attempts": 20,
     "yolo_conf_threshold": 0.25,
     "max_consecutive_fetch_failures": 10,
     "fetch_failure_backoff_sec": 0.2,
@@ -128,12 +138,10 @@
     "expected_frame_height": 1944,
     "frame_size_tolerance_pct": 10
   },
-
   "service": {
     "num_workers": 3,
     "queue_max": 50
   },
-
   "logging": {
     "level": "INFO",
     "console": true,

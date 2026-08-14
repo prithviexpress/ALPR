@@ -306,6 +306,12 @@ def load_config(path: Path = None) -> dict:
     bay_monitor.setdefault("ollama_host", "http://localhost:11434")
     bay_monitor.setdefault("ollama_model", None)
     bay_monitor.setdefault("ollama_timeout_sec", 30)
+    # Reasoning models (e.g. qwen3) spend several extra seconds emitting
+    # a hidden "thinking" trace before the actual answer unless told not
+    # to -- confirmed on this deployment to cut one classify call from
+    # ~31.7s to ~6.4s. Harmless to send to non-reasoning models, which
+    # simply ignore a field they don't understand.
+    bay_monitor.setdefault("ollama_think", False)
     bay_monitor.setdefault("status_values",
                             ["empty", "occupied", "unloading", "loading", "idle"])
     # Which entry of status_values means "nothing is there". Drives both

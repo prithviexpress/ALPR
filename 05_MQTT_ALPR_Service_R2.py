@@ -213,6 +213,13 @@
 #       of using the bare `requests.post` module function (which had no
 #       session to disable proxying on). No new config -- this is an
 #       unconditional code-level fix.
+#   18. "bay_monitor.ollama_think" (default false) is now sent as the
+#       /api/generate "think" field. Confirmed on a real deployment
+#       running a Qwen3 reasoning model that this alone cut one classify
+#       call from ~31.7s to ~6.4s -- reasoning models emit a hidden
+#       "thinking" trace before their actual answer unless told not to.
+#       Harmless to leave on for non-reasoning models, which simply
+#       ignore a field they don't recognize.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

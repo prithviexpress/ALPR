@@ -170,6 +170,7 @@ def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = 
         "prompt": prompt,
         "images": images,
         "stream": False,
+        "think": bm_cfg["ollama_think"],
     }
     requester = session if session is not None else requests
     try:

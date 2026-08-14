@@ -170,6 +170,16 @@ def load_config(path: Path = None) -> dict:
     # through each job's own per-event audit subfolder. The full per-job
     # detail (result.json, every candidate crop) is unaffected either way.
     alpr.setdefault("save_detected_plate_frames", True)
+    # Every completed job's best-scoring attempted crop -- SUCCESS or
+    # not -- into one flat audit/all_attempts/ folder (named
+    # "<timestamp>_<bay>_<direction>_<status>_<plate-or-UNKNOWN>.jpg"),
+    # so "what is the camera actually seeing, why is this bay coming
+    # back NO_VALID_PLATE" can be answered by browsing one folder
+    # chronologically instead of opening each job's own nested audit
+    # subfolder one at a time. Separate from save_detected_plate_frames
+    # above, which is SUCCESS-only and answers a different question
+    # ("which trucks did we confirm").
+    alpr.setdefault("save_all_attempt_frames", True)
     # Ceiling on how many ALPR reads bay_state_engine will queue for one
     # visit while the plate is still unconfirmed. Without a cap, a truck
     # parked for hours with an unreadable plate re-runs a full 8s

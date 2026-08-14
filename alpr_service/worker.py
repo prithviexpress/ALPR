@@ -123,6 +123,7 @@ class Worker(threading.Thread):
         self.min_ocr_conf = alpr["min_ocr_conf"]
         self.unknown_plate_value = alpr["unknown_plate_value"]
         self.save_detected_plate_frames = alpr["save_detected_plate_frames"]
+        self.save_all_attempt_frames = alpr["save_all_attempt_frames"]
         self.yolo_conf_threshold = alpr["yolo_conf_threshold"]
         self.max_consecutive_fetch_failures = alpr["max_consecutive_fetch_failures"]
         self.fetch_failure_backoff_sec = alpr["fetch_failure_backoff_sec"]
@@ -302,6 +303,29 @@ class Worker(threading.Thread):
             self.log.warning(f"({bay}/{direction}) failed to save "
                              f"detected-plate frame", exc_info=True)
 
+    def _save_attempt_frame(self, bay, direction, ts, status, plate, samples):
+        """Every completed job's best-scoring attempted crop -- SUCCESS
+        or not -- into one flat, chronologically browsable
+        audit/all_attempts/ folder, named with the outcome baked into
+        the filename. Unlike _save_detected_plate (SUCCESS only, for "which
+        trucks did we confirm"), this is a "what is the camera actually
+        seeing, why isn't a given bay reading" view: seeing a NO_VALID_PLATE
+        run's actual crop (blurry? genuinely not a plate? wrong ROI?)
+        without opening that job's own nested audit subfolder one at a
+        time. Best-effort; never lets a save failure affect the job itself."""
+        if not samples:
+            return
+        best = max(samples, key=lambda s: s['score'])
+        try:
+            out_dir = self.audit_dir / "all_attempts"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe_plate = (plate or self.unknown_plate_value).replace('/', '_')
+            cv2.imwrite(str(out_dir / f"{ts}_{bay}_{direction}_{status}_"
+                                      f"{safe_plate}.jpg"), best['crop'])
+        except Exception:
+            self.log.warning(f"({bay}/{direction}) failed to save "
+                             f"all_attempts frame", exc_info=True)
+
     # --------- per-job pipeline ---------
     def handle(self, job):
         bay = job['bay']
@@ -379,6 +403,8 @@ class Worker(threading.Thread):
 
         if status == 'SUCCESS' and self.save_detected_plate_frames:
             self._save_detected_plate(bay, direction, ts, final, reads, samples)
+        if self.save_all_attempt_frames:
+            self._save_attempt_frame(bay, direction, ts, status, truck_number, samples)
 
         # Full detail for the audit trail on disk. 'final_plate' is the
         # same value as truck_number on SUCCESS, and None otherwise --
@@ -416,7 +442,21 @@ class Worker(threading.Thread):
                              confidence, status, event_time,
                              ocr_time=result['ocr_time'])
 
-        if not should_publish(self.config, status):
+        # bay_state_engine retries the SAME visit's plate read many times
+        # (every classification, until success or alpr.max_read_attempts)
+        # -- publishing every failed attempt would flood the enter topic
+        # with NO_VALID_PLATE noise for one physical truck, when only the
+        # eventual SUCCESS (or the final give-up) actually matters to a
+        # downstream consumer. bay_state_engine's on_alpr_result hook
+        # still sees every attempt via _notify_result below regardless of
+        # whether it got published, so a plate found on attempt 7 is
+        # captured exactly the same either way -- this only silences the
+        # MQTT spam, not the retry logic itself. One-shot MQTT/HTTP
+        # triggers (source=None) are unaffected: one trigger, one
+        # attempt, always worth publishing.
+        is_bay_state_retry_noise = (job.get('source') == 'bay_state'
+                                     and status == 'NO_VALID_PLATE')
+        if not should_publish(self.config, status) or is_bay_state_retry_noise:
             self.log.info(f"({bay}/{direction}) no valid plate found, result "
                            f"saved to {folder} but not published "
                            f"({elapsed}s total, {len(reads)} reads)")

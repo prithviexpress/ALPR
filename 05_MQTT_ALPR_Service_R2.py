@@ -296,6 +296,36 @@
 #       is NOT suppressed by alpr.publish_no_valid_plate=false, since its
 #       whole purpose is showing the engine reacting at all -- exactly
 #       what was invisible during this failure.
+#   22. Fixed a real field complaint: too many "enter" MQTT publishes
+#       with an invalid (NO_VALID_PLATE) result for what was really one
+#       physical truck. Root cause: bay_state_engine retries a visit's
+#       plate read every classification until it succeeds or
+#       alpr.max_read_attempts is hit, and Worker.handle() was
+#       publishing EVERY one of those attempts (default
+#       alpr.publish_no_valid_plate=true), not just the eventual good
+#       one -- confirmed these never continue PAST a successful read
+#       (bay_state_engine stops enqueuing once session.plate is
+#       confirmed), so the flood was always attempts BEFORE (or in place
+#       of, if a visit never succeeds) a valid detection, never after.
+#       mqtt_bus.make_job() now takes a "source" ("bay_state" for
+#       bay_state_engine's own retries, unset for one-shot MQTT/HTTP
+#       triggers); Worker.handle() publishes a bay_state-sourced
+#       NO_VALID_PLATE result to disk and to audit/all_attempts/ (see
+#       below) same as always, but no longer to MQTT -- SUCCESS still
+#       publishes immediately as before, and a one-shot trigger's
+#       NO_VALID_PLATE is completely unaffected. bay_state_engine's own
+#       on_alpr_result hook still sees every attempt regardless, so
+#       nothing about the retry/confirmation logic itself changed.
+#
+#       Also added "alpr.save_all_attempt_frames" (default true): every
+#       completed job's best-scoring attempted crop -- SUCCESS or not --
+#       now also lands in one flat audit/all_attempts/ folder (named
+#       "<timestamp>_<bay>_<direction>_<status>_<plate-or-UNKNOWN>.jpg"),
+#       separate from save_detected_plate_frames (SUCCESS-only). Directly
+#       answers "what is the camera actually seeing, why is this bay
+#       coming back NO_VALID_PLATE" by browsing one folder chronologically
+#       instead of opening each job's own nested per-event audit
+#       subfolder one at a time.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

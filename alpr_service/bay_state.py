@@ -170,7 +170,8 @@ class BayStateEngine:
         # roughly every other retry is refused this way, so effective
         # retry cadence is the cooldown, not the classify interval. Lower
         # alpr.cooldown_sec if you want a retry on every classification.
-        if self.bus.try_enqueue(make_job(session.bay, "enter", timestamp)):
+        if self.bus.try_enqueue(make_job(session.bay, "enter", timestamp,
+                                          source="bay_state")):
             session.read_attempts += 1
         else:
             self.log.debug(f"({session.bay}) ALPR read not enqueued (JobBus "

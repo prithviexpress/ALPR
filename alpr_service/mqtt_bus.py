@@ -107,7 +107,8 @@ def matches_class_filter(data: dict, class_types, min_likelihood: float):
 
 
 def make_job(bay: str, direction: str, event_time,
-             detected_class=None, detected_likelihood=None) -> dict:
+             detected_class=None, detected_likelihood=None,
+             source=None) -> dict:
     """The canonical job dict Worker.handle() consumes.
 
     There are three trigger sources that enqueue work (the MQTT VCA
@@ -117,6 +118,14 @@ def make_job(bay: str, direction: str, event_time,
     that forgot one produced a KeyError inside a worker thread rather
     than anything traceable to the source. One constructor means adding a
     field is one edit, not three.
+
+    `source` distinguishes a one-shot trigger (MQTT/HTTP -- one physical
+    event, one read attempt, always worth publishing) from
+    bay_state.py's retry loop ("bay_state" -- many attempts per single
+    physical visit, most of which are expected to fail until one
+    succeeds or alpr.max_read_attempts runs out). Worker.handle() uses
+    it to avoid flooding the result topic with a NO_VALID_PLATE publish
+    on every one of those retries.
     """
     return {
         "bay": bay,
@@ -124,6 +133,7 @@ def make_job(bay: str, direction: str, event_time,
         "event_time": event_time,
         "detected_class": detected_class,
         "detected_likelihood": detected_likelihood,
+        "source": source,
     }
 
 

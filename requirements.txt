@@ -8,9 +8,19 @@ paddleocr==2.7.3
 paddlepaddle==2.6.2
 
 # Image handling
+# opencv-python pinned to EXACTLY 4.6.0.66, not a preference -- it's the
+# only version on PyPI that satisfies both ultralytics==8.3.40
+# (opencv-python>=4.6.0) and paddleocr==2.7.3 (opencv-python<=4.6.0.66,
+# confirmed from its published wheel metadata) at once. Anything else
+# (including newer opencv-python releases) makes `pip install -r
+# requirements.txt` fail with ResolutionImpossible. Functionally safe:
+# every cv2 call this codebase makes (resize/imencode/imread/imwrite/
+# absdiff/Laplacian/cvtColor/copyMakeBorder/rectangle/putText) is a
+# long-stable API present unchanged well before 4.6.0.
+#
 # numpy pinned below 2.0: paddlepaddle==2.6.2 predates NumPy 2.0 and
 # compatibility with it is unverified.
-opencv-python==4.10.0.84
+opencv-python==4.6.0.66
 numpy==1.26.4
 
 # MQTT + HTTP snapshot fetch

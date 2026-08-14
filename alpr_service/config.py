@@ -204,6 +204,41 @@ def load_config(path: Path = None) -> dict:
     # fetch as fast as the HTTP round trip allows.
     snapshot.setdefault("poll_interval_ms", 0)
 
+    # Continuous, trigger-independent bay-activity monitor (bay_monitor.py)
+    # -- a separate concern from the enter/leave ALPR pipeline above, off
+    # by default. Round-robins every enabled camera looking for presence
+    # (reusing the ALPR YOLO model as a cheap signal, no filtering), then
+    # "zooms in" on a hit: every classify_interval_sec it sends a frame to
+    # a local Ollama-hosted vision model and publishes the reply
+    # (one of status_values) to mqtt.bay_status_topic_prefix + "/<bay>".
+    # After empty_debounce_count consecutive "empty" reads it reverts to
+    # baseline scanning. ollama_model has no working default -- it must
+    # match a tag you've actually pulled locally (`ollama pull <tag>`),
+    # so this fails fast at startup rather than silently misclassifying
+    # everything as null if left unset.
+    bay_monitor = cfg.setdefault("bay_monitor", {})
+    bay_monitor.setdefault("enabled", False)
+    bay_monitor.setdefault("baseline_scan_interval_ms", 2000)
+    bay_monitor.setdefault("classify_interval_sec", 60)
+    bay_monitor.setdefault("empty_debounce_count", 3)
+    bay_monitor.setdefault("ollama_host", "http://localhost:11434")
+    bay_monitor.setdefault("ollama_model", None)
+    bay_monitor.setdefault("ollama_timeout_sec", 30)
+    bay_monitor.setdefault("status_values",
+                            ["empty", "occupied", "unloading", "loading", "idle"])
+    bay_monitor.setdefault("classification_prompt", (
+        "You are monitoring a truck loading dock bay through a fixed "
+        "security camera. Classify the current activity into EXACTLY ONE "
+        "of these words: empty, occupied, unloading, loading, idle. "
+        "'empty' = no truck present. 'occupied' = a truck is present but "
+        "no cargo movement is visible. 'unloading' = cargo is visibly "
+        "being removed from the truck. 'loading' = cargo is visibly being "
+        "loaded onto the truck. 'idle' = a truck is present, not actively "
+        "loading or unloading (e.g. waiting, doors closed, driver break). "
+        "Respond with only the single classification word, nothing else."
+    ))
+    mqtt.setdefault("bay_status_topic_prefix", "site/alpr/bay_status")
+
     log_cfg = cfg.setdefault("logging", {})
     log_cfg.setdefault("level", "INFO")  # DEBUG / INFO / WARNING / ERROR
     log_cfg.setdefault("console", True)

@@ -93,10 +93,29 @@
 #       errors as JSON 500s instead of Flask's default HTML error page.
 #       waitress's own log output is routed through the same logging
 #       setup as the rest of the service (see logging_setup.py).
+#   11. Added an entirely separate, optional feature: config "bay_monitor"
+#       (alpr_service/bay_monitor.py) continuously round-robins every
+#       enabled camera looking for presence, independent of the enter/
+#       leave trigger pipeline -- it never touches JobBus, Worker, or the
+#       MQTT/HTTP trigger sources above. Presence reuses the existing
+#       ALPR plate model as a cheap signal (any detected box, no
+#       filtering). Once a bay shows a detection it's "zoomed in": every
+#       "bay_monitor.classify_interval_sec" (default 60s) a frame is sent
+#       to a local Ollama-hosted vision model and the reply (empty /
+#       occupied / unloading / loading / idle, or a custom set via
+#       "bay_monitor.status_values") is published to
+#       "mqtt.bay_status_topic_prefix" + "/<bay>". After
+#       "bay_monitor.empty_debounce_count" consecutive "empty" replies it
+#       reverts to baseline scanning. Off by default; fails fast at
+#       startup if enabled without "bay_monitor.ollama_model" set to an
+#       actual locally-pulled model tag.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is
-# true) -- see requirements.txt for pinned versions.
+# true) -- see requirements.txt for pinned versions. bay_monitor needs no
+# new pip package (talks to Ollama over plain HTTP via `requests`), but
+# does need a local Ollama install (https://ollama.com) with a
+# vision-capable model pulled if bay_monitor.enabled is turned on.
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 

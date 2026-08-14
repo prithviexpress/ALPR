@@ -40,6 +40,20 @@ def check_snapshot_credentials(config: dict, log):
         raise SystemExit(1)
 
 
+def check_bay_monitor_config(config: dict, log):
+    """Fail fast at startup if bay_monitor is enabled but ollama_model
+    isn't set -- there's no sane default (it has to match a tag actually
+    pulled into the local Ollama install), and running with it unset would
+    mean every single classification call silently fails instead of
+    surfacing the misconfiguration once, up front."""
+    bm_cfg = config["bay_monitor"]
+    if bm_cfg["enabled"] and not bm_cfg.get("ollama_model"):
+        log.error("bay_monitor.enabled is true but bay_monitor.ollama_model "
+                  "is not set -- set it to a vision model tag you've pulled "
+                  "locally via `ollama pull <tag>` (e.g. a Qwen VL tag)")
+        raise SystemExit(1)
+
+
 def build_mqtt(cameras: dict, config: dict, bus: JobBus,
                subscribe_enabled: bool = True) -> mqtt.Client:
     log = get_logger("MQTT")
@@ -217,6 +231,14 @@ def main():
               f"expected_frame="
               f"{alpr['expected_frame_width']}x{alpr['expected_frame_height']}")
     check_snapshot_credentials(config, log)
+    check_bay_monitor_config(config, log)
+
+    bay_monitor_cfg = config["bay_monitor"]
+    log.info(f"bay_monitor: enabled={bay_monitor_cfg['enabled']}"
+              + (f" ollama={bay_monitor_cfg['ollama_host']} "
+                 f"model={bay_monitor_cfg['ollama_model']} "
+                 f"classify_interval={bay_monitor_cfg['classify_interval_sec']}s"
+                 if bay_monitor_cfg["enabled"] else ""))
 
     try:
         cameras = load_cameras(CAMERAS_FILE)
@@ -250,6 +272,10 @@ def main():
         except ValueError as e:
             log.error(str(e))
             raise SystemExit(1)
+
+    if bay_monitor_cfg["enabled"]:
+        from .bay_monitor import start_bay_monitor
+        start_bay_monitor(cameras, config, publish)
 
     # Shared by every worker so their first-run model loading (in
     # particular PaddleOCR's download-if-missing check against the one

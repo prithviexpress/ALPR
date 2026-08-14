@@ -23,3 +23,9 @@ requests==2.32.3
 # WSGI server) instead of Flask's own dev server.
 flask==3.0.3
 waitress==3.0.0
+
+# bay_monitor.py (config "bay_monitor.enabled") needs no new pip package --
+# it talks to a locally running Ollama server over plain HTTP via
+# `requests` (already listed above). Ollama itself is a separate install,
+# not a pip package: https://ollama.com, then `ollama pull <a vision-
+# capable model tag>` and set that exact tag as bay_monitor.ollama_model.

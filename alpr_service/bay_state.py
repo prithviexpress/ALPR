@@ -32,12 +32,18 @@ only thing driving this) -- see check_bay_state_config() in service.py.
 
 State is in-memory only -- a restart loses any in-progress session.
 """
+import csv
 import json
 import threading
+from datetime import datetime, timezone
+from pathlib import Path
 
 from .logging_setup import get_logger
 from .mqtt_bus import make_job
 from .results import build_reply, result_topic, should_publish
+
+CSV_FIELDS = ["bay", "bay_status", "session_open", "direction", "plate",
+              "confidence", "read_attempts", "last_updated"]
 
 
 class BaySession:
@@ -68,16 +74,32 @@ class BaySession:
 
 
 class BayStateEngine:
-    def __init__(self, cameras: dict, config: dict, bus, publish_fn):
+    def __init__(self, cameras: dict, config: dict, bus, publish_fn,
+                 audit_dir: Path = None):
         self.log = get_logger("BAY_STATE")
         self.config = config
         self.bus = bus
         self.publish = publish_fn
         self.lock = threading.Lock()
         self.sessions = {bay: BaySession(bay) for bay in cameras}
+        # bay_monitor's raw activity classification (empty/occupied/
+        # unloading/...) per bay -- tracked here purely for the CSV
+        # snapshot below, since on_status() doesn't otherwise persist it
+        # anywhere this engine can read back.
+        self.bay_status = {bay: "" for bay in cameras}
         self.unknown_plate_value = config["alpr"]["unknown_plate_value"]
         self.max_read_attempts = config["alpr"]["max_read_attempts"]
         self.state_topic_prefix = config["mqtt"]["bay_state_topic_prefix"]
+        # A one-row-per-bay CSV snapshot of current state, rewritten in
+        # full on every on_status()/on_alpr_result() call -- MQTT
+        # requires a client and a subscription just to see "what's
+        # happening right now"; this is a file anyone can just open
+        # (Excel, Notepad, `watch cat`) and have it always show the
+        # latest state, no tooling required. None (no audit_dir passed,
+        # or bay_state_engine.save_state_csv turned off) just skips it.
+        self.csv_path = None
+        if audit_dir is not None and config["bay_state_engine"]["save_state_csv"]:
+            self.csv_path = audit_dir / "bay_state.csv"
 
     def _publish_state(self, session: BaySession, timestamp: str):
         """Live view of this engine's own state, separate from both
@@ -99,6 +121,39 @@ class BayStateEngine:
         }
         self.publish(topic, json.dumps(payload, default=str))
 
+    def _write_csv(self):
+        """Overwrite bay_state.csv with the current snapshot of every
+        bay -- always the full table, not an append-only log, so the
+        file stays small and opening it always shows the latest state
+        rather than history to scroll through. Written to a .tmp file
+        and atomically renamed into place so a reader (or Excel keeping
+        the file open) never sees a half-written row. Best-effort --
+        must never take the state engine down over a disk/permission
+        problem."""
+        if self.csv_path is None:
+            return
+        try:
+            tmp_path = self.csv_path.with_suffix(".csv.tmp")
+            now = datetime.now(timezone.utc).isoformat()
+            with open(tmp_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+                writer.writeheader()
+                for bay in sorted(self.sessions):
+                    session = self.sessions[bay]
+                    writer.writerow({
+                        "bay": bay,
+                        "bay_status": self.bay_status.get(bay, ""),
+                        "session_open": session.open,
+                        "direction": session.direction or "",
+                        "plate": session.plate or "",
+                        "confidence": session.confidence,
+                        "read_attempts": session.read_attempts,
+                        "last_updated": now,
+                    })
+            tmp_path.replace(self.csv_path)
+        except Exception:
+            self.log.warning("failed to write bay_state.csv", exc_info=True)
+
     def on_status(self, bay: str, status: str, timestamp: str,
                   occupied: bool, departed: bool):
         """Called by bay_monitor after every classification.
@@ -113,6 +168,7 @@ class BayStateEngine:
         stop reporting entirely once it reverted to baseline scanning and
         the session would stay open forever."""
         with self.lock:
+            self.bay_status[bay] = status
             session = self.sessions.setdefault(bay, BaySession(bay))
 
             if occupied:
@@ -134,6 +190,13 @@ class BayStateEngine:
                     self._retry_read(session, timestamp)
             elif departed and session.open:
                 self._on_departure(session, timestamp)
+
+            # Rewritten after every classification, not just at
+            # transitions -- this is what makes the CSV a reliable "is
+            # this thing even alive" check: its last_updated column
+            # moves every time bay_monitor classifies ANY bay, whether
+            # or not anything actually changed.
+            self._write_csv()
 
     def _on_arrival(self, session: BaySession, timestamp: str):
         session.reset()
@@ -236,5 +299,6 @@ class BayStateEngine:
                 self.log.info(f"({bay}) plate confirmed this session: "
                                f"{session.plate} (conf {session.confidence})")
                 self._publish_state(session, reply.get("ocr_time", ""))
+                self._write_csv()
             # NO_VALID_PLATE / ERROR: leave session.plate exactly as it
             # was -- a failed retry must never erase an earlier good read.

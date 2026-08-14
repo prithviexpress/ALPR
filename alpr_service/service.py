@@ -302,7 +302,8 @@ def main():
     state_engine = None
     if bay_state_enabled:
         from .bay_state import BayStateEngine
-        state_engine = BayStateEngine(cameras, config, bus, publish)
+        state_engine = BayStateEngine(cameras, config, bus, publish,
+                                       audit_dir=AUDIT_DIR)
 
     # Every background component that needs telling to stop registers its
     # Event here, so shutdown iterates one list instead of accumulating a

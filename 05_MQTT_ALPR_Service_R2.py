@@ -326,6 +326,17 @@
 #       coming back NO_VALID_PLATE" by browsing one folder chronologically
 #       instead of opening each job's own nested per-event audit
 #       subfolder one at a time.
+#   23. Added "bay_state_engine.save_state_csv" (default true):
+#       overwrites audit/bay_state.csv with a one-row-per-bay snapshot
+#       (bay_status, session_open, direction, plate, confidence,
+#       read_attempts, last_updated) on every classification and every
+#       plate confirmation. Requested directly: MQTT's bay_state topic
+#       (item #20) needs a client and a subscription just to see "what's
+#       happening right now" -- this is a plain file anyone can just
+#       open (Excel, Notepad) and have it always show current state, no
+#       tooling required. Always the full current table, not an
+#       append-only log, written via temp-file-then-rename so a reader
+#       never sees a half-written row.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

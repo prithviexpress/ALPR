@@ -429,6 +429,13 @@ def load_config(path: Path = None) -> dict:
     # second, independently-configured debounce would be unsafe here).
     bay_state_engine = cfg.setdefault("bay_state_engine", {})
     bay_state_engine.setdefault("enabled", False)
+    # Overwrites audit/bay_state.csv with a one-row-per-bay snapshot of
+    # current session state (bay_status, session_open, direction, plate,
+    # confidence, read_attempts, last_updated) on every classification
+    # and every plate confirmation -- a file anyone can just open
+    # (Excel, Notepad) to see current state at a glance, no MQTT client
+    # or subscription required.
+    bay_state_engine.setdefault("save_state_csv", True)
 
     # Worker pool sizing -- num_workers is roughly "max concurrent
     # dockings this instance can process at once" (each Worker owns its

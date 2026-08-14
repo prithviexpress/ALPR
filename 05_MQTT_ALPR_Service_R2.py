@@ -108,7 +108,35 @@
 #       "bay_monitor.empty_debounce_count" consecutive "empty" replies it
 #       reverts to baseline scanning. Off by default; fails fast at
 #       startup if enabled without "bay_monitor.ollama_model" set to an
-#       actual locally-pulled model tag.
+#       actual locally-pulled model tag. Also supports few-shot exemplar
+#       images ("bay_monitor.reference_images") sent alongside every
+#       classification call to calibrate ambiguous cases (e.g. a bay/
+#       cargo door being open) that a text-only prompt undersells.
+#   12. Added a second, optional, opt-in feature on top of #11: config
+#       "bay_state_engine" (alpr_service/bay_state.py) fuses bay_monitor's
+#       status stream with ALPR reads into one session per bay, and
+#       becomes the authority for enter/leave INSTEAD of the MQTT/HTTP
+#       trigger source. bay_monitor's own empty->occupied transition
+#       enqueues an ALPR read via the normal Worker pool (Worker now
+#       takes an optional "on_result" hook, called after every completed
+#       job so this engine can capture a confirmed plate); unlike a
+#       one-shot trigger it keeps retrying on every subsequent
+#       reclassification of the bay as still occupied until a read
+#       actually succeeds -- so one bad read (e.g. from a door being
+#       open at that exact instant) doesn't cost the whole visit's
+#       identity. occupied->empty publishes the leave result using
+#       whatever plate got confirmed at any point during the stay, since
+#       by the time a bay reads "empty" there's no truck left in frame
+#       for a fresh read. Departure timing is driven directly by
+#       bay_monitor's own empty_debounce_count decision (bay_monitor.py's
+#       on_status hook now also passes its post-transition zoomed_in
+#       flag) rather than a second, separately-configured debounce here,
+#       since two independently-tuned copies of that threshold could
+#       fall out of sync. Off by default; fails fast at startup if
+#       enabled without bay_monitor also enabled, and warns (without
+#       blocking) if the MQTT/HTTP triggers are also left on, since both
+#       would then independently decide enter/leave for the same bays.
+#       State is in-memory only -- a restart loses any truck mid-visit.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

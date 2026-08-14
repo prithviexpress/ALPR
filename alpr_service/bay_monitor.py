@@ -136,7 +136,8 @@ def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = 
     return None
 
 
-def run_bay_monitor(cameras: dict, config: dict, publish_fn, stop_event: threading.Event):
+def run_bay_monitor(cameras: dict, config: dict, publish_fn, stop_event: threading.Event,
+                     on_status=None):
     log = get_logger("BAY_MONITOR")
     bm_cfg = config["bay_monitor"]
     snap_cfg = config["snapshot"]
@@ -198,10 +199,11 @@ def run_bay_monitor(cameras: dict, config: dict, publish_fn, stop_event: threadi
                     status = classify_frame(frame, bm_cfg, log, bay, reference_images)
                     state.last_classify_time = time.time()
                     if status is not None:
+                        timestamp = datetime.now(timezone.utc).isoformat()
                         payload = {
                             "bay": bay,
                             "status": status,
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "timestamp": timestamp,
                         }
                         topic = f"{bay_status_topic_prefix}/{bay}"
                         publish_fn(topic, json.dumps(payload))
@@ -217,6 +219,22 @@ def run_bay_monitor(cameras: dict, config: dict, publish_fn, stop_event: threadi
                         else:
                             state.consecutive_empty = 0
 
+                        # Called last, after state.zoomed_in above already
+                        # reflects the post-transition truth -- so a
+                        # consumer (e.g. bay_state.py's BayStateEngine)
+                        # can tell "this was the empty read that made this
+                        # loop give up watching closely" (zoomed_in=False)
+                        # apart from "still empty, still watching"
+                        # (zoomed_in=True) without re-deriving its own,
+                        # potentially out-of-sync copy of this same
+                        # debounce decision.
+                        if on_status is not None:
+                            try:
+                                on_status(bay, status, timestamp, state.zoomed_in)
+                            except Exception:
+                                log.error(f"({bay}) on_status hook raised",
+                                          exc_info=True)
+
             # Pace between bays regardless of what happened above -- keeps
             # the round-robin from hammering every camera back-to-back
             # with no gap. wait() returns True the moment stop_event is
@@ -228,14 +246,16 @@ def run_bay_monitor(cameras: dict, config: dict, publish_fn, stop_event: threadi
     log.info("bay monitor stopped")
 
 
-def start_bay_monitor(cameras: dict, config: dict, publish_fn):
+def start_bay_monitor(cameras: dict, config: dict, publish_fn, on_status=None):
     """Starts the round-robin scanner in a background thread. Returns
     (thread, stop_event) -- signal stop_event to ask the loop to exit at
     its next check point (it won't interrupt a request already in
-    flight)."""
+    flight). on_status, if given, is called (bay, status, timestamp) after
+    every successful classification -- see bay_state.py's BayStateEngine
+    for the main consumer."""
     stop_event = threading.Event()
     t = threading.Thread(target=run_bay_monitor,
-                          args=(cameras, config, publish_fn, stop_event),
+                          args=(cameras, config, publish_fn, stop_event, on_status),
                           daemon=True, name="bay-monitor")
     t.start()
     return t, stop_event

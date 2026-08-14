@@ -39,7 +39,8 @@ FETCH_FAILURE_BACKOFF_SEC = 0.2
 
 class Worker(threading.Thread):
     def __init__(self, wid, jobs, cameras: dict, config: dict, publish_fn,
-                 job_bus, audit_dir: Path, model_load_lock: threading.Lock = None):
+                 job_bus, audit_dir: Path, model_load_lock: threading.Lock = None,
+                 on_result=None):
         super().__init__(daemon=True, name=f"worker-{wid}")
         self.wid = wid
         self.jobs = jobs
@@ -48,6 +49,14 @@ class Worker(threading.Thread):
         self.publish = publish_fn
         self.job_bus = job_bus
         self.audit_dir = audit_dir
+        # Optional hook invoked with the reply dict after every completed
+        # job (success, NO_VALID_PLATE, or an error result), independent
+        # of whether it was actually published to MQTT (publish_no_valid_
+        # plate can suppress that, but a consumer of this hook -- e.g.
+        # bay_state.py's BayStateEngine -- still needs to know a read
+        # attempt happened and how it went). Never lets a hook exception
+        # take down job processing.
+        self.on_result = on_result
         # Shared across every Worker: all workers point at the same local
         # PaddleOCR model folder, and on a fresh install nothing's
         # downloaded there yet. Without this lock, every worker thread
@@ -171,6 +180,15 @@ class Worker(threading.Thread):
         except Exception:
             self.log.error(f"({bay}/{direction}) failed to publish ERROR result:\n"
                             f"{traceback.format_exc()}")
+        self._notify_result(result)
+
+    def _notify_result(self, reply: dict):
+        if self.on_result is None:
+            return
+        try:
+            self.on_result(reply)
+        except Exception:
+            self.log.error(f"on_result hook raised:\n{traceback.format_exc()}")
 
     # --------- per-job pipeline ---------
     def handle(self, job):
@@ -294,6 +312,11 @@ class Worker(threading.Thread):
             self.publish(topic, json.dumps(reply, default=str))
             self.log.info(f"({bay}/{direction}) {final or status} published "
                            f"to {topic} ({elapsed}s total, {len(reads)} reads)")
+
+        # Fires regardless of whether publish_no_valid_plate suppressed
+        # the MQTT publish above -- a consumer of this hook needs to know
+        # a read attempt completed and how it went either way.
+        self._notify_result(reply)
 
     def collect(self, cam: dict, debug_dir=None):
         stats = {'first_fetch_ms': 0, 'avg_fetch_ms': 0.0, 'total_bytes': 0,

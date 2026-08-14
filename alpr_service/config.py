@@ -248,6 +248,23 @@ def load_config(path: Path = None) -> dict:
     ))
     mqtt.setdefault("bay_status_topic_prefix", "site/alpr/bay_status")
 
+    # Per-bay state engine (bay_state.py) -- fuses bay_monitor's
+    # continuous status stream with ALPR plate reads into one session per
+    # bay, and becomes the authority for enter/leave direction and
+    # timing instead of the MQTT/HTTP trigger source: an empty->occupied
+    # transition enqueues an ALPR read (retried across the whole stay,
+    # not just once), and occupied->empty publishes "leave" using
+    # whatever plate got confirmed at any point during the visit. Off by
+    # default; depends entirely on bay_monitor also being enabled --
+    # fails fast at startup otherwise (see check_bay_state_config() in
+    # service.py). No config of its own beyond "enabled": its departure
+    # timing directly follows bay_monitor.empty_debounce_count rather
+    # than a separate setting, to guarantee the two can never fall out
+    # of sync (see bay_state.py's BayStateEngine.on_status for why a
+    # second, independently-configured debounce would be unsafe here).
+    bay_state_engine = cfg.setdefault("bay_state_engine", {})
+    bay_state_engine.setdefault("enabled", False)
+
     log_cfg = cfg.setdefault("logging", {})
     log_cfg.setdefault("level", "INFO")  # DEBUG / INFO / WARNING / ERROR
     log_cfg.setdefault("console", True)

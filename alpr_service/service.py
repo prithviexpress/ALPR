@@ -54,6 +54,31 @@ def check_bay_monitor_config(config: dict, log):
         raise SystemExit(1)
 
 
+def check_bay_state_config(config: dict, log):
+    """Fail fast at startup if bay_state_engine is enabled without
+    bay_monitor -- the state engine has no signal of its own, it entirely
+    depends on bay_monitor's status classification stream to know when a
+    bay's occupancy starts/ends. Also warns (doesn't block) if the
+    original MQTT/HTTP triggers are also enabled alongside it, since both
+    paths would then independently decide enter/leave for the same bay --
+    redundant at best, duplicate/conflicting publishes at worst."""
+    if not config["bay_state_engine"]["enabled"]:
+        return
+    if not config["bay_monitor"]["enabled"]:
+        log.error("bay_state_engine.enabled is true but bay_monitor.enabled "
+                  "is false -- the state engine has no signal without it, "
+                  "enable bay_monitor too")
+        raise SystemExit(1)
+    if config["mqtt"]["trigger_enabled"] or config["http_trigger"]["enabled"]:
+        log.warning("bay_state_engine is enabled AND an MQTT/HTTP trigger "
+                    "is also enabled -- both will independently decide "
+                    "enter/leave for the same bays, which usually means "
+                    "redundant or conflicting result publishes. Consider "
+                    "disabling mqtt.trigger_enabled/http_trigger.enabled "
+                    "if bay_state_engine is meant to be the sole source "
+                    "of enter/leave direction.")
+
+
 def build_mqtt(cameras: dict, config: dict, bus: JobBus,
                subscribe_enabled: bool = True) -> mqtt.Client:
     log = get_logger("MQTT")
@@ -208,12 +233,14 @@ def main():
 
     mqtt_trigger_enabled = config["mqtt"]["trigger_enabled"]
     http_trigger_enabled = config["http_trigger"]["enabled"]
-    if not mqtt_trigger_enabled and not http_trigger_enabled:
-        log.error("no trigger source enabled -- set mqtt.trigger_enabled "
-                  "and/or http_trigger.enabled to true in config.json")
+    bay_state_enabled = config["bay_state_engine"]["enabled"]
+    if not mqtt_trigger_enabled and not http_trigger_enabled and not bay_state_enabled:
+        log.error("no trigger source enabled -- set mqtt.trigger_enabled, "
+                  "http_trigger.enabled, and/or bay_state_engine.enabled "
+                  "to true in config.json")
         raise SystemExit(1)
     log.info(f"trigger sources: mqtt={mqtt_trigger_enabled} "
-              f"http={http_trigger_enabled}")
+              f"http={http_trigger_enabled} bay_state_engine={bay_state_enabled}")
 
     log.info(f"workers={NUM_WORKERS} queue_max={QUEUE_MAX} "
               f"cooldown={alpr['cooldown_sec']}s "
@@ -232,6 +259,7 @@ def main():
               f"{alpr['expected_frame_width']}x{alpr['expected_frame_height']}")
     check_snapshot_credentials(config, log)
     check_bay_monitor_config(config, log)
+    check_bay_state_config(config, log)
 
     bay_monitor_cfg = config["bay_monitor"]
     log.info(f"bay_monitor: enabled={bay_monitor_cfg['enabled']}"
@@ -239,6 +267,7 @@ def main():
                  f"model={bay_monitor_cfg['ollama_model']} "
                  f"classify_interval={bay_monitor_cfg['classify_interval_sec']}s"
                  if bay_monitor_cfg["enabled"] else ""))
+    log.info(f"bay_state_engine: enabled={bay_state_enabled}")
 
     try:
         cameras = load_cameras(CAMERAS_FILE)
@@ -273,9 +302,19 @@ def main():
             log.error(str(e))
             raise SystemExit(1)
 
+    # Instantiated whether or not bay_monitor is running yet -- Worker
+    # needs state_engine.on_alpr_result wired in below regardless, and
+    # doing so is harmless if bay_state_engine ends up disabled (nothing
+    # ever calls into it in that case).
+    state_engine = None
+    if bay_state_enabled:
+        from .bay_state import BayStateEngine
+        state_engine = BayStateEngine(cameras, config, bus, publish)
+
     if bay_monitor_cfg["enabled"]:
         from .bay_monitor import start_bay_monitor
-        start_bay_monitor(cameras, config, publish)
+        start_bay_monitor(cameras, config, publish,
+                           on_status=state_engine.on_status if state_engine else None)
 
     # Shared by every worker so their first-run model loading (in
     # particular PaddleOCR's download-if-missing check against the one
@@ -284,7 +323,8 @@ def main():
     model_load_lock = threading.Lock()
     workers = [
         Worker(i + 1, bus.jobs, cameras, config, publish, bus, AUDIT_DIR,
-               model_load_lock)
+               model_load_lock,
+               on_result=state_engine.on_alpr_result if state_engine else None)
         for i in range(NUM_WORKERS)
     ]
     for w in workers:

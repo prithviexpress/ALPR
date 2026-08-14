@@ -311,10 +311,12 @@ def main():
         from .bay_state import BayStateEngine
         state_engine = BayStateEngine(cameras, config, bus, publish)
 
+    bay_monitor_stop = None
     if bay_monitor_cfg["enabled"]:
         from .bay_monitor import start_bay_monitor
-        start_bay_monitor(cameras, config, publish,
-                           on_status=state_engine.on_status if state_engine else None)
+        _, bay_monitor_stop = start_bay_monitor(
+            cameras, config, publish,
+            on_status=state_engine.on_status if state_engine else None)
 
     # Shared by every worker so their first-run model loading (in
     # particular PaddleOCR's download-if-missing check against the one
@@ -332,6 +334,12 @@ def main():
 
     def _handle_signal(signum, frame):
         log.info(f"received signal {signum}, shutting down")
+        # Signal the bay monitor first -- without this it keeps fetching
+        # snapshots and publishing bay statuses after the MQTT client is
+        # disconnected. It exits at its next check point (it won't
+        # interrupt a request already in flight).
+        if bay_monitor_stop is not None:
+            bay_monitor_stop.set()
         client.disconnect()
 
     signal.signal(signal.SIGTERM, _handle_signal)

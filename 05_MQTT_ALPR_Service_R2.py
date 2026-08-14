@@ -137,6 +137,15 @@
 #       blocking) if the MQTT/HTTP triggers are also left on, since both
 #       would then independently decide enter/leave for the same bays.
 #       State is in-memory only -- a restart loses any truck mid-visit.
+#   13. Every published result now carries a truck_number STRING, never
+#       null: anything short of a valid read reports
+#       "alpr.unknown_plate_value" ("UNKNOWN" by default) instead, so a
+#       downstream consumer never has to null-check the field. "status"
+#       remains what distinguishes a genuine read from the placeholder,
+#       and the placeholder can never satisfy plate_text.is_valid() nor
+#       be stored as a session's confirmed plate. The audit result.json
+#       also gained "raw_vote" (whatever the OCR vote actually produced,
+#       possibly null/garbage) so the placeholder hides no forensic detail.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

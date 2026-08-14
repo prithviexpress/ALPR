@@ -142,6 +142,14 @@ def load_config(path: Path = None) -> dict:
     #          staying at 0), then switched back to "basic".
     alpr.setdefault("diagnostics_mode", "basic")
     alpr.setdefault("min_ocr_conf", 0.35)
+    # Published results always carry a truck_number STRING, never null --
+    # anything short of a valid read reports this placeholder instead, so
+    # a downstream consumer never has to null-check the field. The
+    # "status" field (SUCCESS / NO_VALID_PLATE / CAMERA_* / ERROR) is what
+    # distinguishes a genuine read from the placeholder. Keep this to
+    # something no real plate could ever be (it must not satisfy
+    # plate_text.is_valid(), or it could be mistaken for a real read).
+    alpr.setdefault("unknown_plate_value", "UNKNOWN")
     # Minimum YOLO box confidence for a plate detection to be considered
     # at all (Ultralytics' own default is 0.25 if this isn't passed
     # explicitly -- surfaced here so it's tunable without a code change).
@@ -158,9 +166,13 @@ def load_config(path: Path = None) -> dict:
     # score_sharpness_norm), center (how close to the ROI's horizontal
     # center -- plates dead-center in frame tend to be the real target,
     # not a passing vehicle at the edge).
-    alpr.setdefault("score_weights", {
-        "yolo_conf": 0.4, "area": 0.25, "sharpness": 0.2, "center": 0.15,
-    })
+    # Merged key-by-key rather than setdefault'd as a whole dict: a
+    # partial override like {"yolo_conf": 0.55} would otherwise leave the
+    # other three keys absent, and worker.py subscripts all four -- every
+    # job would die with a KeyError on the first kept box.
+    score_weights = {"yolo_conf": 0.4, "area": 0.25, "sharpness": 0.2, "center": 0.15}
+    score_weights.update(alpr.get("score_weights") or {})
+    alpr["score_weights"] = score_weights
     alpr.setdefault("score_area_norm", 25000)
     alpr.setdefault("score_sharpness_norm", 600)
     # A candidate crop is discarded as a near-duplicate of one already
@@ -267,6 +279,23 @@ def load_config(path: Path = None) -> dict:
     bay_monitor.setdefault("ollama_timeout_sec", 30)
     bay_monitor.setdefault("status_values",
                             ["empty", "occupied", "unloading", "loading", "idle"])
+    # Which entry of status_values means "nothing is there". Drives both
+    # this module's revert-to-baseline debounce and bay_state.py's
+    # occupied set (everything that ISN'T this) -- neither hardcodes the
+    # literal "empty" any more, so a custom status_values vocabulary
+    # still works end to end.
+    bay_monitor.setdefault("empty_status", "empty")
+    # Which pixels the vision model is asked to judge:
+    #   "full_frame" (default) -- the whole bay: cargo, forklifts, doors,
+    #       which is what the activity vocabulary is really about. But a
+    #       truck in an ADJACENT bay that's also in shot can drive this
+    #       bay's status (and, with bay_state_engine on, open a session on
+    #       the wrong bay).
+    #   "roi" -- restrict it to the same cameras.json roi that presence
+    #       detection uses. Removes that cross-talk, at the cost of a much
+    #       narrower view (the roi is framed for plates, not for watching
+    #       cargo movement). Use this if bays overlap in frame.
+    bay_monitor.setdefault("classify_region", "full_frame")
     # Optional few-shot exemplars sent alongside every classification
     # call, e.g. [{"path": "reference_images/empty.jpg", "label": "empty"},
     # {"path": "reference_images/door_open.jpg", "label": "occupied (bay

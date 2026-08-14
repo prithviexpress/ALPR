@@ -38,15 +38,11 @@ from datetime import datetime, timezone
 
 from .logging_setup import get_logger
 
-# bay_monitor's classification vocabulary that counts as "a truck is (or
-# very recently was) actually there" for session purposes.
-OCCUPIED_STATUSES = {"occupied", "unloading", "loading", "idle"}
-
 
 class BaySession:
     def __init__(self, bay: str):
         self.bay = bay
-        self.status = "empty"
+        self.status = None
         self.direction = None       # "enter" while a session is open, else None
         self.plate = None
         self.confidence = 0.0
@@ -64,9 +60,20 @@ class BayStateEngine:
         self.publish = publish_fn
         self.lock = threading.Lock()
         self.sessions = {bay: BaySession(bay) for bay in cameras}
-        self.publish_no_valid_plate = config["alpr"].get("publish_no_valid_plate", True)
+        alpr_cfg = config["alpr"]
+        self.publish_no_valid_plate = alpr_cfg.get("publish_no_valid_plate", True)
+        self.unknown_plate_value = alpr_cfg.get("unknown_plate_value", "UNKNOWN")
         self.leave_topic_prefix = config["mqtt"].get(
             "leave_result_topic_prefix", "alpr_result/leave")
+        # "Occupied" is derived from bay_monitor's own configured
+        # vocabulary (everything that isn't its empty_status) rather than
+        # a hardcoded set here -- a custom bay_monitor.status_values would
+        # otherwise never match, and no session would ever open or close.
+        bm_cfg = config.get("bay_monitor", {})
+        empty_status = bm_cfg.get("empty_status", "empty")
+        status_values = bm_cfg.get(
+            "status_values", ["empty", "occupied", "unloading", "loading", "idle"])
+        self.occupied_statuses = {s for s in status_values if s != empty_status}
 
     def on_status(self, bay: str, status: str, timestamp: str, zoomed_in: bool):
         """Called by bay_monitor after every classification. zoomed_in is
@@ -82,12 +89,22 @@ class BayStateEngine:
         leaving a session open forever)."""
         with self.lock:
             session = self.sessions.setdefault(bay, BaySession(bay))
-            was_occupied = session.status in OCCUPIED_STATUSES
-            is_occupied = status in OCCUPIED_STATUSES
             session.status = status
 
-            if is_occupied:
-                if not was_occupied:
+            if status in self.occupied_statuses:
+                # Whether this is a NEW arrival is decided purely by
+                # whether a session is already open -- NOT by comparing
+                # against the previous classification. Keying off the
+                # previous status was a real bug: a single transient
+                # "empty" mid-visit (a VLM blip, or a door-open frame that
+                # reads as empty) sits below bay_monitor's debounce, so no
+                # departure fires and the session stays open -- but the
+                # next "occupied" then looked like a fresh arrival and
+                # wiped the plate already confirmed for this very truck,
+                # publishing leave with no truck number. That is precisely
+                # the failure this module exists to prevent. With a
+                # session open, any occupied read is a continuation.
+                if session.direction != "enter":
                     self._on_arrival(session, timestamp)
                 elif not session.confirmed:
                     self._retry_read(session, timestamp)
@@ -112,7 +129,6 @@ class BayStateEngine:
         self._enqueue_read(session, timestamp)
 
     def _enqueue_read(self, session: BaySession, timestamp: str):
-        session.read_attempts += 1
         queued_event = {
             "bay": session.bay,
             "direction": "enter",
@@ -120,9 +136,21 @@ class BayStateEngine:
             "detected_class": None,
             "detected_likelihood": None,
         }
-        # JobBus's own (bay, direction) cooldown naturally paces retries --
-        # no separate retry-interval setting needed here.
-        self.bus.try_enqueue(queued_event)
+        # JobBus's own (bay, direction) cooldown paces retries -- but it
+        # also silently REFUSES them, so read_attempts only counts reads
+        # that were actually accepted, and a refusal is logged rather than
+        # looking like an attempt that came back empty. Worth knowing:
+        # with the defaults (cooldown_sec=90 > classify_interval_sec=60)
+        # roughly every other retry is refused this way, so effective
+        # retry cadence is the cooldown, not the classify interval. Lower
+        # alpr.cooldown_sec if you want a retry on every classification.
+        if self.bus.try_enqueue(queued_event):
+            session.read_attempts += 1
+            return True
+        self.log.debug(f"({session.bay}) ALPR read not enqueued (JobBus "
+                        f"cooldown or queue full) -- will try again on the "
+                        f"next classification")
+        return False
 
     def _on_departure(self, session: BaySession, timestamp: str):
         self.log.info(f"({session.bay}) departure detected -> leave "
@@ -132,7 +160,11 @@ class BayStateEngine:
         reply = {
             "bay": session.bay,
             "direction": "leave",
-            "truck_number": session.plate,
+            # Never null -- a downstream consumer always gets a string,
+            # either the confirmed plate or alpr.unknown_plate_value. The
+            # "status" field is what distinguishes a real read from a
+            # placeholder.
+            "truck_number": session.plate or self.unknown_plate_value,
             "confidence": session.confidence,
             "status": status,
             "event_time": timestamp,
@@ -173,8 +205,13 @@ class BayStateEngine:
             if (session is None or session.direction != "enter"
                     or reply.get("direction") != "enter"):
                 return
-            if reply.get("status") == "SUCCESS" and reply.get("truck_number"):
-                session.plate = reply["truck_number"]
+            plate = reply.get("truck_number")
+            # status=="SUCCESS" already excludes the placeholder, but
+            # guard explicitly so alpr.unknown_plate_value can never be
+            # recorded as this session's confirmed plate.
+            if (reply.get("status") == "SUCCESS" and plate
+                    and plate != self.unknown_plate_value):
+                session.plate = plate
                 session.confidence = reply.get("confidence", 0.0)
                 session.confirmed = True
                 self.log.info(f"({bay}) plate confirmed this session: "

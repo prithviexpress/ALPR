@@ -84,13 +84,17 @@ class Worker(threading.Thread):
         self.expected_frame_height = alpr.get("expected_frame_height")
         self.frame_size_tolerance_pct = alpr.get("frame_size_tolerance_pct", 10)
         self.min_ocr_conf = alpr.get("min_ocr_conf", 0.35)
+        self.unknown_plate_value = alpr.get("unknown_plate_value", "UNKNOWN")
         self.yolo_conf_threshold = alpr.get("yolo_conf_threshold", 0.25)
         self.max_consecutive_fetch_failures = alpr.get(
             "max_consecutive_fetch_failures", 10)
         self.fetch_failure_backoff_sec = alpr.get("fetch_failure_backoff_sec", 0.2)
-        self.score_weights = alpr.get(
-            "score_weights",
-            {"yolo_conf": 0.4, "area": 0.25, "sharpness": 0.2, "center": 0.15})
+        # Merged, not replaced -- load_config() already does this, but a
+        # Worker built from a hand-made config dict must not be able to
+        # KeyError mid-job on a missing weight either.
+        self.score_weights = {"yolo_conf": 0.4, "area": 0.25,
+                               "sharpness": 0.2, "center": 0.15}
+        self.score_weights.update(alpr.get("score_weights") or {})
         self.score_area_norm = alpr.get("score_area_norm", 25000)
         self.score_sharpness_norm = alpr.get("score_sharpness_norm", 600)
         self.duplicate_resize = (
@@ -177,7 +181,8 @@ class Worker(threading.Thread):
         result = {
             'bay': bay,
             'direction': direction,
-            'truck_number': None,
+            # Never null -- see handle()'s reply for the rationale.
+            'truck_number': self.unknown_plate_value,
             'status': 'ERROR',
             'error_reason': reason,
             'error_detail': str(detail)[-2000:],
@@ -278,11 +283,23 @@ class Worker(threading.Thread):
             # "read" plate.
             status = 'SUCCESS' if final and is_valid(final) else 'NO_VALID_PLATE'
 
+        # Every result carries a truck_number string, never null: on
+        # anything short of a valid read it's alpr.unknown_plate_value
+        # ("UNKNOWN" by default), so a downstream consumer can always read
+        # the field without null-handling. "status" is what distinguishes
+        # a genuine read from the placeholder -- and since the placeholder
+        # can never satisfy is_valid(), it can't be mistaken for one.
+        # 'raw_vote' below keeps whatever weighted_vote() actually
+        # produced (possibly null, possibly OCR garbage) so the audit
+        # trail doesn't lose that detail behind the placeholder.
+        truck_number = final if status == 'SUCCESS' else self.unknown_plate_value
+
         # Full detail for the audit trail on disk.
         result = {
             'bay': bay,
             'direction': direction,
-            'truck_number': final,
+            'truck_number': truck_number,
+            'raw_vote': final,
             'confidence': confidence,
             'supporting_reads': supporting_reads,
             'total_reads': len(reads),
@@ -307,7 +324,7 @@ class Worker(threading.Thread):
         reply = {
             'bay': bay,
             'direction': direction,
-            'truck_number': final,
+            'truck_number': truck_number,
             'confidence': confidence,
             'status': status,
             'event_time': event_time,
@@ -321,8 +338,9 @@ class Worker(threading.Thread):
         else:
             topic = self._result_topic(direction, bay)
             self.publish(topic, json.dumps(reply, default=str))
-            self.log.info(f"({bay}/{direction}) {final or status} published "
-                           f"to {topic} ({elapsed}s total, {len(reads)} reads)")
+            self.log.info(f"({bay}/{direction}) {truck_number} ({status}) "
+                           f"published to {topic} ({elapsed}s total, "
+                           f"{len(reads)} reads)")
 
         # Fires regardless of whether publish_no_valid_plate suppressed
         # the MQTT publish above -- a consumer of this hook needs to know

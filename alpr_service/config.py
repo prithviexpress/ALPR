@@ -27,8 +27,8 @@ REQUIRED_KEYS = {
     "mqtt": ["host", "port",
              "enter_subscribe_topic", "leave_subscribe_topic",
              "enter_result_topic_prefix", "leave_result_topic_prefix"],
-    "alpr": ["collection_timeout", "max_raw_samples",
-             "best_samples", "min_plate_width", "min_plate_height",
+    "alpr": ["collection_timeout", "max_ocr_attempts",
+             "min_plate_width", "min_plate_height",
              "center_distance_limit"],
 }
 
@@ -138,11 +138,11 @@ def load_config(path: Path = None) -> dict:
     # "troubleshooting": all of the above, PLUS every fetched frame (full
     #          image and ROI, the ROI annotated with every box the model
     #          returned -- green=kept, red/orange=rejected with reason)
-    #          and every raw candidate crop saved the moment it's found,
-    #          not just the final best_samples. Also forces the log level
-    #          to DEBUG regardless of "logging.level". Generates
+    #          and every kept candidate crop saved the moment it's found,
+    #          not just the ones that got OCR'd. Also forces the log
+    #          level to DEBUG regardless of "logging.level". Generates
     #          noticeably more files/log volume -- meant to be turned on
-    #          only while actively diagnosing an issue (e.g. raw_cands
+    #          only while actively diagnosing an issue (e.g. ocr_attempts
     #          staying at 0), then switched back to "basic".
     alpr.setdefault("diagnostics_mode", "basic")
     alpr.setdefault("min_ocr_conf", 0.35)
@@ -370,6 +370,19 @@ def load_config(path: Path = None) -> dict:
     bay_monitor.setdefault("presence_diff_resize_width", 160)
     bay_monitor.setdefault("presence_diff_resize_height", 120)
     bay_monitor.setdefault("presence_diff_threshold", 3.0)
+    # Same diff mechanism as presence_diff_*, but for a DIFFERENT
+    # question: while a bay is already zoomed in, has the scene changed
+    # enough since the last classify to be worth reclassifying right now
+    # (e.g. idle -> unloading), rather than waiting out
+    # classify_interval_sec. Runs alongside that timer, not instead of
+    # it -- a subtle change too small to trip this still gets caught on
+    # the next scheduled tick. Deliberately a separate threshold from
+    # presence_diff_threshold: "is anything here at all" and "did an
+    # established truck's activity change" don't need the same
+    # sensitivity. Set classify_diff_enabled to false to go back to
+    # pure timer-based reclassification only.
+    bay_monitor.setdefault("classify_diff_enabled", True)
+    bay_monitor.setdefault("classify_diff_threshold", 3.0)
     bay_monitor.setdefault("classification_prompt", (
         "You are monitoring a truck loading dock bay through a fixed "
         "security camera. Classify the current activity into EXACTLY ONE "

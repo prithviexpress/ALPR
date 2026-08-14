@@ -3,7 +3,8 @@
 Separate concern from the enter/leave ALPR pipeline (worker.py / JobBus /
 MQTT-or-HTTP triggers) -- this never touches any of that. It only reuses
 cameras.json (via the same cameras dict service.py already loaded) and the
-HTTP snapshot fetch mechanism (snapshot.py) that ALPR's own collect() uses.
+HTTP snapshot fetch mechanism (snapshot.py) that ALPR's own
+collect_and_read() uses.
 
 How it works: round-robins every enabled camera, one frame at a time,
 "by turns". A bay with nothing detected is scanned at the baseline cadence
@@ -19,18 +20,23 @@ open door -- counts as "something's there", since the point isn't to find
 a clean plate, or even identify what changed -- it's just "is this bay
 worth paying closer attention to".
 
-Once a bay's scene has changed it's "zoomed in": every
-bay_monitor.classify_interval_sec (default 60s -- "one frame per minute
-per truck") a fresh frame is sent to a local Ollama-hosted vision model
-(bay_monitor.ollama_model) with a classification prompt, and the reply is
-published to mqtt.bay_status_topic_prefix + "/<bay>". Other bays are not
-paused while one is zoomed in -- the round-robin keeps visiting all of
-them each pass; a zoomed-in bay just also gets the extra classification
-call layered on top when its interval is due, and is skipped without a
-frame fetch on passes where it isn't. After bay_monitor.empty_debounce_count
-consecutive "empty" classifications the bay reverts to baseline diff-only
-scanning, since an LLM call every round for a bay with nothing happening
-is wasted latency and load.
+Once a bay's scene has changed it's "zoomed in": a frame is sent to a
+local Ollama-hosted vision model (bay_monitor.ollama_model) with a
+classification prompt, and the reply is published to
+mqtt.bay_status_topic_prefix + "/<bay>". Two independent things can
+trigger that call while zoomed in -- whichever comes first: the
+bay_monitor.classify_interval_sec timer (default 60s -- "at least one
+frame per minute per truck"), or the same kind of thumbnail diff used
+for presence detection noticing the scene changed since the last
+classify (bay_monitor.classify_diff_*) -- e.g. a truck going from idle
+to actively being unloaded gets picked up immediately rather than
+waiting out the rest of the interval. A zoomed-in bay is fetched every
+round either way (same cadence as baseline scanning), just not always
+classified. Other bays are not paused while one is zoomed in -- the
+round-robin keeps visiting all of them each pass. After
+bay_monitor.empty_debounce_count consecutive "empty" classifications the
+bay reverts to baseline diff-only scanning, since an LLM call every
+round for a bay with nothing happening is wasted latency and load.
 """
 import base64
 import json
@@ -57,6 +63,12 @@ class BayState:
         # thumbnail of this ROI the last time it was looked at while
         # empty, so the next look can tell whether the scene changed.
         self.presence_thumb = None
+        # Same idea while already zoomed in (see BayMonitor._detect_
+        # change): a thumbnail of this ROI as of the last classified (or
+        # looked-at) frame, so an in-progress visit's activity change
+        # (e.g. idle -> unloading) can trigger an early reclassify
+        # instead of waiting out classify_interval_sec.
+        self.classify_thumb = None
 
 
 def downscale(img, max_dimension: int):
@@ -280,15 +292,12 @@ class BayMonitor:
                     continue
                 state = self.states.setdefault(bay, BayState())
 
-                if state.zoomed_in and (time.time() - state.last_classify_time
-                                         < self.cfg["classify_interval_sec"]):
-                    # Not due yet -- skip without fetching a frame, but
-                    # still pace the loop. Without this wait, a round of
-                    # zoomed-in-but-not-due bays would busy-spin the
-                    # thread at ~100% CPU checking timestamps.
-                    if stop_event.wait(self.scan_interval_sec):
-                        break
-                    continue
+                # A zoomed-in bay is still fetched every round (not just
+                # when classify_interval_sec is due) -- see _scan_bay's
+                # "already zoomed in" branch, which reclassifies early on
+                # a meaningful scene change (e.g. idle -> unloading)
+                # without waiting for the timer, while the timer itself
+                # still fires as a periodic backstop.
 
                 # Every bay's turn is wrapped: this loop is the ONLY thing
                 # driving bay_state_engine, so an unhandled exception here
@@ -388,6 +397,32 @@ class BayMonitor:
         state.presence_thumb = thumb
         return changed
 
+    def _detect_change(self, bay: str, roi, state: BayState) -> bool:
+        """While already zoomed in: is the ROI meaningfully different
+        from the last frame this bay was looked at -- e.g. a truck going
+        from idle to actively being unloaded. This runs alongside
+        classify_interval_sec's periodic reclassify, not instead of it:
+        a change big enough to matter gets picked up immediately rather
+        than waiting out the rest of the interval, while a change too
+        subtle to move enough pixels still gets caught on the next
+        scheduled tick. Uses a separate threshold from the baseline
+        presence check (classify_diff_threshold, not
+        presence_diff_threshold) since "is anything here at all" and
+        "did an established truck's activity change" are different
+        questions that don't need to share a sensitivity."""
+        if not self.cfg["classify_diff_enabled"]:
+            return False
+
+        thumb = thumbnail(roi, self.presence_diff_resize)
+        if state.classify_thumb is None:
+            state.classify_thumb = thumb
+            return False
+
+        changed = not duplicate_thumbs(thumb, state.classify_thumb,
+                                        self.cfg["classify_diff_threshold"])
+        state.classify_thumb = thumb
+        return changed
+
     def _scan_bay(self, bay: str, cam: dict, state: BayState):
         """One bay's turn: fetch a frame, then either check for presence
         (baseline) or classify activity (zoomed in)."""
@@ -401,15 +436,26 @@ class BayMonitor:
                 return
             state.zoomed_in = True
             state.consecutive_empty = 0
-            # The cached thumbnail describes the pre-arrival scene and is
-            # meaningless once this bay reverts to baseline again
+            # The cached thumbnails describe the pre-arrival scene and
+            # are meaningless once this bay reverts to baseline again
             # (whether "unchanged" then means "still that truck" or
             # "back to empty" is exactly what a stale cache can't tell) --
-            # clear it so the first baseline check after this visit
+            # clear them so the first baseline check after this visit
             # establishes a fresh empty baseline rather than diffing
             # against a frame from before the truck showed up.
             state.presence_thumb = None
+            state.classify_thumb = None
             self.log.info(f"({bay}) presence detected, zooming in")
+            # Falls through and classifies immediately below -- no need
+            # to wait for classify_interval_sec on the very first look.
+        else:
+            due = (time.time() - state.last_classify_time
+                   >= self.cfg["classify_interval_sec"])
+            changed = roi is not None and self._detect_change(bay, roi, state)
+            if not (due or changed):
+                return
+            if changed and not due:
+                self.log.info(f"({bay}) scene changed, reclassifying early")
 
         # Which pixels the vision model judges. "full_frame" (default)
         # shows it the whole bay -- cargo, forklifts, doors -- which is
@@ -438,9 +484,10 @@ class BayMonitor:
             if state.consecutive_empty >= self.cfg["empty_debounce_count"]:
                 state.zoomed_in = False
                 # Same reasoning as the arrival-side reset in _scan_bay:
-                # whatever the presence cache held describes the scene
-                # while a truck was there, not the just-emptied bay.
+                # whatever the presence/classify caches held describe the
+                # scene while a truck was there, not the just-emptied bay.
                 state.presence_thumb = None
+                state.classify_thumb = None
                 departed = True
                 self.log.info(f"({bay}) {state.consecutive_empty} consecutive "
                               f"'{self.empty_status}' reads, reverting to "

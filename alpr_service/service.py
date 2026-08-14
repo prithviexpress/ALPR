@@ -240,7 +240,7 @@ def main():
     log.info(f"workers={num_workers} queue_max={queue_max} "
               f"cooldown={alpr['cooldown_sec']}s "
               f"collect_timeout={alpr['collection_timeout']}s")
-    log.info(f"samples: raw<={alpr['max_raw_samples']} best={alpr['best_samples']} "
+    log.info(f"ocr: max_attempts={alpr['max_ocr_attempts']} "
               f"min_plate={alpr['min_plate_width']}x{alpr['min_plate_height']} "
               f"center_limit={alpr['center_distance_limit']}")
     log.info(f"diagnostics_mode={alpr['diagnostics_mode']} "

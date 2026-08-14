@@ -238,6 +238,42 @@
 #       skip", "presence_conf_threshold", "presence_imgsz") is gone too
 #       -- every baseline round now runs the (~100us) diff directly, with
 #       nothing to skip.
+#   20. Two deliberate redesigns of how a plate gets read and how bay
+#       activity gets reclassified, replacing collect-a-batch-then-vote
+#       designs with immediate, event-driven ones:
+#       (a) ALPR (worker.py): OCR is no longer deferred until the whole
+#           collection window ends. The first detected plate box in ANY
+#           frame is now the trigger to start OCRing immediately --
+#           best-scoring candidate first within a frame, continuing
+#           across subsequent frames -- and the ENTIRE collection stops
+#           the instant one produces a plate that passes
+#           plate_text.is_valid(), rather than waiting out
+#           collection_timeout and voting across whatever showed up.
+#           "alpr.max_ocr_attempts" caps total OCR calls per collection
+#           window (replaces "max_raw_samples"/"best_samples", which no
+#           longer mean anything now that collection and OCR are one
+#           interleaved loop). There is no fallback vote if the budget
+#           runs out with nothing valid -- plate_text.weighted_vote() is
+#           removed entirely; the result is plain NO_VALID_PLATE, and
+#           every individual attempt (valid or not) is still in the
+#           audit result.json's "reads" array for forensics. collect()
+#           is renamed collect_and_read() to match what it now does; the
+#           audit field "raw_vote" is renamed "final_plate" (same value
+#           as truck_number on SUCCESS, null otherwise -- there's no
+#           more "best guess among garbage" left to preserve there).
+#       (b) bay_monitor: while a bay is already zoomed in, reclassifying
+#           no longer waits purely on the classify_interval_sec timer.
+#           The same thumbnail-diff mechanism as the baseline presence
+#           check now also runs on every round while occupied
+#           ("bay_monitor.classify_diff_enabled"/"classify_diff_
+#           threshold", separate threshold from presence_diff_*), and a
+#           meaningful scene change (e.g. idle -> unloading) triggers an
+#           immediate reclassify rather than waiting out the rest of the
+#           interval. The timer still fires as a backstop for changes
+#           too subtle to trip the diff -- this runs ALONGSIDE it, not
+#           instead of it. A zoomed-in bay is now fetched every
+#           baseline_scan_interval_ms round (not just when the timer is
+#           due) to make this possible.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

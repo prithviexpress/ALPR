@@ -1,8 +1,6 @@
-"""Indian license-plate text normalization, validation, OCR-error
-correction, and the per-character weighted vote across multiple reads
-of the same plate. Unchanged from R2 -- just relocated."""
+"""Indian license-plate text normalization, validation, and OCR-error
+correction."""
 import re
-from collections import Counter, defaultdict
 
 PLATE_PATTERNS = [
     # State(2 letters) + RTO code(1-2 digits, some states/eras drop the
@@ -52,21 +50,3 @@ def fix_indian_plate(text):
     if is_valid(text) and not is_valid(fixed):
         return text
     return fixed
-
-
-def weighted_vote(results):
-    valid = [r for r in results if r['valid']]
-    pool = valid if valid else results
-    mode_len = Counter(len(r['plate']) for r in pool).most_common(1)[0][0]
-    pool = [r for r in pool if len(r['plate']) == mode_len]
-    votes = defaultdict(dict)
-    for r in pool:
-        for i, ch in enumerate(r['plate']):
-            votes[i][ch] = votes[i].get(ch, 0) + r['conf']
-    out = ''
-    for i in range(mode_len):
-        if i in votes:
-            out += max(votes[i], key=votes[i].get)
-    if not is_valid(out) and valid:
-        out = max(valid, key=lambda r: r['conf'])['plate']
-    return out

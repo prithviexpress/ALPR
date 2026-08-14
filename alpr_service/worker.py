@@ -22,7 +22,7 @@ from .image_ops import (prep, sharpness, thumbnail, duplicate_thumbs,
                          save_debug_image, check_frame_size)
 from .logging_setup import get_logger
 from .results import build_reply, result_topic, should_publish
-from .plate_text import is_valid, fix_indian_plate, weighted_vote
+from .plate_text import is_valid, fix_indian_plate
 from .snapshot import build_snapshot_url, build_auth, fetch_snapshot, SnapshotError
 
 # Collection-stage error reasons mapped to a result-level status, so a
@@ -109,8 +109,7 @@ class Worker(threading.Thread):
         # False here, and only the config.py one was ever reachable.
         alpr = config["alpr"]
         self.collection_timeout = alpr["collection_timeout"]
-        self.max_raw_samples = alpr["max_raw_samples"]
-        self.best_samples = alpr["best_samples"]
+        self.max_ocr_attempts = alpr["max_ocr_attempts"]
         self.min_plate_width = alpr["min_plate_width"]
         self.min_plate_height = alpr["min_plate_height"]
         self.center_distance_limit = alpr["center_distance_limit"]
@@ -325,12 +324,13 @@ class Worker(threading.Thread):
         debug_dir.mkdir(exist_ok=True)
         self.log.info(f"({bay}/{direction}) started, audit -> {folder}")
 
-        samples, cstats = self.collect(cam, debug_dir)
+        reads, final, samples, cstats = self.collect_and_read(cam, debug_dir)
+        for i, s in enumerate(samples, 1):
+            cv2.imwrite(str(folder / f"crop_{i:02d}.jpg"), s['crop'])
         self.log.info(
             f"({bay}/{direction}) frames={cstats['frames_read']} "
             f"boxes_detected={cstats['total_boxes_detected']} "
-            f"raw_cands={cstats['raw_candidates']} "
-            f"kept={len(samples)} "
+            f"ocr_attempts={cstats['ocr_attempts']} "
             f"rejected={cstats['rejected']} "
             f"in {cstats['collect_sec']}s "
             f"(first fetch {cstats['first_fetch_ms']}ms, "
@@ -346,19 +346,6 @@ class Worker(threading.Thread):
                 f"set alpr.diagnostics_mode='troubleshooting' for a full "
                 f"per-frame dump)")
 
-        reads = []
-        for i, s in enumerate(samples, 1):
-            cv2.imwrite(str(folder / f"crop_{i:02d}.jpg"), s['crop'])
-            prep_path = debug_dir / f"prep_{i:02d}.jpg"
-            plate, conf, valid, raw = self.ocr_image(s['crop'], prep_path)
-            self.log.debug(
-                f"({bay}/{direction}) sample {i}: raw='{raw}' fixed='{plate}' "
-                f"conf={conf:.2f} valid={valid} score={s['score']:.2f}")
-            if plate:
-                reads.append({'plate': plate, 'conf': round(conf, 3),
-                              'valid': valid, 'raw': raw, 'sample': i})
-
-        final = weighted_vote(reads) if reads else None
         confidence = 0.0
         supporting_reads = 0
         if final:
@@ -372,13 +359,15 @@ class Worker(threading.Thread):
 
         status = ERROR_STATUS.get(cstats.get('error'))
         if status is None:
-            # weighted_vote() falls back to voting among invalid reads
-            # when nothing valid exists (a best-effort guess, e.g. OCR
-            # fragments like "4551" or "SEDRAD" that never matched a
-            # plate pattern) -- that vote must not count as SUCCESS just
-            # because it's non-empty, or garbage gets published as a
-            # "read" plate.
-            status = 'SUCCESS' if final and is_valid(final) else 'NO_VALID_PLATE'
+            # collect_and_read() only ever sets `final` to a read that
+            # already passed is_valid() -- it stops the instant one does,
+            # and reports nothing (None) if the try budget runs out
+            # first. No fallback "best guess" among invalid reads: a
+            # single frame's OCR either matches the Indian-plate format
+            # or it doesn't, and picking the least-wrong garbage read
+            # once the budget is spent would risk publishing a fabricated
+            # plate as if it were a real one.
+            status = 'SUCCESS' if final else 'NO_VALID_PLATE'
 
         # Every result carries a truck_number string, never null: on
         # anything short of a valid read it's alpr.unknown_plate_value
@@ -386,24 +375,26 @@ class Worker(threading.Thread):
         # the field without null-handling. "status" is what distinguishes
         # a genuine read from the placeholder -- and since the placeholder
         # can never satisfy is_valid(), it can't be mistaken for one.
-        # 'raw_vote' below keeps whatever weighted_vote() actually
-        # produced (possibly null, possibly OCR garbage) so the audit
-        # trail doesn't lose that detail behind the placeholder.
         truck_number = final if status == 'SUCCESS' else self.unknown_plate_value
 
         if status == 'SUCCESS' and self.save_detected_plate_frames:
             self._save_detected_plate(bay, direction, ts, final, reads, samples)
 
-        # Full detail for the audit trail on disk.
+        # Full detail for the audit trail on disk. 'final_plate' is the
+        # same value as truck_number on SUCCESS, and None otherwise --
+        # unlike the old weighted-vote design there's no "best guess
+        # among invalid reads" left to preserve here; the full attempt
+        # history (raw OCR text per try, valid or not) is still in
+        # 'reads' below for forensics.
         result = {
             'bay': bay,
             'direction': direction,
             'truck_number': truck_number,
-            'raw_vote': final,
+            'final_plate': final,
             'confidence': confidence,
             'supporting_reads': supporting_reads,
             'total_reads': len(reads),
-            'valid': bool(final and is_valid(final)),
+            'valid': final is not None,
             'event_time': event_time,
             'ocr_time': datetime.now(timezone.utc).isoformat(),
             'processing_time_sec': elapsed,
@@ -441,9 +432,30 @@ class Worker(threading.Thread):
         # a read attempt completed and how it went either way.
         self._notify_result(reply)
 
-    def collect(self, cam: dict, debug_dir=None):
+    def collect_and_read(self, cam: dict, debug_dir=None):
+        """Fetch frames and run YOLO on every one -- but unlike the old
+        collect-a-batch-then-vote design, OCR is no longer deferred to
+        the end. The first detected plate box is the trigger to start
+        OCRing immediately, best-scoring candidate first within each
+        frame, continuing across subsequent frames until either one
+        produces a plate that passes plate_text.is_valid() -- stopping
+        the ENTIRE collection right there, no need to wait out the rest
+        of collection_timeout -- or alpr.max_ocr_attempts runs out.
+
+        No fallback vote across whatever was tried if nothing validates:
+        a single read either matches the Indian-plate format or it
+        doesn't, and there's no "best guess among garbage" worth
+        publishing once the try budget is spent. Every individual
+        attempt (valid or not) is still returned in `reads` for the
+        audit trail.
+
+        Returns (reads, final, samples, stats): `final` is the winning
+        plate or None, `samples` is every crop actually OCR'd (in
+        attempt order, 1-based via list position) for handle() to write
+        to the audit folder and for _save_detected_plate() to pull the
+        winning crop from."""
         stats = {'first_fetch_ms': 0, 'avg_fetch_ms': 0.0, 'total_bytes': 0,
-                  'frames_read': 0, 'raw_candidates': 0, 'total_boxes_detected': 0,
+                  'frames_read': 0, 'ocr_attempts': 0, 'total_boxes_detected': 0,
                   'rejected': {}, 'collect_sec': 0.0}
 
         try:
@@ -451,21 +463,25 @@ class Worker(threading.Thread):
         except SnapshotError as e:
             self.log.error(f"({cam.get('ip', '?')}) snapshot config error: {e}")
             stats['error'] = 'snapshot_config_error'
-            return [], stats
+            return [], None, [], stats
 
         self.log.debug(f"polling {url} "
                         f"(connect_timeout={self.connect_timeout_ms}ms, "
                         f"read_timeout={self.read_timeout_ms}ms, "
                         f"diagnostics_mode={'troubleshooting' if self.troubleshooting else 'basic'})")
 
-        cands = []
+        samples = []       # every crop actually OCR'd, in attempt order
+        tried_thumbs = []  # dedupe against every crop already OCR'd
+        reads = []
+        final = None
         candidate_no = 0
         rejected = Counter()
         start = time.time()
         consecutive_failures = 0
         fetch_ms_total = 0
 
-        while time.time() - start < self.collection_timeout:
+        while (time.time() - start < self.collection_timeout
+               and stats['ocr_attempts'] < self.max_ocr_attempts):
             try:
                 frame, fetch_ms, size_bytes = fetch_snapshot(
                     self.session, url, self.auth,
@@ -530,6 +546,7 @@ class Worker(threading.Thread):
 
             results = self.model(roi, conf=self.yolo_conf_threshold, verbose=False)
             boxes_this_frame = 0
+            frame_cands = []
             for r in results:
                 for b in r.boxes:
                     boxes_this_frame += 1
@@ -567,14 +584,14 @@ class Worker(threading.Thread):
                     px2 = min(roi.shape[1], bx2 + pad_x)
                     py2 = min(roi.shape[0], by2 + pad_y)
                     crop = roi[py1:py2, px1:px2]
-                    # Thumbnail this crop once, then compare against each
-                    # kept candidate's already-cached thumbnail -- the
-                    # stored side used to be re-resized on every single
-                    # comparison.
+                    # Thumbnail this crop once, then compare against every
+                    # already-attempted candidate's cached thumbnail --
+                    # re-OCRing pixels that already failed (or would
+                    # produce the exact same read again) wastes a try.
                     crop_thumb = thumbnail(crop, self.duplicate_resize)
-                    if any(duplicate_thumbs(crop_thumb, c['thumb'],
+                    if any(duplicate_thumbs(crop_thumb, t,
                                              self.duplicate_diff_threshold)
-                           for c in cands):
+                           for t in tried_thumbs):
                         rejected['duplicate'] += 1
                         if annotated is not None and self.troubleshooting:
                             cv2.rectangle(annotated, (bx1, by1), (bx2, by2),
@@ -590,16 +607,12 @@ class Worker(threading.Thread):
                     sc = (float(b.conf[0]) * w_cfg["yolo_conf"] +
                           area * w_cfg["area"] + shp * w_cfg["sharpness"] +
                           (1 - dist / center) * w_cfg["center"])
-                    cands.append({'crop': crop, 'thumb': crop_thumb, 'score': sc})
                     candidate_no += 1
                     self.log.debug(
                         f"candidate kept: frame={frame_no} "
                         f"box=({bx1},{by1},{bx2},{by2}) "
                         f"score={sc:.2f} yolo_conf={float(b.conf[0]):.2f}")
                     if debug_dir and self.troubleshooting:
-                        # "after crop" -- every raw candidate crop, saved
-                        # the moment it's found, not just the final
-                        # best_samples subset written later in handle().
                         save_debug_image(
                             debug_dir,
                             f"candidate_{candidate_no:02d}_score{sc:.2f}.jpg",
@@ -610,34 +623,55 @@ class Worker(threading.Thread):
                         cv2.putText(annotated, f"{sc:.2f}", (bx1, by1 - 6),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                                     (0, 255, 0), 2)
-                    if len(cands) >= self.max_raw_samples:
-                        break
-                if len(cands) >= self.max_raw_samples:
-                    break
+                    frame_cands.append({'crop': crop, 'thumb': crop_thumb, 'score': sc})
 
             stats['total_boxes_detected'] += boxes_this_frame
             self.log.debug(f"({cam.get('ip', '?')}) frame {frame_no}: "
                             f"{boxes_this_frame} boxes from model, "
-                            f"{len(cands)} kept so far")
+                            f"{len(frame_cands)} kept")
 
             if annotated is not None and debug_dir:
                 name = ("01_roi_first.jpg" if frame_no == 1
                         else f"frame_{frame_no:02d}_roi.jpg")
                 save_debug_image(debug_dir, name, annotated, self.log)
 
-            if len(cands) >= self.max_raw_samples:
+            # This is the actual "plate detected -> start reading"
+            # trigger: OCR this frame's kept candidates right now,
+            # best-scoring first, instead of only scoring them for a
+            # batch vote later. Stops the whole collection the instant
+            # one produces a valid plate.
+            frame_cands.sort(key=lambda c: c['score'], reverse=True)
+            for c in frame_cands:
+                if stats['ocr_attempts'] >= self.max_ocr_attempts:
+                    break
+                tried_thumbs.append(c['thumb'])
+                stats['ocr_attempts'] += 1
+                i = len(samples) + 1
+                samples.append(c)
+                prep_path = debug_dir / f"prep_{i:02d}.jpg" if debug_dir else None
+                plate, conf, valid, raw = self.ocr_image(c['crop'], prep_path)
+                self.log.debug(
+                    f"({cam.get('ip', '?')}) attempt {i}: raw='{raw}' "
+                    f"fixed='{plate}' conf={conf:.2f} valid={valid} "
+                    f"score={c['score']:.2f}")
+                if plate:
+                    reads.append({'plate': plate, 'conf': round(conf, 3),
+                                  'valid': valid, 'raw': raw, 'sample': i})
+                if valid:
+                    final = plate
+                    break
+
+            if final:
                 break
 
             if self.poll_interval_ms:
                 time.sleep(self.poll_interval_ms / 1000)
 
-        stats['raw_candidates'] = len(cands)
         stats['rejected'] = dict(rejected)
         stats['collect_sec'] = round(time.time() - start, 1)
         if stats['frames_read']:
             stats['avg_fetch_ms'] = round(fetch_ms_total / stats['frames_read'], 1)
-        cands.sort(key=lambda x: x['score'], reverse=True)
-        return cands[:self.best_samples], stats
+        return reads, final, samples, stats
 
     def ocr_image(self, img, debug_path=None):
         pimg = prep(img, self.ocr_prep_target_height, self.ocr_prep_padding)

@@ -224,7 +224,8 @@ class BayMonitor:
     thread's lifetime, and only (bay, cam, state) vary per turn.
     """
 
-    def __init__(self, cameras: dict, config: dict, publish_fn, on_status=None):
+    def __init__(self, cameras: dict, config: dict, publish_fn, on_status=None,
+                 audit_dir: Path = None):
         self.log = get_logger("BAY_MONITOR")
         self.cameras = cameras
         self.config = config
@@ -238,6 +239,12 @@ class BayMonitor:
         self.scan_interval_sec = self.cfg["baseline_scan_interval_ms"] / 1000
         self.presence_diff_resize = (self.cfg["presence_diff_resize_width"],
                                       self.cfg["presence_diff_resize_height"])
+        # Where every bay's most-recently-fetched frame is dropped (see
+        # _save_latest_frame) -- None (no audit_dir passed, or
+        # save_latest_frame turned off) just skips that write.
+        self.audit_dir = audit_dir
+        self.save_latest_frame = (audit_dir is not None
+                                   and self.cfg["save_latest_frame"])
         self.states = {}
 
         from ultralytics import YOLO
@@ -302,10 +309,28 @@ class BayMonitor:
                 self.session, url, self.auth,
                 self.snap_cfg["connect_timeout_ms"],
                 self.snap_cfg["read_timeout_ms"])
+            if self.save_latest_frame:
+                self._save_latest_frame(bay, frame)
             return frame
         except SnapshotError as e:
             self.log.debug(f"({bay}) snapshot fetch failed: {e}")
             return None
+
+    def _save_latest_frame(self, bay: str, frame):
+        """Overwrites audit/<bay>/latest_frame.jpg on every successful
+        fetch -- a live "what does this camera currently see" view for
+        remote troubleshooting, without wading through diagnostics_mode's
+        much larger per-event dumps. One file per bay, always the most
+        recent frame, never accumulates."""
+        try:
+            bay_dir = self.audit_dir / bay
+            bay_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(bay_dir / "latest_frame.jpg"), frame)
+        except Exception:
+            # Best-effort diagnostics -- must never take the scan loop
+            # down over a disk/permission problem.
+            self.log.warning(f"({bay}) failed to save latest_frame.jpg",
+                             exc_info=True)
 
     def _roi(self, bay: str, cam: dict, frame):
         """The configured ROI slice, or None if it falls outside the frame
@@ -435,7 +460,8 @@ class BayMonitor:
             self.log.error(f"({bay}) on_status hook raised", exc_info=True)
 
 
-def start_bay_monitor(cameras: dict, config: dict, publish_fn, on_status=None):
+def start_bay_monitor(cameras: dict, config: dict, publish_fn, on_status=None,
+                       audit_dir: Path = None):
     """Starts the round-robin scanner in a background thread. Returns
     (thread, stop_event) -- set stop_event to ask the loop to exit at its
     next check point (it won't interrupt a request already in flight).
@@ -444,8 +470,11 @@ def start_bay_monitor(cameras: dict, config: dict, publish_fn, on_status=None):
     (bay, status, timestamp, occupied, departed) after every successful
     classification -- see bay_state.py's BayStateEngine, the main
     consumer, for what those last two mean and why they're computed here.
+
+    audit_dir, if given, enables bay_monitor.save_latest_frame -- see
+    BayMonitor._save_latest_frame.
     """
-    monitor = BayMonitor(cameras, config, publish_fn, on_status)
+    monitor = BayMonitor(cameras, config, publish_fn, on_status, audit_dir)
     stop_event = threading.Event()
     t = threading.Thread(target=monitor.run, args=(stop_event,),
                           daemon=True, name="bay-monitor")

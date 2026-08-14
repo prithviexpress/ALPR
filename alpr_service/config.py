@@ -154,6 +154,13 @@ def load_config(path: Path = None) -> dict:
     # something no real plate could ever be (it must not satisfy
     # plate_text.is_valid(), or it could be mistaken for a real read).
     alpr.setdefault("unknown_plate_value", "UNKNOWN")
+    # On every SUCCESS result, copies the crop that actually produced the
+    # winning plate into a separate, flat audit/detected_plates/ folder
+    # (named "<timestamp>_<bay>_<direction>_<plate>.jpg") -- so confirmed
+    # reads can be browsed chronologically at a glance, without hunting
+    # through each job's own per-event audit subfolder. The full per-job
+    # detail (result.json, every candidate crop) is unaffected either way.
+    alpr.setdefault("save_detected_plate_frames", True)
     # Ceiling on how many ALPR reads bay_state_engine will queue for one
     # visit while the plate is still unconfirmed. Without a cap, a truck
     # parked for hours with an unreadable plate re-runs a full 8s
@@ -327,6 +334,14 @@ def load_config(path: Path = None) -> dict:
     # prompt undersells -- e.g. an open bay/cargo door that can otherwise
     # get misread as empty or confuse the model.
     bay_monitor.setdefault("reference_images", [])
+    # Overwrites audit/<bay>/latest_frame.jpg on every successful
+    # snapshot fetch -- a live "what does this camera see right now"
+    # view for remote troubleshooting (e.g. confirming camera framing/
+    # focus/ROI without SSH/RDP access to actually look at the feed),
+    # without the volume of diagnostics_mode='troubleshooting''s
+    # per-event dumps. One file per bay, always the latest, never
+    # accumulates.
+    bay_monitor.setdefault("save_latest_frame", True)
     # Longest side (pixels) an image is downscaled to before being JPEG
     # encoded and sent to the vision model, and the JPEG quality used.
     # A raw 5MP snapshot is ~6x the pixels of a 1024-wide view, and a

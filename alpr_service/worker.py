@@ -123,6 +123,7 @@ class Worker(threading.Thread):
         self.frame_size_tolerance_pct = alpr["frame_size_tolerance_pct"]
         self.min_ocr_conf = alpr["min_ocr_conf"]
         self.unknown_plate_value = alpr["unknown_plate_value"]
+        self.save_detected_plate_frames = alpr["save_detected_plate_frames"]
         self.yolo_conf_threshold = alpr["yolo_conf_threshold"]
         self.max_consecutive_fetch_failures = alpr["max_consecutive_fetch_failures"]
         self.fetch_failure_backoff_sec = alpr["fetch_failure_backoff_sec"]
@@ -275,6 +276,27 @@ class Worker(threading.Thread):
         except Exception:
             self.log.error(f"on_result hook raised:\n{traceback.format_exc()}")
 
+    def _save_detected_plate(self, bay, direction, ts, plate, reads, samples):
+        """Copies the crop that actually produced the winning plate into
+        a separate, flat audit/detected_plates/ folder -- so confirmed
+        reads can be browsed at a glance, chronologically, without
+        hunting through each job's own per-event audit subfolder. Only
+        called on a SUCCESS result (see handle()); best-effort, never
+        lets a save failure affect the job itself."""
+        matches = [r for r in reads if r['plate'] == plate]
+        if not matches:
+            return
+        best = max(matches, key=lambda r: r['conf'])
+        crop = samples[best['sample'] - 1]['crop']
+        try:
+            out_dir = self.audit_dir / "detected_plates"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe_plate = plate.replace('/', '_')
+            cv2.imwrite(str(out_dir / f"{ts}_{bay}_{direction}_{safe_plate}.jpg"), crop)
+        except Exception:
+            self.log.warning(f"({bay}/{direction}) failed to save "
+                             f"detected-plate frame", exc_info=True)
+
     # --------- per-job pipeline ---------
     def handle(self, job):
         bay = job['bay']
@@ -362,6 +384,9 @@ class Worker(threading.Thread):
         # produced (possibly null, possibly OCR garbage) so the audit
         # trail doesn't lose that detail behind the placeholder.
         truck_number = final if status == 'SUCCESS' else self.unknown_plate_value
+
+        if status == 'SUCCESS' and self.save_detected_plate_frames:
+            self._save_detected_plate(bay, direction, ts, final, reads, samples)
 
         # Full detail for the audit trail on disk.
         result = {

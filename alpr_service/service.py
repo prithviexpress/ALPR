@@ -312,7 +312,8 @@ def main():
         from .bay_monitor import start_bay_monitor
         _, bay_monitor_stop = start_bay_monitor(
             cameras, config, publish,
-            on_status=state_engine.on_status if state_engine else None)
+            on_status=state_engine.on_status if state_engine else None,
+            audit_dir=AUDIT_DIR)
         stoppables.append(bay_monitor_stop)
 
     # Shared by every worker so their first-run model loading (in

@@ -184,6 +184,20 @@
 #           instead of processing them, so a downstream consumer gets a
 #           signal on the result topic instead of the log file being the
 #           only place the failure is visible.
+#   16. Two remote-troubleshooting aids, both on by default:
+#       (a) "bay_monitor.save_latest_frame" overwrites
+#           audit/<bay>/latest_frame.jpg on every successful snapshot
+#           fetch -- a live "what does this camera see right now" view
+#           for confirming framing/focus/ROI without direct access to the
+#           feed, one file per bay, always the most recent, never
+#           accumulating.
+#       (b) "alpr.save_detected_plate_frames" copies the crop that
+#           actually produced a SUCCESS result's winning plate into a
+#           separate, flat audit/detected_plates/ folder (named
+#           "<timestamp>_<bay>_<direction>_<plate>.jpg") -- so confirmed
+#           reads can be browsed chronologically across every bay at a
+#           glance, without hunting through each job's own per-event
+#           audit subfolder (which still gets the full detail either way).
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

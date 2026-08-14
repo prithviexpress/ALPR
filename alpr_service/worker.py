@@ -149,6 +149,12 @@ class Worker(threading.Thread):
         # the first snapshot fetch to a given camera pays for a fresh
         # handshake -- not every single one.
         self.session = requests.Session()
+        # Cameras are on the local/internal network; don't let a
+        # corporate proxy configured via HTTP_PROXY/HTTPS_PROXY env vars
+        # or Windows system settings intercept (or block) these requests
+        # -- see the matching fix in bay_monitor.py for the confirmed
+        # symptom (curl direct works, requests via the proxy doesn't).
+        self.session.trust_env = False
         self.auth = build_auth(self.config)
 
         while True:

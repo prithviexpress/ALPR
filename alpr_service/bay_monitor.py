@@ -125,7 +125,8 @@ def load_reference_images(bm_cfg: dict, config_dir: Path, log) -> list:
     return refs
 
 
-def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = None):
+def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = None,
+                    session: requests.Session = None):
     """POSTs one JPEG-encoded frame -- plus, if configured, a set of
     labeled exemplar images sent alongside it as few-shot context -- to a
     local Ollama vision model, and returns whichever of
@@ -170,8 +171,9 @@ def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = 
         "images": images,
         "stream": False,
     }
+    requester = session if session is not None else requests
     try:
-        resp = requests.post(url, json=payload, timeout=bm_cfg["ollama_timeout_sec"])
+        resp = requester.post(url, json=payload, timeout=bm_cfg["ollama_timeout_sec"])
         resp.raise_for_status()
         text = resp.json().get("response", "").strip().lower()
     except (requests.RequestException, ValueError) as e:
@@ -253,6 +255,14 @@ class BayMonitor:
         self.model = YOLO(str(model_path))
         self.references = load_reference_images(self.cfg, config_dir, self.log)
         self.session = requests.Session()
+        # Cameras and the Ollama host are always on the local/internal
+        # network. `requests` honors HTTP_PROXY/HTTPS_PROXY env vars and
+        # Windows system proxy settings by default (trust_env=True), which
+        # on corporate machines can route -- or block -- these internal
+        # requests through a proxy that has no route to them, while a
+        # plain `curl` in the same shell session bypasses it. Disable
+        # proxy use entirely so these calls always go direct.
+        self.session.trust_env = False
         self.auth = build_auth(config)
         self.log.info(
             f"bay monitor started: model={model_path} "
@@ -412,7 +422,7 @@ class BayMonitor:
         # "roi" removes that cross-talk at the cost of a narrower view.
         classify_img = roi if (self.classify_region == "roi" and roi is not None) else frame
         status = classify_frame(classify_img, self.cfg, self.log, bay,
-                                 self.references)
+                                 self.references, session=self.session)
         state.last_classify_time = time.time()
         if status is None:
             return

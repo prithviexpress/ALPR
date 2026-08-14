@@ -198,6 +198,21 @@
 #           reads can be browsed chronologically across every bay at a
 #           glance, without hunting through each job's own per-event
 #           audit subfolder (which still gets the full detail either way).
+#   17. Fixed a real field failure where bay_monitor's Ollama calls
+#       ("...actively refused it" / "connect timeout=30") failed while a
+#       plain `curl` to the exact same host:port succeeded from the same
+#       machine -- the signature of a corporate proxy that Python's
+#       `requests` honors by default (via HTTP_PROXY/HTTPS_PROXY env vars
+#       or Windows system proxy settings, trust_env=True) intercepting or
+#       blocking traffic to an internal-only address that curl's shell
+#       session was not routing through it. Cameras and the local Ollama
+#       host are always on the internal network and should never go
+#       through an outbound proxy, so both `BayMonitor.session` and
+#       `Worker.session` now set `trust_env = False` right after
+#       creation, and classify_frame() takes the caller's session instead
+#       of using the bare `requests.post` module function (which had no
+#       session to disable proxying on). No new config -- this is an
+#       unconditional code-level fix.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

@@ -159,6 +159,31 @@
 #       shifting light) a single-frame diff would never trip. The cache
 #       is cleared on both the arrival and departure transitions so it
 #       never compares across a visit boundary.
+#   15. Two fixes for a real field failure: a corporate proxy blocking
+#       PaddleOCR's cls-model download took out all three worker
+#       threads, one after another through the shared model_load_lock,
+#       with nothing published anywhere and jobs left to queue forever
+#       -- the process itself stayed up (MQTT connected, HTTP trigger
+#       listening) while silently doing no work at all.
+#       (a) Confirmed from paddleocr==2.7.3's own source: the classifier
+#           object that actually READS the cls model files is only ever
+#           instantiated when use_angle_cls=true, which this service
+#           never passes -- so cls's file CONTENT was never the issue,
+#           only PaddleOCR's unconditional existence check before it
+#           even looks at use_angle_cls. worker.py's
+#           ensure_cls_placeholder() now creates two empty placeholder
+#           files there itself if nothing's present, so the download is
+#           never attempted at all and no machine needs a real cls
+#           model (a real one, if already present, is left untouched).
+#       (b) Model loading (Worker._load_models_with_retry) now retries
+#           on any failure ("alpr.model_load_max_retries", default 3,
+#           "alpr.model_load_retry_backoff_sec" apart, default 5s), and
+#           if every attempt still fails, that worker thread stays alive
+#           rather than dying silently -- it publishes a
+#           MODEL_LOAD_FAILED error result for every job it's handed
+#           instead of processing them, so a downstream consumer gets a
+#           signal on the result topic instead of the log file being the
+#           only place the failure is visible.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

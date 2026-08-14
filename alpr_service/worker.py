@@ -36,6 +36,36 @@ ERROR_STATUS = {
 }
 
 
+def ensure_cls_placeholder(cls_dir: Path, log):
+    """PaddleOCR's constructor unconditionally checks cls_model_dir for
+    inference.pdiparams/inference.pdmodel and downloads the real cls
+    (angle classifier) model .tar over the network if either is missing
+    -- regardless of use_angle_cls (confirmed from paddleocr==2.7.3's own
+    source: that check runs before use_angle_cls is even consulted). But
+    the classifier object itself -- the only thing that ever actually
+    reads those files as model data -- is instantiated in
+    tools/infer/predict_system.py's TextSystem.__init__ ONLY when
+    self.use_angle_cls is True. We always pass use_angle_cls=False (see
+    Worker.run), so with that confirmed, these two files are never read
+    as real model weights: only their EXISTENCE matters, to satisfy the
+    unconditional check and skip the download, not their content.
+
+    So rather than requiring every deployment to source a real cls model
+    (or fail here on any network hiccup reaching paddleocr.bj.bcebos.com
+    -- confirmed in the field behind a corporate proxy that blocks the
+    download's HTTPS CONNECT tunnel, taking every worker thread down with
+    it), create empty placeholders here if they don't already exist. A
+    real cls model already present is left untouched -- this only fills
+    the gap when there's nothing there at all."""
+    for name in ("inference.pdiparams", "inference.pdmodel"):
+        f = cls_dir / name
+        if not f.exists():
+            f.write_bytes(b"")
+            log.info(f"created empty cls placeholder: {f} (cls is never "
+                      f"used since use_angle_cls=False -- see "
+                      f"ensure_cls_placeholder's docstring)")
+
+
 class Worker(threading.Thread):
     def __init__(self, wid, jobs, cameras: dict, config: dict, publish_fn,
                  job_bus, audit_dir: Path, model_load_lock: threading.Lock = None,
@@ -111,6 +141,53 @@ class Worker(threading.Thread):
         self.poll_interval_ms = snap_cfg["poll_interval_ms"]
 
     def run(self):
+        self._load_models_with_retry()
+        # One Session/HTTPDigestAuth per worker thread, reused across every
+        # job it handles: a Session keeps the TCP connection (and, for
+        # HTTPDigestAuth, the last nonce) alive across requests, so only
+        # the first snapshot fetch to a given camera pays for a fresh
+        # handshake -- not every single one.
+        self.session = requests.Session()
+        self.auth = build_auth(self.config)
+
+        while True:
+            job = self.jobs.get()
+            bay = job['bay']
+            direction = job.get('direction', '')
+            try:
+                if self.model is None or self.ocr is None:
+                    # Every load attempt in _load_models_with_retry()
+                    # failed. Rather than the thread having died silently
+                    # (the previous behavior -- an uncaught exception in
+                    # a Thread.run() just prints a traceback and vanishes,
+                    # with no signal anywhere else that jobs will now
+                    # queue forever), this worker stays alive and gives
+                    # every job it's handed a real answer.
+                    self._publish_error(job, "MODEL_LOAD_FAILED",
+                                        self.model_load_error)
+                else:
+                    self.handle(job)
+            except Exception:
+                tb = traceback.format_exc()
+                self.log.error(f"({bay}/{direction}) job failed unexpectedly:\n{tb}")
+                self._publish_error(job, "WORKER_EXCEPTION", tb)
+            finally:
+                self.job_bus.release(bay, direction)
+                self.jobs.task_done()
+
+    def _load_models_with_retry(self):
+        """Loads YOLO + PaddleOCR, retrying alpr.model_load_max_retries
+        times (alpr.model_load_retry_backoff_sec apart) on any failure --
+        a transient network blip fetching a model file shouldn't need a
+        process restart to recover from. If every attempt fails, self.model
+        and self.ocr are left None and self.model_load_error holds the
+        last failure, so run()'s job loop can answer every job it's handed
+        with a real MODEL_LOAD_FAILED result instead of the thread having
+        silently died with an uncaught exception (the previous behavior --
+        confirmed in the field: a proxy blocking PaddleOCR's cls-model
+        download took out all three worker threads at once, one after
+        another through the shared model_load_lock, with nothing published
+        anywhere and jobs left to queue forever)."""
         self.log.info("loading models...")
         t = time.time()
         # Resolved against the directory config.json actually loaded
@@ -124,45 +201,52 @@ class Worker(threading.Thread):
         # cls (angle classifier): PaddleOCR downloads this unconditionally
         # at construction time even though use_angle_cls=False below means
         # it's never actually used for inference -- pointed at a local
-        # folder same as det/rec so it doesn't fall back to ~/.paddleocr.
+        # folder same as det/rec so it doesn't fall back to ~/.paddleocr,
+        # and backed by a harmless placeholder (see ensure_cls_placeholder)
+        # so a machine with no route to paddleocr.bj.bcebos.com never
+        # needs a real cls model at all.
         cls_dir = config_dir / self.config["alpr"]["paddleocr_cls_model_dir"]
         self.log.info(f"model_path={model_path} "
                        f"paddleocr det={det_dir} rec={rec_dir} cls={cls_dir}")
 
-        # Serialized across all workers -- see model_load_lock's comment
-        # in __init__. Only matters for the one-time download; once the
-        # files exist this lock is held only as long as it takes each
-        # worker to load from disk.
-        with self.model_load_lock:
-            self.model = YOLO(str(model_path))
-            det_dir.mkdir(parents=True, exist_ok=True)
-            rec_dir.mkdir(parents=True, exist_ok=True)
-            cls_dir.mkdir(parents=True, exist_ok=True)
-            self.ocr = PaddleOCR(lang='en', use_angle_cls=False, show_log=False,
-                                  det_model_dir=str(det_dir), rec_model_dir=str(rec_dir),
-                                  cls_model_dir=str(cls_dir))
-        # One Session/HTTPDigestAuth per worker thread, reused across every
-        # job it handles: a Session keeps the TCP connection (and, for
-        # HTTPDigestAuth, the last nonce) alive across requests, so only
-        # the first snapshot fetch to a given camera pays for a fresh
-        # handshake -- not every single one.
-        self.session = requests.Session()
-        self.auth = build_auth(self.config)
-        self.log.info(f"ready ({round(time.time() - t, 1)}s)")
-
-        while True:
-            job = self.jobs.get()
-            bay = job['bay']
-            direction = job.get('direction', '')
+        max_retries = self.config["alpr"]["model_load_max_retries"]
+        backoff_sec = self.config["alpr"]["model_load_retry_backoff_sec"]
+        self.model_load_error = None
+        for attempt in range(1, max_retries + 1):
             try:
-                self.handle(job)
-            except Exception:
-                tb = traceback.format_exc()
-                self.log.error(f"({bay}/{direction}) job failed unexpectedly:\n{tb}")
-                self._publish_error(job, "WORKER_EXCEPTION", tb)
-            finally:
-                self.job_bus.release(bay, direction)
-                self.jobs.task_done()
+                # Serialized across all workers -- see model_load_lock's
+                # comment in __init__. Only matters for the one-time
+                # download; once the files exist this lock is held only
+                # as long as it takes each worker to load from disk.
+                with self.model_load_lock:
+                    model = YOLO(str(model_path))
+                    det_dir.mkdir(parents=True, exist_ok=True)
+                    rec_dir.mkdir(parents=True, exist_ok=True)
+                    cls_dir.mkdir(parents=True, exist_ok=True)
+                    ensure_cls_placeholder(cls_dir, self.log)
+                    ocr = PaddleOCR(lang='en', use_angle_cls=False, show_log=False,
+                                     det_model_dir=str(det_dir), rec_model_dir=str(rec_dir),
+                                     cls_model_dir=str(cls_dir))
+                self.model, self.ocr = model, ocr
+                self.model_load_error = None  # a retry that eventually
+                # succeeded must not leave a stale failure message behind
+                self.log.info(f"ready ({round(time.time() - t, 1)}s, "
+                               f"attempt {attempt}/{max_retries})")
+                return
+            except Exception as e:
+                self.model_load_error = f"{type(e).__name__}: {e}"
+                self.log.error(
+                    f"model load attempt {attempt}/{max_retries} failed:\n"
+                    f"{traceback.format_exc()}")
+                if attempt < max_retries:
+                    time.sleep(backoff_sec)
+
+        self.log.error(
+            f"giving up on model loading after {max_retries} attempts -- "
+            f"this worker will stay alive and publish MODEL_LOAD_FAILED "
+            f"for every job it receives instead of processing them. Fix "
+            f"the underlying cause ({self.model_load_error}) and restart "
+            f"the service.")
 
     def _publish_error(self, job, reason, detail=""):
         """Last-resort publish so a downstream consumer waiting on this

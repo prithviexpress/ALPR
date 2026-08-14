@@ -4,3 +4,5 @@ config.json
 cameras.json
 audit/
 logs/
+best.pt
+paddleocr_models/

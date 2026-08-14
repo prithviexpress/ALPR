@@ -163,6 +163,15 @@ def load_config(path: Path = None) -> dict:
     # consulted by bay_state.py; the MQTT/HTTP trigger paths are
     # one-shot and unaffected.
     alpr.setdefault("max_read_attempts", 20)
+    # How many times a Worker retries loading YOLO+PaddleOCR at startup
+    # before giving up (backoff_sec apart) -- a transient failure (e.g. a
+    # proxy blocking a one-time model download) shouldn't need a process
+    # restart to recover from. If every attempt fails, that worker thread
+    # stays alive rather than dying silently, and publishes
+    # MODEL_LOAD_FAILED for every job it's handed instead of processing
+    # them -- see Worker._load_models_with_retry.
+    alpr.setdefault("model_load_max_retries", 3)
+    alpr.setdefault("model_load_retry_backoff_sec", 5)
     # Minimum YOLO box confidence for a plate detection to be considered
     # at all (Ultralytics' own default is 0.25 if this isn't passed
     # explicitly -- surfaced here so it's tunable without a code change).

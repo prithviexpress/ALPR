@@ -112,9 +112,6 @@ def load_config(path: Path = None) -> dict:
     # tracks truck_number) -- bay_monitor alone has no truck identity to
     # report.
     mqtt.setdefault("bay_notification_topic_prefix", "site/alpr/bay_notification")
-    # Periodic image-only heartbeat ("/<bay>" appended) -- see
-    # bay_monitor.snapshot_publish_interval_sec.
-    mqtt.setdefault("bay_snapshot_topic_prefix", "site/alpr/bay_snapshot")
 
     # An alternative trigger source to the MQTT VCA events above: some
     # cameras (e.g. a Bosch dome's built-in "HTTP notification" alarm
@@ -438,9 +435,17 @@ def load_config(path: Path = None) -> dict:
         "carried, a forklift or workers present, the truck bed's "
         "visible contents), not just a restatement of the status word>"
     ))
-    # Periodic image-only MQTT heartbeat, independent of classification --
-    # see bay_monitor.py's _publish_snapshot. 0 disables it.
-    bay_monitor.setdefault("snapshot_publish_interval_sec", 300)
+    # On-demand snapshot server (snapshot_webhook.py) -- HTTP GET
+    # http://<host>:<port>/snapshot/<bay> returns bay_monitor's most
+    # recently saved frame (audit/<bay>/latest_frame.jpg, requires
+    # save_latest_frame -- default on) plus this bay's last-known
+    # occupancy_status/activity, as JSON with a base64 image. Pull, not
+    # push: nothing is sent anywhere until requested. Off by default;
+    # requires bay_monitor.enabled.
+    bay_monitor.setdefault("snapshot_webhook_enabled", False)
+    bay_monitor.setdefault("snapshot_webhook_host", "0.0.0.0")
+    bay_monitor.setdefault("snapshot_webhook_port", 8081)
+    bay_monitor.setdefault("snapshot_webhook_threads", 4)
     # Per-bay state engine (bay_state.py) -- fuses bay_monitor's
     # continuous status stream with ALPR plate reads into one session per
     # bay, and becomes the authority for enter/leave direction and

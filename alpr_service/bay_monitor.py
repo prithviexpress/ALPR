@@ -37,6 +37,13 @@ round-robin keeps visiting all of them each pass. After
 bay_monitor.empty_debounce_count consecutive "empty" classifications the
 bay reverts to baseline diff-only scanning, since an LLM call every
 round for a bay with nothing happening is wasted latency and load.
+
+Snapshots are pull, not push: nothing is published on a timer. Every
+round writes audit/<bay>/latest_frame.jpg (bay_monitor.save_latest_frame)
+and BayMonitor.get_snapshot(bay) serves it -- plus this bay's last-known
+occupancy/activity -- on request, via snapshot_webhook.py's HTTP GET
+/snapshot/<bay> (bay_monitor.snapshot_webhook_enabled). Nothing is sent
+anywhere until asked for.
 """
 import base64
 import json
@@ -80,17 +87,12 @@ class BayState:
         # exactly one classify per bay regardless of the diff, to
         # establish real ground truth on startup.
         self.classified_once = False
-        # Last time this bay's periodic image heartbeat (bay_monitor.
-        # snapshot_publish_interval_sec) was published -- independent of
-        # classification entirely, so it keeps firing even for a bay
-        # that's sitting at baseline with nothing happening.
-        self.last_snapshot_publish_time = 0.0
         # This bay's most recent successful classification word (e.g.
-        # "loading", "empty") -- so the periodic snapshot heartbeat can
-        # report current occupancy/activity alongside the image, without
-        # forcing a fresh classify call just to answer "what do we think
-        # is happening right now". None until the first classify ever
-        # succeeds.
+        # "loading", "empty") -- so an on-demand snapshot request
+        # (BayMonitor.get_snapshot) can report current occupancy/
+        # activity alongside the image without forcing a fresh classify
+        # call just to answer "what do we think is happening right
+        # now". None until the first classify ever succeeds.
         self.last_status = None
 
 
@@ -302,8 +304,6 @@ class BayMonitor:
         self.cfg = config["bay_monitor"]
         self.snap_cfg = config["snapshot"]
         self.status_topic_prefix = config["mqtt"]["bay_status_topic_prefix"]
-        self.snapshot_topic_prefix = config["mqtt"]["bay_snapshot_topic_prefix"]
-        self.snapshot_publish_interval_sec = self.cfg["snapshot_publish_interval_sec"]
         self.empty_status = self.cfg["empty_status"]
         self.classify_region = self.cfg["classify_region"]
         self.scan_interval_sec = self.cfg["baseline_scan_interval_ms"] / 1000
@@ -478,41 +478,41 @@ class BayMonitor:
         state.classify_thumb = thumb
         return changed
 
-    def _publish_snapshot(self, bay: str, frame, state: BayState):
-        """A base64 image heartbeat on its own timer (bay_monitor.
-        snapshot_publish_interval_sec, default 300s), independent of
-        whether a classify happens to run this round -- so a downstream
-        consumer has a periodic "here is what this bay looks like, and
-        what we currently believe is happening" without needing to wait
-        for -- or trigger -- a status change. occupancy_status/activity
-        report the last classification this bay actually got (state.
-        last_status, possibly from several rounds ago if nothing's
-        changed since -- not a fresh classify call, which would defeat
-        the point of this being a CHEAP heartbeat), or None if this bay
-        has never been classified yet. 0 disables it."""
-        if not self.snapshot_publish_interval_sec:
-            return
-        if (time.time() - state.last_snapshot_publish_time
-                < self.snapshot_publish_interval_sec):
-            return
-        image_b64 = encode_image(frame, self.cfg["classify_max_dimension"],
-                                  self.cfg["classify_jpeg_quality"])
-        if image_b64 is None:
-            return
-        state.last_snapshot_publish_time = time.time()
+    def get_snapshot(self, bay: str):
+        """On-demand snapshot for snapshot_webhook.py's HTTP GET
+        /snapshot/<bay> -- pull, not push: nothing is sent anywhere
+        until this is actually called. Reads audit/<bay>/latest_frame.jpg
+        (already written every scan round by _save_latest_frame -- never
+        more than one baseline_scan_interval_ms round stale, 2s by
+        default) rather than fetching a fresh frame from this call: that
+        would mean sharing bay_monitor's own HTTPDigestAuth session
+        (stateful, not meant for concurrent cross-thread reuse) with
+        whatever thread is serving the HTTP request.
+
+        Returns None if there's nothing to serve yet -- an unrecognized
+        bay, or no frame has been saved for it so far (requires
+        save_latest_frame on, which is the default). occupancy_status/
+        activity report this bay's last-known classification (state.
+        last_status), both None until it's ever been classified."""
+        if bay not in self.cameras or self.audit_dir is None:
+            return None
+        frame_path = self.audit_dir / bay / "latest_frame.jpg"
+        if not frame_path.exists():
+            return None
+        state = self.states.get(bay)
+        last_status = state.last_status if state else None
         occupancy_status = None
-        if state.last_status is not None:
-            occupancy_status = ("empty" if state.last_status == self.empty_status
-                                 else "occupied")
-        topic = f"{self.snapshot_topic_prefix}/{bay}"
-        self.publish(topic, json.dumps({
+        if last_status is not None:
+            occupancy_status = "empty" if last_status == self.empty_status else "occupied"
+        image_b64 = base64.b64encode(frame_path.read_bytes()).decode("ascii")
+        mtime = datetime.fromtimestamp(frame_path.stat().st_mtime, tz=timezone.utc)
+        return {
             "bay": bay,
             "occupancy_status": occupancy_status,
-            "activity": state.last_status,
+            "activity": last_status,
             "image_base64": image_b64,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }))
-        self.log.debug(f"({bay}) periodic snapshot published -> {topic}")
+            "timestamp": mtime.isoformat(),
+        }
 
     def _scan_bay(self, bay: str, cam: dict, state: BayState):
         """One bay's turn: fetch a frame, then either check for presence
@@ -520,7 +520,6 @@ class BayMonitor:
         frame = self._fetch(bay, cam)
         if frame is None:
             return
-        self._publish_snapshot(bay, frame, state)
         roi = self._roi(bay, cam, frame)
 
         if not state.zoomed_in:
@@ -636,8 +635,11 @@ class BayMonitor:
 def start_bay_monitor(cameras: dict, config: dict, publish_fn, on_status=None,
                        audit_dir: Path = None):
     """Starts the round-robin scanner in a background thread. Returns
-    (thread, stop_event) -- set stop_event to ask the loop to exit at its
-    next check point (it won't interrupt a request already in flight).
+    (monitor, thread, stop_event) -- set stop_event to ask the loop to
+    exit at its next check point (it won't interrupt a request already
+    in flight); monitor is the BayMonitor instance itself, so a caller
+    can also wire up snapshot_webhook.py's on-demand snapshot server
+    against monitor.get_snapshot.
 
     on_status, if given, is called
     (bay, status, timestamp, occupied, departed) after every successful
@@ -652,4 +654,4 @@ def start_bay_monitor(cameras: dict, config: dict, publish_fn, on_status=None,
     t = threading.Thread(target=monitor.run, args=(stop_event,),
                           daemon=True, name="bay-monitor")
     t.start()
-    return t, stop_event
+    return monitor, t, stop_event

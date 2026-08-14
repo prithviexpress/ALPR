@@ -402,13 +402,49 @@
 #           mqtt.bay_notification_topic_prefix (item #24) remains the
 #           only channel gated on an actual status CHANGE, which is the
 #           one meant to be treated as a "notification" to react to.
+#   27. Reversed, on direct request ("don't publish snapshot
+#       continuously, instead publish webhook, I will request when I
+#       need"): the periodic MQTT image heartbeat introduced in item
+#       #24(c) and enriched in #26(b) -- bay_monitor.
+#       snapshot_publish_interval_sec / mqtt.bay_snapshot_topic_prefix
+#       -- is REMOVED. Nothing about a bay's image is pushed to MQTT on
+#       a timer anymore.
+#       In its place: a small on-demand HTTP server, snapshot_webhook.py,
+#       enabled via bay_monitor.snapshot_webhook_enabled (default
+#       false, requires bay_monitor.enabled) and served by waitress on
+#       its own configurable host/port (bay_monitor.
+#       snapshot_webhook_host/_port/_threads, default 0.0.0.0:8081) --
+#       the same pattern as http_trigger.py's server, but deliberately a
+#       separate one: receiving camera-alert triggers and serving
+#       snapshots on request are unrelated concerns, and a deployment
+#       may want either without the other. GET /snapshot/<bay> returns
+#       {bay, occupancy_status, activity, image_base64, timestamp}, 404
+#       if the bay is unrecognized or nothing's been captured for it
+#       yet. GET /healthz for a liveness check.
+#       BayMonitor.get_snapshot(bay) serves audit/<bay>/latest_frame.jpg
+#       (already written every scan round by save_latest_frame, default
+#       on -- never more than one baseline_scan_interval_ms round
+#       stale, 2s by default) plus the bay's last-known classification
+#       (BayState.last_status), rather than fetching a brand-new frame
+#       per request: that would mean sharing bay_monitor's own
+#       HTTPDigestAuth session (stateful, not meant for concurrent
+#       cross-thread reuse) with whatever waitress worker thread handles
+#       the HTTP request. start_bay_monitor() now returns (monitor,
+#       thread, stop_event) instead of (thread, stop_event) so
+#       service.py can wire the webhook's route table up against the
+#       running monitor's own get_snapshot method.
+#       mqtt.bay_notification_topic_prefix (item #24(b)) is unaffected
+#       -- it's the one channel still allowed to push anything, and only
+#       because it's gated on an actual status CHANGE rather than a
+#       timer.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
-# `flask` and `waitress` (only actually used if http_trigger.enabled is
-# true) -- see requirements.txt for pinned versions. bay_monitor needs no
-# new pip package (talks to Ollama over plain HTTP via `requests`), but
-# does need a local Ollama install (https://ollama.com) with a
-# vision-capable model pulled if bay_monitor.enabled is turned on.
+# `flask` and `waitress` (used if http_trigger.enabled or bay_monitor.
+# snapshot_webhook_enabled is true) -- see requirements.txt for pinned
+# versions. bay_monitor needs no new pip package (talks to Ollama over
+# plain HTTP via `requests`), but does need a local Ollama install
+# (https://ollama.com) with a vision-capable model pulled if bay_monitor.
+# enabled is turned on.
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 

@@ -192,6 +192,38 @@ def start_http_trigger(cameras: dict, config: dict, bus: JobBus, log) -> threadi
     return t
 
 
+def start_snapshot_webhook(monitor, config: dict, log) -> threading.Thread:
+    """Starts the on-demand snapshot server (config "bay_monitor.
+    snapshot_webhook_*") in a background thread, served by waitress --
+    same reasoning as start_http_trigger above. A separate server/port
+    from http_trigger on purpose: receiving camera alerts and serving
+    snapshots-on-request are unrelated concerns, and a deployment may
+    want one without the other."""
+    from waitress import serve
+    from .snapshot_webhook import build_snapshot_webhook_app
+
+    bm_cfg = config["bay_monitor"]
+    app = build_snapshot_webhook_app(monitor.get_snapshot)
+
+    def _run():
+        try:
+            serve(app, host=bm_cfg["snapshot_webhook_host"],
+                  port=bm_cfg["snapshot_webhook_port"],
+                  threads=bm_cfg["snapshot_webhook_threads"])
+        except OSError as e:
+            log.error(f"snapshot webhook server failed to start on "
+                      f"{bm_cfg['snapshot_webhook_host']}:"
+                      f"{bm_cfg['snapshot_webhook_port']}: {e}")
+
+    t = threading.Thread(target=_run, daemon=True, name="snapshot-webhook")
+    t.start()
+    log.info(f"snapshot webhook listening on http://"
+              f"{bm_cfg['snapshot_webhook_host']}:"
+              f"{bm_cfg['snapshot_webhook_port']}/snapshot/<bay> "
+              f"(threads={bm_cfg['snapshot_webhook_threads']})")
+    return t
+
+
 def main():
     try:
         config = load_config()
@@ -311,11 +343,13 @@ def main():
     stoppables = []
     if bay_monitor_cfg["enabled"]:
         from .bay_monitor import start_bay_monitor
-        _, bay_monitor_stop = start_bay_monitor(
+        monitor, _, bay_monitor_stop = start_bay_monitor(
             cameras, config, publish,
             on_status=state_engine.on_status if state_engine else None,
             audit_dir=AUDIT_DIR)
         stoppables.append(bay_monitor_stop)
+        if bay_monitor_cfg["snapshot_webhook_enabled"]:
+            start_snapshot_webhook(monitor, config, log)
 
     # Shared by every worker so their first-run model loading (in
     # particular PaddleOCR's download-if-missing check against the one

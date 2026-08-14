@@ -96,6 +96,25 @@ def load_config(path: Path = None) -> dict:
     # of what the engine is doing right now, e.g. for a dashboard or for
     # confirming the engine is alive/reacting at all while troubleshooting.
     mqtt.setdefault("bay_state_topic_prefix", "site/alpr/bay_state")
+    # Where bay_state_engine publishes a RICH notification ("/<bay>"
+    # appended) whenever bay_monitor's activity classification actually
+    # CHANGES (idle->loading, empty->occupied, etc, not on every
+    # classification the way bay_status_topic_prefix above does) --
+    # {bay, occupancy_status, activity, truck_number, comment,
+    # image_base64, timestamp}. occupancy_status is "occupied"/"empty"
+    # (bay_monitor's own occupied/departed interpretation); activity is
+    # the raw classification word (may equal occupancy_status, or be a
+    # finer one like "loading"/"unloading"/"idle"); truck_number is
+    # whatever this session's plate is confirmed as so far (or
+    # alpr.unknown_plate_value); comment is the vision model's own
+    # free-text description of what it sees; image_base64 is the exact
+    # frame it was shown. Requires bay_state_engine.enabled (only it
+    # tracks truck_number) -- bay_monitor alone has no truck identity to
+    # report.
+    mqtt.setdefault("bay_notification_topic_prefix", "site/alpr/bay_notification")
+    # Periodic image-only heartbeat ("/<bay>" appended) -- see
+    # bay_monitor.snapshot_publish_interval_sec.
+    mqtt.setdefault("bay_snapshot_topic_prefix", "site/alpr/bay_snapshot")
 
     # An alternative trigger source to the MQTT VCA events above: some
     # cameras (e.g. a Bosch dome's built-in "HTTP notification" alarm
@@ -411,8 +430,14 @@ def load_config(path: Path = None) -> dict:
         "being removed from the truck. 'loading' = cargo is visibly being "
         "loaded onto the truck. 'idle' = a truck is present, not actively "
         "loading or unloading (e.g. waiting, doors closed, driver break). "
-        "Respond with only the single classification word, nothing else."
+        "Respond in EXACTLY this two-line format, nothing else:\n"
+        "STATUS: <the single classification word>\n"
+        "COMMENT: <one short plain-English sentence describing what you "
+        "actually see happening in the bay>"
     ))
+    # Periodic image-only MQTT heartbeat, independent of classification --
+    # see bay_monitor.py's _publish_snapshot. 0 disables it.
+    bay_monitor.setdefault("snapshot_publish_interval_sec", 300)
     # Per-bay state engine (bay_state.py) -- fuses bay_monitor's
     # continuous status stream with ALPR plate reads into one session per
     # bay, and becomes the authority for enter/leave direction and

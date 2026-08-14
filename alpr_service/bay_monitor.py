@@ -80,6 +80,11 @@ class BayState:
         # exactly one classify per bay regardless of the diff, to
         # establish real ground truth on startup.
         self.classified_once = False
+        # Last time this bay's periodic image heartbeat (bay_monitor.
+        # snapshot_publish_interval_sec) was published -- independent of
+        # classification entirely, so it keeps firing even for a bay
+        # that's sitting at baseline with nothing happening.
+        self.last_snapshot_publish_time = 0.0
 
 
 def downscale(img, max_dimension: int):
@@ -152,11 +157,16 @@ def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = 
                     session: requests.Session = None):
     """POSTs one JPEG-encoded frame -- plus, if configured, a set of
     labeled exemplar images sent alongside it as few-shot context -- to a
-    local Ollama vision model, and returns whichever of
-    bm_cfg['status_values'] appears in its reply. Returns None if the
-    request/response didn't produce a usable answer (logged, never
-    raised -- a flaky local LLM call shouldn't take the scanner thread
-    down).
+    local Ollama vision model, and returns (status, comment, image_b64):
+    status is whichever of bm_cfg['status_values'] appears in the reply
+    (or None if the reply didn't produce a usable answer -- logged, never
+    raised, since a flaky local LLM call shouldn't take the scanner
+    thread down), comment is the model's free-text description of what
+    it sees (see split_status_comment -- falls back to the whole reply
+    if the model didn't follow the STATUS:/COMMENT: format), and
+    image_b64 is the exact JPEG-base64 this call sent to Ollama, handed
+    back so a caller that wants to publish/forward the classified frame
+    doesn't have to re-encode it.
 
     Few-shot exemplars matter most for exactly the ambiguous cases a bare
     prompt gets wrong -- e.g. a truck with its bay/cargo door open, which
@@ -167,7 +177,7 @@ def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = 
                                bm_cfg["classify_jpeg_quality"])
     if target_b64 is None:
         log.warning(f"({bay}) failed to JPEG-encode frame for classification")
-        return None
+        return None, None, None
 
     reference_images = reference_images or []
     images = [b64 for _, b64 in reference_images] + [target_b64]
@@ -199,12 +209,37 @@ def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = 
     try:
         resp = requester.post(url, json=payload, timeout=bm_cfg["ollama_timeout_sec"])
         resp.raise_for_status()
-        text = resp.json().get("response", "").strip().lower()
+        text = resp.json().get("response", "").strip()
     except (requests.RequestException, ValueError) as e:
         log.warning(f"({bay}) ollama classification call failed: {e}")
-        return None
+        return None, None, None
 
-    return parse_status(text, bm_cfg["status_values"], log, bay)
+    status_text, comment = split_status_comment(text)
+    status = parse_status(status_text, bm_cfg["status_values"], log, bay)
+    return status, comment, target_b64
+
+
+def split_status_comment(text: str):
+    """Splits a 'STATUS: <word>\\nCOMMENT: <text>' reply (the format
+    bay_monitor.classification_prompt's default asks for) into the two
+    parts, so a comment mentioning a DIFFERENT status word than the one
+    actually chosen (e.g. "STATUS: idle / COMMENT: looks mostly empty of
+    cargo") can't make parse_status() see two candidate words in the same
+    blob of text and call the whole reply ambiguous.
+
+    Falls back to using the full reply as both parts if either marker is
+    missing -- keeps this working with a model that ignores the
+    requested format, or a custom classification_prompt that doesn't ask
+    for one at all (the pre-existing single-word-only behavior)."""
+    status_part = text
+    comment_part = text
+    m = re.search(r'status\s*:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
+    if m:
+        status_part = m.group(1).strip()
+    m2 = re.search(r'comment\s*:\s*(.+)', text, re.IGNORECASE | re.DOTALL)
+    if m2:
+        comment_part = m2.group(1).strip()
+    return status_part, comment_part
 
 
 def parse_status(text: str, status_values, log, bay: str):
@@ -260,6 +295,8 @@ class BayMonitor:
         self.cfg = config["bay_monitor"]
         self.snap_cfg = config["snapshot"]
         self.status_topic_prefix = config["mqtt"]["bay_status_topic_prefix"]
+        self.snapshot_topic_prefix = config["mqtt"]["bay_snapshot_topic_prefix"]
+        self.snapshot_publish_interval_sec = self.cfg["snapshot_publish_interval_sec"]
         self.empty_status = self.cfg["empty_status"]
         self.classify_region = self.cfg["classify_region"]
         self.scan_interval_sec = self.cfg["baseline_scan_interval_ms"] / 1000
@@ -434,12 +471,37 @@ class BayMonitor:
         state.classify_thumb = thumb
         return changed
 
+    def _publish_snapshot(self, bay: str, frame, state: BayState):
+        """Independent of classification entirely: a plain base64 image
+        heartbeat on its own timer (bay_monitor.snapshot_publish_interval_
+        sec, default 300s), so a downstream consumer has a periodic "here
+        is what this bay actually looks like right now" without needing
+        to wait for -- or trigger -- a status change. 0 disables it."""
+        if not self.snapshot_publish_interval_sec:
+            return
+        if (time.time() - state.last_snapshot_publish_time
+                < self.snapshot_publish_interval_sec):
+            return
+        image_b64 = encode_image(frame, self.cfg["classify_max_dimension"],
+                                  self.cfg["classify_jpeg_quality"])
+        if image_b64 is None:
+            return
+        state.last_snapshot_publish_time = time.time()
+        topic = f"{self.snapshot_topic_prefix}/{bay}"
+        self.publish(topic, json.dumps({
+            "bay": bay,
+            "image_base64": image_b64,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }))
+        self.log.debug(f"({bay}) periodic snapshot published -> {topic}")
+
     def _scan_bay(self, bay: str, cam: dict, state: BayState):
         """One bay's turn: fetch a frame, then either check for presence
         (baseline) or classify activity (zoomed in)."""
         frame = self._fetch(bay, cam)
         if frame is None:
             return
+        self._publish_snapshot(bay, frame, state)
         roi = self._roi(bay, cam, frame)
 
         if not state.zoomed_in:
@@ -476,8 +538,9 @@ class BayMonitor:
         # ADJACENT bay that's in shot can then drive this bay's status.
         # "roi" removes that cross-talk at the cost of a narrower view.
         classify_img = roi if (self.classify_region == "roi" and roi is not None) else frame
-        status = classify_frame(classify_img, self.cfg, self.log, bay,
-                                 self.references, session=self.session)
+        status, comment, image_b64 = classify_frame(
+            classify_img, self.cfg, self.log, bay,
+            self.references, session=self.session)
         state.last_classify_time = time.time()
         if status is None:
             return
@@ -524,9 +587,10 @@ class BayMonitor:
         # else: a first-look (or otherwise not-yet-zoomed) result came
         # back empty -- already at baseline, nothing to revert.
 
-        self._notify(bay, status, timestamp, occupied, departed)
+        self._notify(bay, status, timestamp, occupied, departed, comment, image_b64)
 
-    def _notify(self, bay, status, timestamp, occupied, departed):
+    def _notify(self, bay, status, timestamp, occupied, departed,
+                comment=None, image_b64=None):
         """Hand the reading to a consumer as an already-interpreted event.
 
         `occupied` and `departed` are decided here rather than shipping
@@ -534,11 +598,17 @@ class BayMonitor:
         (empty_status) and the debounce (empty_debounce_count) they
         derive from. A consumer re-deriving either would hold a second
         copy of a threshold that can drift out of sync with this one.
+
+        `comment` and `image_b64` are the LLM's free-text description and
+        the exact frame it was shown, passed through so a consumer (e.g.
+        bay_state_engine) can build a richer notification without
+        re-fetching or re-classifying anything itself.
         """
         if self.on_status is None:
             return
         try:
-            self.on_status(bay, status, timestamp, occupied, departed)
+            self.on_status(bay, status, timestamp, occupied, departed,
+                            comment, image_b64)
         except Exception:
             self.log.error(f"({bay}) on_status hook raised", exc_info=True)
 

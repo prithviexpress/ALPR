@@ -90,6 +90,7 @@ class BayStateEngine:
         self.unknown_plate_value = config["alpr"]["unknown_plate_value"]
         self.max_read_attempts = config["alpr"]["max_read_attempts"]
         self.state_topic_prefix = config["mqtt"]["bay_state_topic_prefix"]
+        self.notification_topic_prefix = config["mqtt"]["bay_notification_topic_prefix"]
         # A one-row-per-bay CSV snapshot of current state, rewritten in
         # full on every on_status()/on_alpr_result() call -- MQTT
         # requires a client and a subscription just to see "what's
@@ -120,6 +121,35 @@ class BayStateEngine:
             "timestamp": timestamp,
         }
         self.publish(topic, json.dumps(payload, default=str))
+
+    def _publish_notification(self, bay: str, status: str, occupied: bool,
+                               truck_number: str, comment, image_b64,
+                               timestamp: str):
+        """The rich, CHANGE-gated notification (see on_status -- only
+        called when bay_monitor's classification actually differs from
+        the previous one for this bay): occupancy + finer activity +
+        whichever truck number is known so far + the vision model's own
+        description of what it sees + the exact frame it was shown.
+        Deliberately separate from bay_status_topic_prefix (bay_monitor's
+        own topic, which fires on every classification regardless of
+        change, and carries neither comment nor image to keep that
+        high-frequency topic light) and from bay_state_topic_prefix
+        (fires on session transitions, not activity changes, and has no
+        comment/image either)."""
+        topic = f"{self.notification_topic_prefix}/{bay}"
+        payload = {
+            "bay": bay,
+            "occupancy_status": "occupied" if occupied else "empty",
+            "activity": status,
+            "truck_number": truck_number,
+            "comment": comment,
+            "image_base64": image_b64,
+            "timestamp": timestamp,
+        }
+        self.publish(topic, json.dumps(payload, default=str))
+        self.log.info(f"({bay}) activity changed -> '{status}' "
+                       f"(truck_number={truck_number}), notification "
+                       f"published to {topic}")
 
     def _write_csv(self):
         """Overwrite bay_state.csv with the current snapshot of every
@@ -155,7 +185,8 @@ class BayStateEngine:
             self.log.warning("failed to write bay_state.csv", exc_info=True)
 
     def on_status(self, bay: str, status: str, timestamp: str,
-                  occupied: bool, departed: bool):
+                  occupied: bool, departed: bool, comment=None,
+                  image_b64=None):
         """Called by bay_monitor after every classification.
 
         `occupied` and `departed` are bay_monitor's OWN interpretation of
@@ -166,10 +197,21 @@ class BayStateEngine:
         threshold that can drift -- and if this engine ever waited for
         more consecutive empties than bay_monitor does, bay_monitor would
         stop reporting entirely once it reverted to baseline scanning and
-        the session would stay open forever."""
+        the session would stay open forever.
+
+        `comment` and `image_b64` are the vision model's free-text
+        description and the exact frame it was shown -- passed straight
+        through from bay_monitor for the rich notification below,
+        without this engine re-fetching or re-classifying anything."""
         with self.lock:
+            status_changed = self.bay_status.get(bay) != status
             self.bay_status[bay] = status
             session = self.sessions.setdefault(bay, BaySession(bay))
+            # The truck this activity change is ABOUT: on a departure,
+            # session.reset() below wipes session.plate before we'd get
+            # to read it, so grab whatever's confirmed so far -- possibly
+            # still None/unconfirmed -- before any transition runs.
+            truck_number = session.plate or self.unknown_plate_value
 
             if occupied:
                 # Whether this is a NEW arrival is decided purely by
@@ -190,6 +232,11 @@ class BayStateEngine:
                     self._retry_read(session, timestamp)
             elif departed and session.open:
                 self._on_departure(session, timestamp)
+
+            if status_changed:
+                self._publish_notification(bay, status, occupied,
+                                            truck_number, comment,
+                                            image_b64, timestamp)
 
             # Rewritten after every classification, not just at
             # transitions -- this is what makes the CSV a reliable "is

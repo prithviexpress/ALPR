@@ -337,6 +337,42 @@
 #       tooling required. Always the full current table, not an
 #       append-only log, written via temp-file-then-rename so a reader
 #       never sees a half-written row.
+#   24. Two more MQTT notification types, both requested directly:
+#       (a) bay_monitor.classification_prompt's default now asks the
+#           vision model for a two-line "STATUS: <word>\nCOMMENT:
+#           <sentence>" reply instead of just the bare word.
+#           bay_monitor.split_status_comment() isolates the status
+#           before it's resolved, so a comment mentioning a DIFFERENT
+#           status word (e.g. "STATUS: idle / COMMENT: looks mostly
+#           empty of cargo") can't make the whole reply look ambiguous
+#           the way it would if status and comment were resolved from
+#           the same blob of text. classify_frame() now returns
+#           (status, comment, image_b64) instead of a bare status, and
+#           hands the comment and the exact base64 frame it sent to
+#           Ollama through to bay_monitor's on_status hook.
+#       (b) bay_state_engine now publishes a RICH notification to
+#           "mqtt.bay_notification_topic_prefix" (default site/alpr/
+#           bay_notification) whenever bay_monitor's classification
+#           actually CHANGES for a bay (idle->loading, empty->occupied,
+#           etc -- including the bay's very first-ever classification,
+#           a "change" from unknown) -- {bay, occupancy_status, activity,
+#           truck_number, comment, image_base64, timestamp}.
+#           truck_number is whatever's confirmed so far (or
+#           unknown_plate_value), captured before any session reset so
+#           a departure notification still names the truck that just
+#           left. Deliberately gated on an actual CHANGE, not fired on
+#           every classification the way bay_status_topic_prefix is --
+#           a truck sitting "idle" for an hour of periodic
+#           classify_interval_sec rechecks shouldn't re-notify every
+#           time, only when something's actually different.
+#       (c) Separately, bay_monitor now also publishes a periodic,
+#           classification-independent image-only heartbeat --
+#           "bay_monitor.snapshot_publish_interval_sec" (default 300s),
+#           to "mqtt.bay_snapshot_topic_prefix" (default site/alpr/
+#           bay_snapshot) -- {bay, image_base64, timestamp}. Fires on
+#           its own timer per bay regardless of activity, so a
+#           downstream consumer always has a recent frame without
+#           waiting for (or triggering) a status change. 0 disables it.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

@@ -333,6 +333,25 @@ def load_config(path: Path = None) -> dict:
     # yes/no "is anything there", not a precise box, so it runs well
     # below the detector's default 640.
     bay_monitor.setdefault("presence_imgsz", 320)
+    # Before running that presence inference at all, a small thumbnail of
+    # the ROI is compared against the one from the last round that
+    # actually ran it -- an empty bay's ROI is pixel-for-pixel static
+    # between one baseline_scan_interval_ms poll and the next, and a
+    # resize+diff (~100us) is roughly three orders of magnitude cheaper
+    # than a YOLO pass (~100-300ms). Only the diff runs on an unchanged
+    # scene; a real detection still runs on any bay that changed, and a
+    # change big enough to matter -- a truck arriving -- moves far more
+    # pixels than presence_diff_threshold tolerates, so this cannot miss
+    # an arrival. presence_diff_max_skip forces a real check periodically
+    # regardless, as a safety net against slow drift (e.g. gradually
+    # shifting light) a single-frame-to-frame diff would never trip. Set
+    # presence_diff_enabled to false to always run full inference (the
+    # pre-optimization behavior).
+    bay_monitor.setdefault("presence_diff_enabled", True)
+    bay_monitor.setdefault("presence_diff_resize_width", 160)
+    bay_monitor.setdefault("presence_diff_resize_height", 120)
+    bay_monitor.setdefault("presence_diff_threshold", 3.0)
+    bay_monitor.setdefault("presence_diff_max_skip", 15)
     bay_monitor.setdefault("classification_prompt", (
         "You are monitoring a truck loading dock bay through a fixed "
         "security camera. Classify the current activity into EXACTLY ONE "

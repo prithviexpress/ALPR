@@ -39,6 +39,7 @@ from pathlib import Path
 import cv2
 import requests
 
+from .image_ops import thumbnail, duplicate_thumbs
 from .logging_setup import get_logger
 from .snapshot import build_snapshot_url, build_auth, fetch_snapshot, SnapshotError
 
@@ -48,6 +49,14 @@ class BayState:
         self.zoomed_in = False
         self.last_classify_time = 0.0
         self.consecutive_empty = 0
+        # Frame-diff memoization for the baseline presence check (see
+        # BayMonitor._detect_presence): a thumbnail of the last ROI that
+        # actually got a real YOLO pass, the verdict that pass produced,
+        # and how many consecutive rounds have been skipped on the
+        # strength of "the scene hasn't changed" since then.
+        self.presence_thumb = None
+        self.last_presence = False
+        self.consecutive_skips = 0
 
 
 def downscale(img, max_dimension: int):
@@ -227,6 +236,8 @@ class BayMonitor:
         self.empty_status = self.cfg["empty_status"]
         self.classify_region = self.cfg["classify_region"]
         self.scan_interval_sec = self.cfg["baseline_scan_interval_ms"] / 1000
+        self.presence_diff_resize = (self.cfg["presence_diff_resize_width"],
+                                      self.cfg["presence_diff_resize_height"])
         self.states = {}
 
         from ultralytics import YOLO
@@ -242,6 +253,7 @@ class BayMonitor:
             f"classify_interval={self.cfg['classify_interval_sec']}s "
             f"classify_region={self.classify_region} "
             f"classify_max_dim={self.cfg['classify_max_dimension']} "
+            f"presence_diff_enabled={self.cfg['presence_diff_enabled']} "
             f"ollama={self.cfg['ollama_host']} model={self.cfg['ollama_model']}")
 
     def run(self, stop_event: threading.Event):
@@ -308,13 +320,41 @@ class BayMonitor:
             return None
         return roi
 
-    def _detect_presence(self, roi) -> bool:
+    def _detect_presence(self, bay: str, roi, state: BayState) -> bool:
         """Cheap "is anything there at all" check -- no size/position
         filtering, any box counts. Runs at presence_imgsz rather than the
-        detector's default, since it only needs a yes/no, not a precise box."""
+        detector's default, since it only needs a yes/no, not a precise box.
+
+        Before paying for that YOLO pass at all, compares a small
+        thumbnail of this ROI against the one from the last round that
+        actually ran inference: a resize+diff is roughly three orders of
+        magnitude cheaper than a detection pass (measured ~100us vs
+        ~100-300ms), and an empty bay's ROI is pixel-for-pixel static
+        between one 2-second poll and the next, so most rounds for most
+        bays pay only the diff. A change big enough to matter -- a truck
+        arriving -- moves far more pixels than presence_diff_threshold
+        tolerates, so this cannot miss an arrival. presence_diff_max_skip
+        forces a real check periodically regardless of how static the
+        diff looks, as a safety net against slow drift (e.g. gradually
+        shifting light) a single-frame-to-frame diff would never trip."""
+        if self.cfg["presence_diff_enabled"]:
+            thumb = thumbnail(roi, self.presence_diff_resize)
+            if (state.presence_thumb is not None
+                    and state.consecutive_skips < self.cfg["presence_diff_max_skip"]
+                    and duplicate_thumbs(thumb, state.presence_thumb,
+                                         self.cfg["presence_diff_threshold"])):
+                state.consecutive_skips += 1
+                return state.last_presence
+        else:
+            thumb = None
+
         results = self.model(roi, conf=self.cfg["presence_conf_threshold"],
                               imgsz=self.cfg["presence_imgsz"], verbose=False)
-        return any(len(r.boxes) > 0 for r in results)
+        presence = any(len(r.boxes) > 0 for r in results)
+        state.presence_thumb = thumb
+        state.last_presence = presence
+        state.consecutive_skips = 0
+        return presence
 
     def _scan_bay(self, bay: str, cam: dict, state: BayState):
         """One bay's turn: fetch a frame, then either check for presence
@@ -325,10 +365,19 @@ class BayMonitor:
         roi = self._roi(bay, cam, frame)
 
         if not state.zoomed_in:
-            if roi is None or not self._detect_presence(roi):
+            if roi is None or not self._detect_presence(bay, roi, state):
                 return
             state.zoomed_in = True
             state.consecutive_empty = 0
+            # The cached thumbnail/verdict describe the pre-arrival scene
+            # and are meaningless once this bay reverts to baseline again
+            # (whether "unchanged" then means "still that truck" or
+            # "back to empty" is exactly what a stale cache can't tell) --
+            # clear them so the first baseline check after this visit
+            # always runs a real detection rather than trusting a diff
+            # against a frame from before the truck showed up.
+            state.presence_thumb = None
+            state.consecutive_skips = 0
             self.log.info(f"({bay}) presence detected, zooming in")
 
         # Which pixels the vision model judges. "full_frame" (default)
@@ -357,6 +406,11 @@ class BayMonitor:
             state.consecutive_empty += 1
             if state.consecutive_empty >= self.cfg["empty_debounce_count"]:
                 state.zoomed_in = False
+                # Same reasoning as the arrival-side reset in _scan_bay:
+                # whatever the presence cache held describes the scene
+                # while a truck was there, not the just-emptied bay.
+                state.presence_thumb = None
+                state.consecutive_skips = 0
                 departed = True
                 self.log.info(f"({bay}) {state.consecutive_empty} consecutive "
                               f"'{self.empty_status}' reads, reverting to "

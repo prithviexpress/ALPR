@@ -146,6 +146,19 @@
 #       be stored as a session's confirmed plate. The audit result.json
 #       also gained "raw_vote" (whatever the OCR vote actually produced,
 #       possibly null/garbage) so the placeholder hides no forensic detail.
+#   14. bay_monitor's baseline presence check (config "bay_monitor.
+#       presence_diff_enabled", on by default) now skips the YOLO pass
+#       entirely on a bay whose ROI hasn't meaningfully changed since the
+#       last real check -- a cheap thumbnail diff (~100us) stands in for
+#       it, roughly three orders of magnitude cheaper than inference
+#       (~100-300ms). Real detection still runs on any bay that changed
+#       (an arrival moves far more pixels than "presence_diff_threshold"
+#       tolerates, so this cannot miss one), and
+#       "presence_diff_max_skip" forces a real check periodically
+#       regardless, as a safety net against slow drift (e.g. gradually
+#       shifting light) a single-frame diff would never trip. The cache
+#       is cleared on both the arrival and departure transitions so it
+#       never compares across a visit boundary.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

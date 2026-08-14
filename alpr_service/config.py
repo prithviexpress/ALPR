@@ -87,6 +87,15 @@ def load_config(path: Path = None) -> dict:
     # appended). Lives here with the other topics rather than down in the
     # bay_monitor block, since it's part of the MQTT topic contract.
     mqtt.setdefault("bay_status_topic_prefix", "site/alpr/bay_status")
+    # Where bay_state_engine publishes its LIVE per-bay session ("/<bay>"
+    # appended) -- open/closed, direction, plate (if confirmed yet),
+    # read_attempts -- on every state change (arrival, plate confirmed,
+    # departure), not just the final enter/leave result. That result
+    # (mqtt.enter_result_topic_prefix/leave_result_topic_prefix) only
+    # ever fires once, at the end of a visit; this is the running view
+    # of what the engine is doing right now, e.g. for a dashboard or for
+    # confirming the engine is alive/reacting at all while troubleshooting.
+    mqtt.setdefault("bay_state_topic_prefix", "site/alpr/bay_state")
 
     # An alternative trigger source to the MQTT VCA events above: some
     # cameras (e.g. a Bosch dome's built-in "HTTP notification" alarm

@@ -274,6 +274,28 @@
 #           instead of it. A zoomed-in bay is now fetched every
 #           baseline_scan_interval_ms round (not just when the timer is
 #           due) to make this possible.
+#   21. Fixed a real field failure: a bay already occupied by a truck
+#       when the service starts was never classified at all, and stayed
+#       that way indefinitely -- the presence-diff check (item #19) has
+#       nothing to compare the very first frame against, so it silently
+#       establishes THAT frame (truck already in it) as the "empty"
+#       baseline and reports no presence, forever, until some LATER
+#       visual change happens to trip the diff. No Ollama call, no
+#       bay_state_engine session, no ALPR read, nothing -- while the
+#       process looked completely healthy. bay_monitor now tracks
+#       BayState.classified_once and forces exactly one real classify
+#       per bay regardless of the diff if it's never been classified
+#       before, to establish actual ground truth on startup (a failed
+#       first attempt, e.g. Ollama unreachable, does NOT set the flag,
+#       so it keeps retrying rather than giving up permanently). Also
+#       added "mqtt.bay_state_topic_prefix" (default site/alpr/bay_state):
+#       bay_state_engine now publishes its live per-bay session -- open,
+#       direction, plate (if confirmed), read_attempts -- on every state
+#       change (arrival, plate confirmed, departure), not just the final
+#       enter/leave result on departure. Unlike that result, this topic
+#       is NOT suppressed by alpr.publish_no_valid_plate=false, since its
+#       whole purpose is showing the engine reacting at all -- exactly
+#       what was invisible during this failure.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

@@ -69,6 +69,17 @@ class BayState:
         # (e.g. idle -> unloading) can trigger an early reclassify
         # instead of waiting out classify_interval_sec.
         self.classify_thumb = None
+        # Whether this bay has EVER been successfully classified since
+        # the process started. The presence-diff check alone can never
+        # trigger the very first classify for a bay: there is nothing
+        # yet to diff the current frame against, so a truck already
+        # parked when the service starts would otherwise stay invisible
+        # -- no Ollama call, no bay_state_engine session, nothing --
+        # until some LATER visual change happens to trip the diff. See
+        # BayMonitor._scan_bay's "first look" handling, which forces
+        # exactly one classify per bay regardless of the diff, to
+        # establish real ground truth on startup.
+        self.classified_once = False
 
 
 def downscale(img, max_dimension: int):
@@ -432,22 +443,24 @@ class BayMonitor:
         roi = self._roi(bay, cam, frame)
 
         if not state.zoomed_in:
-            if roi is None or not self._detect_presence(bay, roi, state):
+            if roi is None:
                 return
-            state.zoomed_in = True
-            state.consecutive_empty = 0
-            # The cached thumbnails describe the pre-arrival scene and
-            # are meaningless once this bay reverts to baseline again
-            # (whether "unchanged" then means "still that truck" or
-            # "back to empty" is exactly what a stale cache can't tell) --
-            # clear them so the first baseline check after this visit
-            # establishes a fresh empty baseline rather than diffing
-            # against a frame from before the truck showed up.
-            state.presence_thumb = None
-            state.classify_thumb = None
-            self.log.info(f"({bay}) presence detected, zooming in")
-            # Falls through and classifies immediately below -- no need
-            # to wait for classify_interval_sec on the very first look.
+            presence = self._detect_presence(bay, roi, state)
+            # The diff alone can never trigger a bay's very FIRST-ever
+            # classify: there's nothing yet to diff the current frame
+            # against, so a truck already parked when the service starts
+            # would otherwise never get looked at until some LATER visual
+            # change happens to trip the diff -- no Ollama call, no
+            # bay_state_engine session, nothing, indefinitely. Force
+            # exactly one classify per bay regardless of presence to
+            # establish real ground truth, whatever it turns out to be.
+            first_look = not state.classified_once
+            if not (presence or first_look):
+                return
+            self.log.info(
+                f"({bay}) presence detected, zooming in" if presence else
+                f"({bay}) first look at this bay -- classifying once to "
+                f"establish its current state")
         else:
             due = (time.time() - state.last_classify_time
                    >= self.cfg["classify_interval_sec"])
@@ -468,6 +481,7 @@ class BayMonitor:
         state.last_classify_time = time.time()
         if status is None:
             return
+        state.classified_once = True
 
         timestamp = datetime.now(timezone.utc).isoformat()
         topic = f"{self.status_topic_prefix}/{bay}"
@@ -475,23 +489,40 @@ class BayMonitor:
             {"bay": bay, "status": status, "timestamp": timestamp}))
         self.log.info(f"({bay}) status={status} -> {topic}")
 
+        # Whether this classify counts as an arrival (or a departure) is
+        # decided HERE, from the actual answer, rather than earlier from
+        # the diff that triggered the call -- a presence-diff false
+        # alarm (e.g. a lighting change) that classify then reads as
+        # "empty" must not park the bay in zoomed-in mode waiting out a
+        # debounce it never really entered.
         occupied = status != self.empty_status
         departed = False
         if occupied:
+            if not state.zoomed_in:
+                state.zoomed_in = True
+                # The cached thumbnails describe the pre-arrival scene
+                # and are meaningless once this bay reverts to baseline
+                # again (whether "unchanged" then means "still that
+                # truck" or "back to empty" is exactly what a stale
+                # cache can't tell) -- clear them so the first baseline
+                # check after this visit establishes a fresh empty
+                # baseline rather than diffing against a frame from
+                # before the truck showed up.
+                state.presence_thumb = None
+                state.classify_thumb = None
             state.consecutive_empty = 0
-        else:
+        elif state.zoomed_in:
             state.consecutive_empty += 1
             if state.consecutive_empty >= self.cfg["empty_debounce_count"]:
                 state.zoomed_in = False
-                # Same reasoning as the arrival-side reset in _scan_bay:
-                # whatever the presence/classify caches held describe the
-                # scene while a truck was there, not the just-emptied bay.
                 state.presence_thumb = None
                 state.classify_thumb = None
                 departed = True
                 self.log.info(f"({bay}) {state.consecutive_empty} consecutive "
                               f"'{self.empty_status}' reads, reverting to "
                               f"baseline scan")
+        # else: a first-look (or otherwise not-yet-zoomed) result came
+        # back empty -- already at baseline, nothing to revert.
 
         self._notify(bay, status, timestamp, occupied, departed)
 

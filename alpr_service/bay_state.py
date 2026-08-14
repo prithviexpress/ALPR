@@ -77,6 +77,27 @@ class BayStateEngine:
         self.sessions = {bay: BaySession(bay) for bay in cameras}
         self.unknown_plate_value = config["alpr"]["unknown_plate_value"]
         self.max_read_attempts = config["alpr"]["max_read_attempts"]
+        self.state_topic_prefix = config["mqtt"]["bay_state_topic_prefix"]
+
+    def _publish_state(self, session: BaySession, timestamp: str):
+        """Live view of this engine's own state, separate from both
+        bay_monitor's raw activity status (empty/occupied/...) and the
+        final enter/leave result (which only ever fires once, at the end
+        of a visit). Fired on every state change -- arrival, a plate
+        getting confirmed, departure -- so a downstream consumer (or
+        someone troubleshooting) can see the engine reacting in real
+        time instead of waiting for a visit to conclude."""
+        topic = f"{self.state_topic_prefix}/{session.bay}"
+        payload = {
+            "bay": session.bay,
+            "open": session.open,
+            "direction": session.direction,
+            "plate": session.plate,
+            "confidence": session.confidence,
+            "read_attempts": session.read_attempts,
+            "timestamp": timestamp,
+        }
+        self.publish(topic, json.dumps(payload, default=str))
 
     def on_status(self, bay: str, status: str, timestamp: str,
                   occupied: bool, departed: bool):
@@ -120,6 +141,7 @@ class BayStateEngine:
         self.log.info(f"({session.bay}) arrival detected -> enter, "
                        f"enqueuing ALPR read")
         self._enqueue_read(session, timestamp)
+        self._publish_state(session, timestamp)
 
     def _retry_read(self, session: BaySession, timestamp: str):
         # Capped: the truck is stationary and the camera fixed, so attempt
@@ -176,6 +198,12 @@ class BayStateEngine:
             self.publish(topic, json.dumps(reply, default=str))
             self.log.info(f"({session.bay}) leave published to {topic}")
 
+        # Announce the session closing on the live-state topic too --
+        # the same plate/confidence/read_attempts this visit concluded
+        # with, but open=False now that direction is cleared, so it's
+        # visually distinct from the "still open, unconfirmed" state.
+        session.direction = None
+        self._publish_state(session, timestamp)
         session.reset()
 
     def on_alpr_result(self, reply: dict):
@@ -206,5 +234,6 @@ class BayStateEngine:
                 session.confidence = reply.get("confidence", 0.0)
                 self.log.info(f"({bay}) plate confirmed this session: "
                                f"{session.plate} (conf {session.confidence})")
+                self._publish_state(session, reply.get("ocr_time", ""))
             # NO_VALID_PLATE / ERROR: leave session.plate exactly as it
             # was -- a failed retry must never erase an earlier good read.

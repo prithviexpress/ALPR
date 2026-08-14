@@ -296,13 +296,6 @@ def load_config(path: Path = None) -> dict:
     bay_monitor.setdefault("baseline_scan_interval_ms", 2000)
     bay_monitor.setdefault("classify_interval_sec", 60)
     bay_monitor.setdefault("empty_debounce_count", 3)
-    # Minimum YOLO box confidence for the baseline presence check to
-    # count as "something's there" -- separate from alpr.yolo_conf_
-    # threshold since presence-detection intentionally wants to catch
-    # weak/partial hints of a truck (no size/position filtering at all
-    # here, unlike ALPR's own plate detection), so this can reasonably
-    # be set lower than alpr.yolo_conf_threshold.
-    bay_monitor.setdefault("presence_conf_threshold", 0.25)
     bay_monitor.setdefault("ollama_host", "http://localhost:11434")
     bay_monitor.setdefault("ollama_model", None)
     bay_monitor.setdefault("ollama_timeout_sec", 30)
@@ -359,29 +352,24 @@ def load_config(path: Path = None) -> dict:
     # downscaling and send frames at full resolution.
     bay_monitor.setdefault("classify_max_dimension", 1024)
     bay_monitor.setdefault("classify_jpeg_quality", 80)
-    # Inference size for the cheap presence check. It only needs a
-    # yes/no "is anything there", not a precise box, so it runs well
-    # below the detector's default 640.
-    bay_monitor.setdefault("presence_imgsz", 320)
-    # Before running that presence inference at all, a small thumbnail of
-    # the ROI is compared against the one from the last round that
-    # actually ran it -- an empty bay's ROI is pixel-for-pixel static
-    # between one baseline_scan_interval_ms poll and the next, and a
-    # resize+diff (~100us) is roughly three orders of magnitude cheaper
-    # than a YOLO pass (~100-300ms). Only the diff runs on an unchanged
-    # scene; a real detection still runs on any bay that changed, and a
-    # change big enough to matter -- a truck arriving -- moves far more
-    # pixels than presence_diff_threshold tolerates, so this cannot miss
-    # an arrival. presence_diff_max_skip forces a real check periodically
-    # regardless, as a safety net against slow drift (e.g. gradually
-    # shifting light) a single-frame-to-frame diff would never trip. Set
-    # presence_diff_enabled to false to always run full inference (the
-    # pre-optimization behavior).
+    # The baseline presence check: a small thumbnail of the ROI is
+    # compared against the one from the last time this bay was looked at
+    # while empty -- a resize+diff (~100us), nothing else. Deliberately
+    # NOT plate detection: a bay is "occupied" or not regardless of
+    # whether a plate happens to be visible in frame (a reversed-in
+    # trailer's plate usually faces away from the dock camera entirely),
+    # so this has to be a general "did the scene change" test, not
+    # "did the ALPR model find a plate-shaped box". A change big enough
+    # to matter -- a truck arriving -- moves far more pixels than
+    # presence_diff_threshold tolerates, so this cannot miss an arrival.
+    # Set presence_diff_enabled to false to report presence
+    # unconditionally on every round (bypasses the check entirely --
+    # useful for tuning classify_interval_sec/the prompt without waiting
+    # for an actual scene change).
     bay_monitor.setdefault("presence_diff_enabled", True)
     bay_monitor.setdefault("presence_diff_resize_width", 160)
     bay_monitor.setdefault("presence_diff_resize_height", 120)
     bay_monitor.setdefault("presence_diff_threshold", 3.0)
-    bay_monitor.setdefault("presence_diff_max_skip", 15)
     bay_monitor.setdefault("classification_prompt", (
         "You are monitoring a truck loading dock bay through a fixed "
         "security camera. Classify the current activity into EXACTLY ONE "

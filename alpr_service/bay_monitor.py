@@ -8,14 +8,18 @@ HTTP snapshot fetch mechanism (snapshot.py) that ALPR's own collect() uses.
 How it works: round-robins every enabled camera, one frame at a time,
 "by turns". A bay with nothing detected is scanned at the baseline cadence
 (bay_monitor.baseline_scan_interval_ms between each bay checked). Presence
-is a cheap signal -- reusing the existing YOLO plate model exactly as
-loaded for ALPR, but with no filtering at all (unlike worker.py's
-size/position/duplicate checks): here ANY detected box, however small,
-weak or off-center, counts as "something's there", since the point isn't
-to find a clean plate -- it's just "is this bay worth paying closer
-attention to".
+is a cheap signal -- a plain thumbnail diff of the ROI against the last
+time this bay was looked at while empty, with no model involved at all.
+Deliberately NOT the ALPR plate model: a bay is occupied or not regardless
+of whether a plate happens to be visible in frame (a reversed-in trailer's
+plate usually faces away from the dock camera entirely), so gating on
+plate detection left the monitor blind to exactly the trucks it exists to
+track. Any meaningful visual change -- a truck, a forklift, a person, an
+open door -- counts as "something's there", since the point isn't to find
+a clean plate, or even identify what changed -- it's just "is this bay
+worth paying closer attention to".
 
-Once a bay has any detection it's "zoomed in": every
+Once a bay's scene has changed it's "zoomed in": every
 bay_monitor.classify_interval_sec (default 60s -- "one frame per minute
 per truck") a fresh frame is sent to a local Ollama-hosted vision model
 (bay_monitor.ollama_model) with a classification prompt, and the reply is
@@ -24,7 +28,7 @@ paused while one is zoomed in -- the round-robin keeps visiting all of
 them each pass; a zoomed-in bay just also gets the extra classification
 call layered on top when its interval is due, and is skipped without a
 frame fetch on passes where it isn't. After bay_monitor.empty_debounce_count
-consecutive "empty" classifications the bay reverts to baseline YOLO-only
+consecutive "empty" classifications the bay reverts to baseline diff-only
 scanning, since an LLM call every round for a bay with nothing happening
 is wasted latency and load.
 """
@@ -49,14 +53,10 @@ class BayState:
         self.zoomed_in = False
         self.last_classify_time = 0.0
         self.consecutive_empty = 0
-        # Frame-diff memoization for the baseline presence check (see
-        # BayMonitor._detect_presence): a thumbnail of the last ROI that
-        # actually got a real YOLO pass, the verdict that pass produced,
-        # and how many consecutive rounds have been skipped on the
-        # strength of "the scene hasn't changed" since then.
+        # Baseline presence check (see BayMonitor._detect_presence): a
+        # thumbnail of this ROI the last time it was looked at while
+        # empty, so the next look can tell whether the scene changed.
         self.presence_thumb = None
-        self.last_presence = False
-        self.consecutive_skips = 0
 
 
 def downscale(img, max_dimension: int):
@@ -250,10 +250,7 @@ class BayMonitor:
                                    and self.cfg["save_latest_frame"])
         self.states = {}
 
-        from ultralytics import YOLO
         config_dir = Path(config["_config_dir"])
-        model_path = config_dir / config["model_path"]
-        self.model = YOLO(str(model_path))
         self.references = load_reference_images(self.cfg, config_dir, self.log)
         self.session = requests.Session()
         # Cameras and the Ollama host are always on the local/internal
@@ -266,7 +263,7 @@ class BayMonitor:
         self.session.trust_env = False
         self.auth = build_auth(config)
         self.log.info(
-            f"bay monitor started: model={model_path} "
+            f"bay monitor started: "
             f"baseline_interval={self.cfg['baseline_scan_interval_ms']}ms "
             f"classify_interval={self.cfg['classify_interval_sec']}s "
             f"classify_region={self.classify_region} "
@@ -357,40 +354,39 @@ class BayMonitor:
         return roi
 
     def _detect_presence(self, bay: str, roi, state: BayState) -> bool:
-        """Cheap "is anything there at all" check -- no size/position
-        filtering, any box counts. Runs at presence_imgsz rather than the
-        detector's default, since it only needs a yes/no, not a precise box.
+        """Is the ROI's scene different from the last time this bay was
+        looked at while empty -- a truck, forklift, person, or open door
+        changing the pixels, whatever it is. Deliberately NOT plate
+        detection: this used to reuse the ALPR YOLO model (any box =
+        presence), but a plate is frequently not visible at all from a
+        dock camera's angle on a reversed-in trailer, which made the
+        monitor blind to exactly the trucks it exists to track. Presence
+        here has nothing to do with whether a plate can be read -- that's
+        the ALPR pipeline's job, entirely separate from "what's happening
+        at this bay right now."
 
-        Before paying for that YOLO pass at all, compares a small
-        thumbnail of this ROI against the one from the last round that
-        actually ran inference: a resize+diff is roughly three orders of
-        magnitude cheaper than a detection pass (measured ~100us vs
-        ~100-300ms), and an empty bay's ROI is pixel-for-pixel static
-        between one 2-second poll and the next, so most rounds for most
-        bays pay only the diff. A change big enough to matter -- a truck
-        arriving -- moves far more pixels than presence_diff_threshold
-        tolerates, so this cannot miss an arrival. presence_diff_max_skip
-        forces a real check periodically regardless of how static the
-        diff looks, as a safety net against slow drift (e.g. gradually
-        shifting light) a single-frame-to-frame diff would never trip."""
-        if self.cfg["presence_diff_enabled"]:
-            thumb = thumbnail(roi, self.presence_diff_resize)
-            if (state.presence_thumb is not None
-                    and state.consecutive_skips < self.cfg["presence_diff_max_skip"]
-                    and duplicate_thumbs(thumb, state.presence_thumb,
-                                         self.cfg["presence_diff_threshold"])):
-                state.consecutive_skips += 1
-                return state.last_presence
-        else:
-            thumb = None
+        A resize+diff (~100us) is the whole test, run every baseline
+        round -- there's no expensive model pass to gate here, so unlike
+        the old YOLO-backed version there's nothing to skip or
+        periodically re-verify against. presence_diff_enabled=False
+        bypasses the check and reports presence unconditionally (useful
+        to force classification on every round while tuning
+        classify_interval_sec/the prompt)."""
+        if not self.cfg["presence_diff_enabled"]:
+            return True
 
-        results = self.model(roi, conf=self.cfg["presence_conf_threshold"],
-                              imgsz=self.cfg["presence_imgsz"], verbose=False)
-        presence = any(len(r.boxes) > 0 for r in results)
+        thumb = thumbnail(roi, self.presence_diff_resize)
+        if state.presence_thumb is None:
+            # No history yet for this bay -- establish the baseline
+            # rather than call a single frame "presence" with nothing to
+            # compare it against.
+            state.presence_thumb = thumb
+            return False
+
+        changed = not duplicate_thumbs(thumb, state.presence_thumb,
+                                        self.cfg["presence_diff_threshold"])
         state.presence_thumb = thumb
-        state.last_presence = presence
-        state.consecutive_skips = 0
-        return presence
+        return changed
 
     def _scan_bay(self, bay: str, cam: dict, state: BayState):
         """One bay's turn: fetch a frame, then either check for presence
@@ -405,15 +401,14 @@ class BayMonitor:
                 return
             state.zoomed_in = True
             state.consecutive_empty = 0
-            # The cached thumbnail/verdict describe the pre-arrival scene
-            # and are meaningless once this bay reverts to baseline again
+            # The cached thumbnail describes the pre-arrival scene and is
+            # meaningless once this bay reverts to baseline again
             # (whether "unchanged" then means "still that truck" or
             # "back to empty" is exactly what a stale cache can't tell) --
-            # clear them so the first baseline check after this visit
-            # always runs a real detection rather than trusting a diff
+            # clear it so the first baseline check after this visit
+            # establishes a fresh empty baseline rather than diffing
             # against a frame from before the truck showed up.
             state.presence_thumb = None
-            state.consecutive_skips = 0
             self.log.info(f"({bay}) presence detected, zooming in")
 
         # Which pixels the vision model judges. "full_frame" (default)
@@ -446,7 +441,6 @@ class BayMonitor:
                 # whatever the presence cache held describes the scene
                 # while a truck was there, not the just-emptied bay.
                 state.presence_thumb = None
-                state.consecutive_skips = 0
                 departed = True
                 self.log.info(f"({bay}) {state.consecutive_empty} consecutive "
                               f"'{self.empty_status}' reads, reverting to "

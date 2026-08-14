@@ -220,6 +220,24 @@
 #       "thinking" trace before their actual answer unless told not to.
 #       Harmless to leave on for non-reasoning models, which simply
 #       ignore a field they don't recognize.
+#   19. Supersedes the presence-check design from items #11 and #14:
+#       bay_monitor no longer loads or calls the ALPR YOLO plate model at
+#       all. That reuse was wrong for what presence detection needs to
+#       answer -- a bay is occupied or not regardless of whether a plate
+#       happens to be visible in frame, and a reversed-in trailer's plate
+#       usually faces away from the dock camera entirely, so gating
+#       "zoomed in" on a detected plate box left the monitor blind to
+#       exactly the trucks it exists to track (it would never zoom in,
+#       never classify, and never report anything for that bay's whole
+#       visit). "bay_monitor._detect_presence" is now a pure frame-diff
+#       against the ROI's last-seen-empty thumbnail -- any meaningful
+#       visual change (truck, forklift, person, open door) counts,
+#       independent of plate visibility or the ALPR pipeline entirely.
+#       Since there's no expensive model pass left to gate, the old
+#       skip-N-rounds/periodic-recheck machinery ("presence_diff_max_
+#       skip", "presence_conf_threshold", "presence_imgsz") is gone too
+#       -- every baseline round now runs the (~100us) diff directly, with
+#       nothing to skip.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

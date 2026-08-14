@@ -109,10 +109,20 @@ class BayStateEngine:
         of a visit). Fired on every state change -- arrival, a plate
         getting confirmed, departure -- so a downstream consumer (or
         someone troubleshooting) can see the engine reacting in real
-        time instead of waiting for a visit to conclude."""
+        time instead of waiting for a visit to conclude.
+
+        occupancy_status/activity are included here too (not just on
+        mqtt.bay_notification_topic_prefix) since this is the topic
+        someone watching the engine is most likely already subscribed
+        to -- "open" alone reads as session-lifecycle jargon, not the
+        occupied/empty answer that's actually wanted. activity is
+        bay_monitor's own raw word (e.g. "loading"/"idle"), which may be
+        finer than the occupied/empty occupancy_status."""
         topic = f"{self.state_topic_prefix}/{session.bay}"
         payload = {
             "bay": session.bay,
+            "occupancy_status": "occupied" if session.open else "empty",
+            "activity": self.bay_status.get(session.bay, ""),
             "open": session.open,
             "direction": session.direction,
             "plate": session.plate,

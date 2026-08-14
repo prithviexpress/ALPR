@@ -373,6 +373,16 @@
 #           its own timer per bay regardless of activity, so a
 #           downstream consumer always has a recent frame without
 #           waiting for (or triggering) a status change. 0 disables it.
+#   25. mqtt.bay_state_topic_prefix's payload gained "occupancy_status"
+#       ("occupied"/"empty") and "activity" (bay_monitor's raw
+#       classification word) fields -- a real user watching this topic
+#       only saw "open": true/false and asked "what is this open, I
+#       wanted occupancy". "open" is left in place (it's the session-
+#       lifecycle boolean bay_state_engine itself reasons about, and is
+#       functionally the same signal), but occupancy_status/activity are
+#       now right there in the SAME message, not only on the separate
+#       mqtt.bay_notification_topic_prefix (item #24) someone would have
+#       had to discover and subscribe to separately.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (only actually used if http_trigger.enabled is

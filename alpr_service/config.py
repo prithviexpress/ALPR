@@ -112,6 +112,35 @@ def load_config(path: Path = None) -> dict:
     # tracks truck_number) -- bay_monitor alone has no truck identity to
     # report.
     mqtt.setdefault("bay_notification_topic_prefix", "site/alpr/bay_notification")
+    # The lean, consumer-facing topic ("/<bay>" appended) and the only
+    # one published by default: exactly the events a dock system needs --
+    # a truck came in, which truck it is, it left -- at roughly three
+    # messages per visit.
+    #   arrived     {truck_number (usually the UNKNOWN placeholder this
+    #               early -- the ALPR read takes seconds), door_state,
+    #               alert}. alert is "door_open_on_arrival" when the
+    #               truck backed in with its doors ALREADY open, else
+    #               null.
+    #   identified  {truck_number, confidence, door_state} -- the plate
+    #               resolving for a truck whose arrival already went out
+    #               unidentified. Not published if the plate was already
+    #               known at arrival, so there's never a redundant pair.
+    #   departed    {truck_number, door_state, duration_sec}
+    # Requires bay_state_engine.enabled (only it tracks truck identity).
+    mqtt.setdefault("bay_event_topic_prefix", "site/alpr/bay_event")
+    # Which of the four bay topics actually publish. The three older ones
+    # default OFF: between them they emit dozens of messages per visit --
+    # bay_status on EVERY classification, bay_state on every session
+    # transition, bay_notification on every activity change -- which
+    # buries the handful of events a consumer actually cares about.
+    # bay_event says the same thing in ~3 messages, and the on-demand
+    # webhook (bay_monitor.snapshot_webhook_*) answers everything else on
+    # request rather than by broadcasting it. Turn the older ones back on
+    # individually if something is already consuming them.
+    mqtt.setdefault("publish_bay_event", True)
+    mqtt.setdefault("publish_bay_status", False)
+    mqtt.setdefault("publish_bay_state", False)
+    mqtt.setdefault("publish_bay_notification", False)
 
     # An alternative trigger source to the MQTT VCA events above: some
     # cameras (e.g. a Bosch dome's built-in "HTTP notification" alarm
@@ -457,6 +486,60 @@ def load_config(path: Path = None) -> dict:
     # change what gets classified, or vice versa.
     bay_monitor.setdefault("snapshot_webhook_max_dimension", 640)
     bay_monitor.setdefault("snapshot_webhook_jpeg_quality", 80)
+
+    # Which backend answers "what is happening at this bay".
+    #   "yolo"    a purpose-trained truck/door detection model
+    #             (truck_model_path). ~50ms per frame, deterministic, and
+    #             it reports door state, which the VLM never did reliably.
+    #             Worth understanding why the speed matters beyond the
+    #             obvious: bay_monitor scans every bay from ONE thread,
+    #             so a multi-second VLM call doesn't just delay that bay,
+    #             it stalls the round-robin for every bay queued behind
+    #             it. It also removes the failure mode where a timing-out
+    #             VLM leaves a bay with no status at all indefinitely.
+    #   "ollama"  the original vision-model prompt (classification_prompt
+    #             + status_values + reference_images).
+    # The VLM stays reachable either way for on-demand questions (the
+    # webhook's POST /bay/<bay>/ask) -- routine status is a closed-
+    # vocabulary question a detector answers better, while open questions
+    # ("loading or unloading?") are what a VLM is actually good at.
+    bay_monitor.setdefault("classifier", "ollama")
+    # The trained truck/door weights, resolved relative to config.json
+    # (like model_path and the PaddleOCR dirs). Only read when
+    # classifier == "yolo"; startup fails loudly if it's missing then,
+    # rather than silently reporting every bay as empty forever.
+    bay_monitor.setdefault("truck_model_path", "Truck_model.pt")
+    bay_monitor.setdefault("truck_conf_threshold", 0.4)
+    # Trucks are large objects filling much of the frame, so detection
+    # doesn't need the 640 a plate would -- 416 is 2-3x cheaper for the
+    # same answer. Raise it if small/distant trucks are being missed.
+    bay_monitor.setdefault("truck_imgsz", 416)
+    # Detected and reported (plate_visible), never used to decide
+    # presence: a bay is occupied whether or not a plate happens to be
+    # readable from the dock camera's angle, which is exactly why
+    # bay_monitor stopped using the ALPR plate model for presence.
+    bay_monitor.setdefault("truck_plate_class", "Number_Plate")
+    # Overrides/extends truck_detector.DEFAULT_CLASS_MAP, for a model
+    # retrained with different class names:
+    #   {"<class name>": {"status": "<one of status_values>",
+    #                     "door_state": "open"|"closed"}}
+    # Merged over the built-in map rather than replacing it, so a partial
+    # override doesn't silently drop the classes it didn't mention.
+    bay_monitor.setdefault("truck_class_map", {})
+    # Consecutive agreeing frames before a door-state CHANGE is believed,
+    # same reasoning as empty_debounce_count: a half-raised shutter or
+    # someone walking through the doorway shouldn't flip the reported
+    # state. Only affects the state the webhook reports -- the
+    # door-open-on-arrival alert deliberately uses the raw reading from
+    # the arrival frame itself, since that's a claim about one moment.
+    bay_monitor.setdefault("door_state_debounce_count", 2)
+    # Whether the truck-model backend also base64-encodes each classified
+    # frame for downstream payloads. Pure overhead unless something
+    # actually ships the image, so it follows the one topic that does.
+    # (The Ollama backend always has an encoded frame regardless -- it
+    # had to build one to make the call at all.)
+    bay_monitor.setdefault("attach_frame_to_status",
+                           mqtt["publish_bay_notification"])
     # Per-bay state engine (bay_state.py) -- fuses bay_monitor's
     # continuous status stream with ALPR plate reads into one session per
     # bay, and becomes the authority for enter/leave direction and

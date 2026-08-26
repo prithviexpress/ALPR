@@ -94,6 +94,22 @@ class BayState:
         # call just to answer "what do we think is happening right
         # now". None until the first classify ever succeeds.
         self.last_status = None
+        # Door state ("open"/"closed"), only ever set by the truck-model
+        # backend -- the Ollama backend answers with a status word alone
+        # and leaves this None. Debounced (see BayMonitor.
+        # _update_door_state): `door_state` is the CONFIRMED reading that
+        # gets reported, while pending_* accumulates agreement for a
+        # candidate change, so one misdetected frame can't flip what the
+        # webhook reports mid-visit.
+        self.door_state = None
+        self.pending_door_state = None
+        self.pending_door_count = 0
+        # The door state observed on the frame that detected this visit's
+        # arrival, kept separate from the debounced value above: "did this
+        # truck show up with its doors already open" is a question about
+        # one specific moment, and by the time a debounce has confirmed
+        # anything the arrival is over. None between visits.
+        self.arrival_door_state = None
 
 
 def downscale(img, max_dimension: int):
@@ -162,6 +178,37 @@ def load_reference_images(bm_cfg: dict, config_dir: Path, log) -> list:
     return refs
 
 
+def ollama_generate(prompt: str, images: list, bm_cfg: dict, log, bay: str,
+                     session: requests.Session = None):
+    """One POST to the local Ollama model: returns the reply text, or None
+    if the call failed (logged, never raised -- a flaky local LLM must not
+    take the scanner thread down).
+
+    Shared by classify_frame (the periodic status question) and
+    BayMonitor.ask (an operator's one-off question about a bay), so both
+    honor the same host/model/timeout/think settings and fail the same
+    way. `session` is optional on purpose: the scan loop passes its own
+    pooled Session, but a caller on ANOTHER thread (the webhook's /ask
+    route) must pass None and let `requests` open its own connection --
+    requests.Session isn't safe to share across threads."""
+    url = f"{bm_cfg['ollama_host'].rstrip('/')}/api/generate"
+    payload = {
+        "model": bm_cfg["ollama_model"],
+        "prompt": prompt,
+        "images": images,
+        "stream": False,
+        "think": bm_cfg["ollama_think"],
+    }
+    requester = session if session is not None else requests
+    try:
+        resp = requester.post(url, json=payload, timeout=bm_cfg["ollama_timeout_sec"])
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip()
+    except (requests.RequestException, ValueError) as e:
+        log.warning(f"({bay}) ollama call failed: {e}")
+        return None
+
+
 def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = None,
                     session: requests.Session = None):
     """POSTs one JPEG-encoded frame -- plus, if configured, a set of
@@ -206,21 +253,8 @@ def classify_frame(frame, bm_cfg: dict, log, bay: str, reference_images: list = 
     else:
         prompt = bm_cfg["classification_prompt"]
 
-    url = f"{bm_cfg['ollama_host'].rstrip('/')}/api/generate"
-    payload = {
-        "model": bm_cfg["ollama_model"],
-        "prompt": prompt,
-        "images": images,
-        "stream": False,
-        "think": bm_cfg["ollama_think"],
-    }
-    requester = session if session is not None else requests
-    try:
-        resp = requester.post(url, json=payload, timeout=bm_cfg["ollama_timeout_sec"])
-        resp.raise_for_status()
-        text = resp.json().get("response", "").strip()
-    except (requests.RequestException, ValueError) as e:
-        log.warning(f"({bay}) ollama classification call failed: {e}")
+    text = ollama_generate(prompt, images, bm_cfg, log, bay, session=session)
+    if text is None:
         return None, None, None
 
     status_text, comment = split_status_comment(text)
@@ -304,6 +338,15 @@ class BayMonitor:
         self.cfg = config["bay_monitor"]
         self.snap_cfg = config["snapshot"]
         self.status_topic_prefix = config["mqtt"]["bay_status_topic_prefix"]
+        # See _scan_bay: the per-classification firehose, off by default.
+        self.publish_status_topic = config["mqtt"]["publish_bay_status"]
+        # Whether the truck-model backend also base64-encodes each
+        # classified frame. Pure overhead unless something downstream
+        # actually ships the image (bay_notification), so config.py
+        # defaults this to whatever that topic is set to -- the Ollama
+        # backend always has the encoded frame anyway, since it had to
+        # build one to make the call.
+        self.attach_frame_to_status = self.cfg["attach_frame_to_status"]
         self.empty_status = self.cfg["empty_status"]
         self.classify_region = self.cfg["classify_region"]
         self.scan_interval_sec = self.cfg["baseline_scan_interval_ms"] / 1000
@@ -327,6 +370,36 @@ class BayMonitor:
 
         config_dir = Path(config["_config_dir"])
         self.references = load_reference_images(self.cfg, config_dir, self.log)
+
+        # Which backend answers "what's happening at this bay" -- see
+        # _classify. "yolo" uses the purpose-trained truck/door model
+        # (fast, deterministic, also reports door state); "ollama" is the
+        # original vision-model prompt. The VLM stays reachable either
+        # way for on-demand questions (see ask()), which is the point of
+        # keeping both: routine status is a closed-vocabulary question a
+        # detector answers better, while open questions are what a VLM is
+        # actually good at.
+        self.classifier = self.cfg["classifier"]
+        self.detector = None
+        if self.classifier == "yolo":
+            # Weights checked BEFORE importing the detector: a missing
+            # .pt is by far the likelier misconfiguration, and it should
+            # report itself as such rather than as whatever error the
+            # ultralytics import happens to raise on a machine where the
+            # dependency is also missing.
+            model_path = config_dir / self.cfg["truck_model_path"]
+            if not model_path.exists():
+                raise FileNotFoundError(
+                    f"bay_monitor.classifier is 'yolo' but the truck model "
+                    f"{model_path} does not exist -- point "
+                    f"bay_monitor.truck_model_path at the trained weights "
+                    f"(relative to config.json), or set classifier to "
+                    f"'ollama'")
+            # Imported lazily: a deployment running the ollama backend
+            # shouldn't need the truck model file to exist at all.
+            from .truck_detector import TruckDetector
+            self.detector = TruckDetector(model_path, self.cfg, self.log)
+        self.door_debounce_count = self.cfg["door_state_debounce_count"]
         self.session = requests.Session()
         # Cameras and the Ollama host are always on the local/internal
         # network. `requests` honors HTTP_PROXY/HTTPS_PROXY env vars and
@@ -344,6 +417,7 @@ class BayMonitor:
             f"classify_region={self.classify_region} "
             f"classify_max_dim={self.cfg['classify_max_dimension']} "
             f"presence_diff_enabled={self.cfg['presence_diff_enabled']} "
+            f"classifier={self.classifier} "
             f"ollama={self.cfg['ollama_host']} model={self.cfg['ollama_model']}")
 
     def run(self, stop_event: threading.Event):
@@ -568,6 +642,148 @@ class BayMonitor:
             "timestamp": mtime.isoformat(),
         }
 
+    def get_state(self, bay: str):
+        """This bay's current known state, without an image and without
+        triggering any camera fetch or model call -- what the webhook's
+        GET /bay/<bay> answers with. None for an unrecognized bay.
+
+        Everything here is last-known rather than freshly measured: the
+        point is a cheap query a dashboard can poll, not a new reading.
+        door_state is the DEBOUNCED value (see _update_door_state), so a
+        poller never sees it flicker on a single misdetected frame."""
+        if bay not in self.cameras:
+            return None
+        state = self.states.get(bay)
+        if state is None:
+            # Known camera, but its first turn hasn't come round yet.
+            return {"bay": bay, "occupancy_status": None, "activity": None,
+                    "door_state": None, "classified": False,
+                    "last_classified": None}
+        occupancy_status = None
+        if state.last_status is not None:
+            occupancy_status = ("empty" if state.last_status == self.empty_status
+                                else "occupied")
+        last_classified = None
+        if state.last_classify_time:
+            last_classified = datetime.fromtimestamp(
+                state.last_classify_time, tz=timezone.utc).isoformat()
+        return {
+            "bay": bay,
+            "occupancy_status": occupancy_status,
+            "activity": state.last_status,
+            "door_state": state.door_state,
+            "classified": state.classified_once,
+            "last_classified": last_classified,
+        }
+
+    def get_all_states(self):
+        """Every configured bay's state in one call -- so a dashboard
+        makes one request instead of one per bay."""
+        return [self.get_state(bay) for bay in self.cameras]
+
+    def ask(self, bay: str, question: str):
+        """Put an arbitrary question to the vision model about this bay's
+        most recent frame. This is what the VLM is FOR once the truck
+        model handles routine status: open questions a fixed detector
+        vocabulary can't answer -- "is it being loaded or unloaded",
+        "how many people are working", "is anything blocking the bay".
+
+        Deliberately on-demand only. Reads the same saved frame
+        get_snapshot serves rather than fetching a new one (same
+        cross-thread reasoning), and passes session=None so the Ollama
+        call opens its own connection instead of borrowing the scan
+        loop's Session from whatever thread is serving the request.
+
+        Returns None if there's no frame to ask about; a dict with
+        answer=None if the model call itself failed."""
+        if bay not in self.cameras or self.audit_dir is None:
+            return None
+        frame_path = self.audit_dir / bay / "latest_frame.jpg"
+        if not frame_path.exists():
+            return None
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            return None
+        image_b64 = encode_image(img, self.cfg["classify_max_dimension"],
+                                  self.cfg["classify_jpeg_quality"])
+        if image_b64 is None:
+            return None
+        mtime = datetime.fromtimestamp(frame_path.stat().st_mtime, tz=timezone.utc)
+        answer = ollama_generate(question, [image_b64], self.cfg, self.log,
+                                  bay, session=None)
+        return {
+            "bay": bay,
+            "question": question,
+            "answer": answer,
+            "model": self.cfg["ollama_model"],
+            "frame_timestamp": mtime.isoformat(),
+        }
+
+    def _classify(self, bay: str, img):
+        """Whichever backend bay_monitor.classifier selects, normalized to
+        one shape so _scan_bay doesn't care which produced the answer.
+        Returns None when the backend couldn't produce a usable reading
+        (a failed/timed-out Ollama call), which _scan_bay treats the same
+        either way: no status, no state change.
+
+        door_state/plate_visible/confidence are None on the Ollama path --
+        it answers with a status word and a comment, and inventing values
+        for what it didn't report would be worse than saying "unknown"."""
+        if self.detector is not None:
+            result = self.detector.detect(img, self.empty_status)
+            self.log.debug(f"({bay}) truck model: {result['class_name']} "
+                            f"conf={result['confidence']} "
+                            f"({result['inference_ms']}ms) -> "
+                            f"{result['status']}, counts={result['counts']}")
+            image_b64 = None
+            if self.attach_frame_to_status:
+                image_b64 = encode_image(img, self.cfg["classify_max_dimension"],
+                                          self.cfg["classify_jpeg_quality"])
+            return {"status": result["status"], "comment": result["comment"],
+                    "image_b64": image_b64, "door_state": result["door_state"],
+                    "plate_visible": result["plate_visible"],
+                    "confidence": result["confidence"]}
+
+        status, comment, image_b64 = classify_frame(
+            img, self.cfg, self.log, bay, self.references, session=self.session)
+        if status is None:
+            return None
+        return {"status": status, "comment": comment, "image_b64": image_b64,
+                "door_state": None, "plate_visible": None, "confidence": None}
+
+    def _update_door_state(self, bay: str, state: BayState, observed):
+        """Fold this frame's door reading into the bay's CONFIRMED door
+        state, requiring bay_monitor.door_state_debounce_count consecutive
+        agreeing frames before accepting a change -- the same reasoning
+        behind empty_debounce_count: a single misdetected frame (a
+        half-raised shutter, someone walking through the doorway) must not
+        flip what the webhook reports mid-visit.
+
+        Only the debounced value is reported by get_state. The arrival
+        alert deliberately uses the RAW per-frame reading instead (see
+        _scan_bay) -- "did this truck arrive with its doors open" is a
+        question about one specific moment, and waiting several frames to
+        confirm it would mean answering a different question."""
+        if observed is None:
+            return
+        if observed == state.door_state:
+            state.pending_door_state = None
+            state.pending_door_count = 0
+            return
+        if observed == state.pending_door_state:
+            state.pending_door_count += 1
+        else:
+            state.pending_door_state = observed
+            state.pending_door_count = 1
+        if state.pending_door_count < self.door_debounce_count:
+            return
+        previous = state.door_state
+        state.door_state = observed
+        state.pending_door_state = None
+        state.pending_door_count = 0
+        self.log.info(f"({bay}) door state {previous} -> {observed} "
+                       f"({self.door_debounce_count} consecutive reads)")
+
     def _scan_bay(self, bay: str, cam: dict, state: BayState):
         """One bay's turn: fetch a frame, then either check for presence
         (baseline) or classify activity (zoomed in)."""
@@ -610,20 +826,34 @@ class BayMonitor:
         # ADJACENT bay that's in shot can then drive this bay's status.
         # "roi" removes that cross-talk at the cost of a narrower view.
         classify_img = roi if (self.classify_region == "roi" and roi is not None) else frame
-        status, comment, image_b64 = classify_frame(
-            classify_img, self.cfg, self.log, bay,
-            self.references, session=self.session)
+        result = self._classify(bay, classify_img)
         state.last_classify_time = time.time()
-        if status is None:
+        if result is None:
             return
+        status = result["status"]
+        comment = result["comment"]
+        image_b64 = result["image_b64"]
+        # This frame's RAW door reading -- not state.door_state, which is
+        # debounced. The arrival alert below needs what was actually seen
+        # at the moment the truck was first detected.
+        door_state = result["door_state"]
         state.classified_once = True
         state.last_status = status
+        self._update_door_state(bay, state, door_state)
 
         timestamp = datetime.now(timezone.utc).isoformat()
-        topic = f"{self.status_topic_prefix}/{bay}"
-        self.publish(topic, json.dumps(
-            {"bay": bay, "status": status, "timestamp": timestamp}))
-        self.log.info(f"({bay}) status={status} -> {topic}")
+        # Off by default: this fires on EVERY classification regardless of
+        # whether anything changed, which is the single biggest source of
+        # MQTT traffic this service produces. bay_event (bay_state.py) is
+        # the topic meant for consumers; this one is a firehose kept for
+        # debugging and for anyone who was already consuming it.
+        if self.publish_status_topic:
+            topic = f"{self.status_topic_prefix}/{bay}"
+            self.publish(topic, json.dumps(
+                {"bay": bay, "status": status, "timestamp": timestamp}))
+            self.log.info(f"({bay}) status={status} -> {topic}")
+        else:
+            self.log.info(f"({bay}) status={status}")
 
         # Whether this classify counts as an arrival (or a departure) is
         # decided HERE, from the actual answer, rather than earlier from
@@ -636,6 +866,10 @@ class BayMonitor:
         if occupied:
             if not state.zoomed_in:
                 state.zoomed_in = True
+                # Captured from THIS frame, before any debounce, because
+                # "the truck arrived with its doors already open" is a
+                # claim about this exact moment -- see _update_door_state.
+                state.arrival_door_state = door_state
                 # The cached thumbnails describe the pre-arrival scene
                 # and are meaningless once this bay reverts to baseline
                 # again (whether "unchanged" then means "still that
@@ -654,16 +888,18 @@ class BayMonitor:
                 state.presence_thumb = None
                 state.classify_thumb = None
                 departed = True
+                state.arrival_door_state = None
                 self.log.info(f"({bay}) {state.consecutive_empty} consecutive "
                               f"'{self.empty_status}' reads, reverting to "
                               f"baseline scan")
         # else: a first-look (or otherwise not-yet-zoomed) result came
         # back empty -- already at baseline, nothing to revert.
 
-        self._notify(bay, status, timestamp, occupied, departed, comment, image_b64)
+        self._notify(bay, status, timestamp, occupied, departed, comment,
+                     image_b64, door_state)
 
     def _notify(self, bay, status, timestamp, occupied, departed,
-                comment=None, image_b64=None):
+                comment=None, image_b64=None, door_state=None):
         """Hand the reading to a consumer as an already-interpreted event.
 
         `occupied` and `departed` are decided here rather than shipping
@@ -672,16 +908,23 @@ class BayMonitor:
         derive from. A consumer re-deriving either would hold a second
         copy of a threshold that can drift out of sync with this one.
 
-        `comment` and `image_b64` are the LLM's free-text description and
-        the exact frame it was shown, passed through so a consumer (e.g.
+        `comment` and `image_b64` are the backend's free-text description
+        and the classified frame, passed through so a consumer (e.g.
         bay_state_engine) can build a richer notification without
         re-fetching or re-classifying anything itself.
+
+        `door_state` is this frame's raw "open"/"closed" reading from the
+        truck-model backend (None on the Ollama backend, which doesn't
+        report it). Deliberately the raw value rather than the debounced
+        one: the consumer uses it to decide whether a truck ARRIVED with
+        its doors open, which is about this instant -- see
+        _update_door_state.
         """
         if self.on_status is None:
             return
         try:
             self.on_status(bay, status, timestamp, occupied, departed,
-                            comment, image_b64)
+                            comment, image_b64, door_state)
         except Exception:
             self.log.error(f"({bay}) on_status hook raised", exc_info=True)
 

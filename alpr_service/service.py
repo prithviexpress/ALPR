@@ -39,18 +39,42 @@ def check_snapshot_credentials(config: dict, log):
         raise SystemExit(1)
 
 
+VALID_CLASSIFIERS = ("yolo", "ollama")
+
+
 def check_bay_monitor_config(config: dict, log):
-    """Fail fast at startup if bay_monitor is enabled but ollama_model
-    isn't set -- there's no sane default (it has to match a tag actually
-    pulled into the local Ollama install), and running with it unset would
-    mean every single classification call silently fails instead of
-    surfacing the misconfiguration once, up front."""
+    """Fail fast at startup on a bay_monitor config that would otherwise
+    fail silently on every single frame instead of once, up front:
+
+    - an unrecognized classifier (a typo would fall through to whichever
+      branch _classify happens to take, not to an error)
+    - classifier="ollama" without ollama_model, which has no sane default
+      (it must match a tag actually pulled into the local Ollama install)
+    - classifier="yolo" without a vision model configured is FINE -- that
+      only costs the on-demand /ask route, so it warns rather than
+      exiting. The truck model's own weights are checked when BayMonitor
+      loads them.
+    """
     bm_cfg = config["bay_monitor"]
-    if bm_cfg["enabled"] and not bm_cfg.get("ollama_model"):
-        log.error("bay_monitor.enabled is true but bay_monitor.ollama_model "
-                  "is not set -- set it to a vision model tag you've pulled "
-                  "locally via `ollama pull <tag>` (e.g. a Qwen VL tag)")
+    if not bm_cfg["enabled"]:
+        return
+
+    classifier = bm_cfg["classifier"]
+    if classifier not in VALID_CLASSIFIERS:
+        log.error(f"bay_monitor.classifier is {classifier!r}, which is not "
+                  f"one of {VALID_CLASSIFIERS}")
         raise SystemExit(1)
+
+    if not bm_cfg.get("ollama_model"):
+        if classifier == "ollama":
+            log.error("bay_monitor.classifier is 'ollama' but bay_monitor."
+                      "ollama_model is not set -- set it to a vision model "
+                      "tag you've pulled locally via `ollama pull <tag>` "
+                      "(e.g. a Qwen VL tag)")
+            raise SystemExit(1)
+        log.warning("bay_monitor.ollama_model is not set -- the truck model "
+                    "handles classification, but the on-demand vision query "
+                    "route (POST /bay/<bay>/ask) will not work without it")
 
 
 def check_bay_state_config(config: dict, log):
@@ -192,18 +216,58 @@ def start_http_trigger(cameras: dict, config: dict, bus: JobBus, log) -> threadi
     return t
 
 
-def start_snapshot_webhook(monitor, config: dict, log) -> threading.Thread:
-    """Starts the on-demand snapshot server (config "bay_monitor.
+def build_bay_state_query(monitor, state_engine):
+    """Composes the two halves of a bay's state into one answer for the
+    webhook: bay_monitor knows occupancy/activity/door (it watches the
+    camera), and bay_state_engine knows identity -- which truck, how
+    confident, how long it's been here (it tracks plate reads). Neither
+    can answer /bay/<bay> alone.
+
+    Composed here rather than giving either module a reference to the
+    other: bay_state_engine already depends on bay_monitor (it consumes
+    on_status), and pointing bay_monitor back at the engine would make
+    that circular for no reason beyond this one query. Returns
+    (get_state, list_states)."""
+    def get_state(bay):
+        state = monitor.get_state(bay)
+        if state is None:
+            return None
+        if state_engine is not None:
+            # Session info second: where both report door_state, the
+            # engine's is the value that came with the last status
+            # update, and bay_monitor's is its debounced view -- the
+            # engine's is what the events were published against, so a
+            # query and an event never disagree.
+            state.update(state_engine.get_session_info(bay))
+        return state
+
+    def list_states():
+        return [s for s in (get_state(bay) for bay in monitor.cameras)
+                if s is not None]
+
+    return get_state, list_states
+
+
+def start_snapshot_webhook(monitor, state_engine, config: dict, log) -> threading.Thread:
+    """Starts the on-demand bay query server (config "bay_monitor.
     snapshot_webhook_*") in a background thread, served by waitress --
     same reasoning as start_http_trigger above. A separate server/port
-    from http_trigger on purpose: receiving camera alerts and serving
-    snapshots-on-request are unrelated concerns, and a deployment may
+    from http_trigger on purpose: receiving camera alerts and answering
+    queries about bay state are unrelated concerns, and a deployment may
     want one without the other."""
     from waitress import serve
     from .snapshot_webhook import build_snapshot_webhook_app
 
     bm_cfg = config["bay_monitor"]
-    app = build_snapshot_webhook_app(monitor.get_snapshot)
+    get_state, list_states = build_bay_state_query(monitor, state_engine)
+    app = build_snapshot_webhook_app(
+        monitor.get_snapshot, get_state_fn=get_state,
+        list_states_fn=list_states,
+        # Only offered when there's a vision model configured to answer
+        # with -- otherwise the route reports itself unavailable (501)
+        # rather than failing per-request against a model that was never
+        # set.
+        ask_fn=monitor.ask if bm_cfg.get("ollama_model") else None)
 
     def _run():
         try:
@@ -217,10 +281,12 @@ def start_snapshot_webhook(monitor, config: dict, log) -> threading.Thread:
 
     t = threading.Thread(target=_run, daemon=True, name="snapshot-webhook")
     t.start()
-    log.info(f"snapshot webhook listening on http://"
-              f"{bm_cfg['snapshot_webhook_host']}:"
-              f"{bm_cfg['snapshot_webhook_port']}/snapshot/<bay> "
-              f"(threads={bm_cfg['snapshot_webhook_threads']})")
+    base = (f"http://{bm_cfg['snapshot_webhook_host']}:"
+            f"{bm_cfg['snapshot_webhook_port']}")
+    log.info(f"bay query webhook listening on {base} "
+              f"(threads={bm_cfg['snapshot_webhook_threads']}) -- "
+              f"GET {base}/bays, GET {base}/bay/<bay>, "
+              f"GET {base}/snapshot/<bay>, POST {base}/bay/<bay>/ask")
     return t
 
 
@@ -349,7 +415,7 @@ def main():
             audit_dir=AUDIT_DIR)
         stoppables.append(bay_monitor_stop)
         if bay_monitor_cfg["snapshot_webhook_enabled"]:
-            start_snapshot_webhook(monitor, config, log)
+            start_snapshot_webhook(monitor, state_engine, config, log)
 
     # Shared by every worker so their first-run model loading (in
     # particular PaddleOCR's download-if-missing check against the one

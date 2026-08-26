@@ -35,6 +35,7 @@ State is in-memory only -- a restart loses any in-progress session.
 import csv
 import json
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,8 +43,8 @@ from .logging_setup import get_logger
 from .mqtt_bus import make_job
 from .results import build_reply, result_topic, should_publish
 
-CSV_FIELDS = ["bay", "bay_status", "session_open", "direction", "plate",
-              "confidence", "read_attempts", "last_updated"]
+CSV_FIELDS = ["bay", "bay_status", "door_state", "session_open", "direction",
+              "plate", "confidence", "read_attempts", "last_updated"]
 
 
 class BaySession:
@@ -91,6 +92,31 @@ class BayStateEngine:
         self.max_read_attempts = config["alpr"]["max_read_attempts"]
         self.state_topic_prefix = config["mqtt"]["bay_state_topic_prefix"]
         self.notification_topic_prefix = config["mqtt"]["bay_notification_topic_prefix"]
+        self.event_topic_prefix = config["mqtt"]["bay_event_topic_prefix"]
+        # The three older topics all fire far more often than a consumer
+        # who only wants "a truck came in / left, and which truck" needs
+        # -- bay_status on every single classification, bay_state on every
+        # session transition, bay_notification on every activity change.
+        # bay_event (see _publish_event) answers exactly that question in
+        # ~3 messages per visit, so it's the only one on by default; the
+        # others stay available for anyone already consuming them.
+        self.publish_state_topic = config["mqtt"]["publish_bay_state"]
+        self.publish_notification_topic = config["mqtt"]["publish_bay_notification"]
+        self.publish_event_topic = config["mqtt"]["publish_bay_event"]
+        # Per-bay door state as last reported by bay_monitor's truck-model
+        # backend, for the CSV and for enriching events. None-valued for
+        # the Ollama backend, which doesn't report door state at all.
+        self.bay_door_state = {bay: None for bay in cameras}
+        # Bays whose "arrived" event went out with no confirmed plate yet
+        # -- an "identified" event is published for these if the plate
+        # later resolves (see on_alpr_result). Discarded at departure, so
+        # a plate confirmed after the truck already left can't emit one.
+        self.awaiting_identity = set()
+        # Wall-clock arrival time per open session, so the departure event
+        # can report how long the truck was at the bay -- the single most
+        # asked-for number about a dock visit, and nothing else in this
+        # service records it.
+        self.arrival_time = {}
         # A one-row-per-bay CSV snapshot of current state, rewritten in
         # full on every on_status()/on_alpr_result() call -- MQTT
         # requires a client and a subscription just to see "what's
@@ -118,6 +144,8 @@ class BayStateEngine:
         occupied/empty answer that's actually wanted. activity is
         bay_monitor's own raw word (e.g. "loading"/"idle"), which may be
         finer than the occupied/empty occupancy_status."""
+        if not self.publish_state_topic:
+            return
         topic = f"{self.state_topic_prefix}/{session.bay}"
         payload = {
             "bay": session.bay,
@@ -146,6 +174,8 @@ class BayStateEngine:
         high-frequency topic light) and from bay_state_topic_prefix
         (fires on session transitions, not activity changes, and has no
         comment/image either)."""
+        if not self.publish_notification_topic:
+            return
         topic = f"{self.notification_topic_prefix}/{bay}"
         payload = {
             "bay": bay,
@@ -160,6 +190,63 @@ class BayStateEngine:
         self.log.info(f"({bay}) activity changed -> '{status}' "
                        f"(truck_number={truck_number}), notification "
                        f"published to {topic}")
+
+    def get_session_info(self, bay: str) -> dict:
+        """This bay's session state for the webhook's /bay/<bay> query --
+        the identity half of the answer (which truck, how confident, how
+        long it's been here), which bay_monitor can't know because it
+        never sees a plate. Returns an empty dict for an unrecognized bay
+        so a caller can merge it unconditionally.
+
+        Takes the lock: a query arrives on the webhook's thread while
+        on_status/on_alpr_result may be mutating these same fields from
+        the monitor's and workers' threads."""
+        with self.lock:
+            session = self.sessions.get(bay)
+            if session is None:
+                return {}
+            arrived_at = self.arrival_time.get(bay)
+            return {
+                "session_open": session.open,
+                "truck_number": session.plate or self.unknown_plate_value,
+                "plate_confirmed": session.plate is not None,
+                "confidence": session.confidence,
+                "read_attempts": session.read_attempts,
+                "door_state": self.bay_door_state.get(bay),
+                "duration_sec": (int(time.time() - arrived_at)
+                                 if arrived_at is not None else None),
+            }
+
+    def _publish_event(self, bay: str, event: str, timestamp: str, **fields):
+        """The lean, consumer-facing topic: exactly the events a dock
+        system asked for -- a truck came in, which truck it is, it left --
+        and nothing else. Roughly three messages per visit, against the
+        dozens the older topics produce between them.
+
+        Three event types:
+          arrived     a truck was detected at an empty bay. Carries
+                      whatever plate is known (usually none yet -- the
+                      ALPR read takes seconds), plus door_state, and
+                      alert="door_open_on_arrival" when it showed up with
+                      its doors already open.
+          identified  the plate resolved for a truck whose "arrived"
+                      already went out unidentified. Not published when
+                      the plate was already known at arrival, so a
+                      consumer never sees a redundant pair.
+          departed    the bay emptied out. Carries the truck number this
+                      visit concluded with and how long it stayed.
+
+        Every event carries bay/event/timestamp; the rest varies by type
+        rather than padding all three with nulls."""
+        if not self.publish_event_topic:
+            return
+        topic = f"{self.event_topic_prefix}/{bay}"
+        payload = {"bay": bay, "event": event, "timestamp": timestamp}
+        payload.update(fields)
+        self.publish(topic, json.dumps(payload, default=str))
+        detail = " ".join(f"{k}={v}" for k, v in fields.items()
+                          if k != "image_base64")
+        self.log.info(f"({bay}) event '{event}' -> {topic} ({detail})")
 
     def _write_csv(self):
         """Overwrite bay_state.csv with the current snapshot of every
@@ -183,6 +270,7 @@ class BayStateEngine:
                     writer.writerow({
                         "bay": bay,
                         "bay_status": self.bay_status.get(bay, ""),
+                        "door_state": self.bay_door_state.get(bay) or "",
                         "session_open": session.open,
                         "direction": session.direction or "",
                         "plate": session.plate or "",
@@ -196,7 +284,7 @@ class BayStateEngine:
 
     def on_status(self, bay: str, status: str, timestamp: str,
                   occupied: bool, departed: bool, comment=None,
-                  image_b64=None):
+                  image_b64=None, door_state=None):
         """Called by bay_monitor after every classification.
 
         `occupied` and `departed` are bay_monitor's OWN interpretation of
@@ -212,10 +300,18 @@ class BayStateEngine:
         `comment` and `image_b64` are the vision model's free-text
         description and the exact frame it was shown -- passed straight
         through from bay_monitor for the rich notification below,
-        without this engine re-fetching or re-classifying anything."""
+        without this engine re-fetching or re-classifying anything.
+
+        `door_state` ("open"/"closed", or None on the Ollama backend,
+        which doesn't report it) is bay_monitor's RAW per-frame reading,
+        not its debounced one -- deliberately, since the only decision
+        made from it here is whether a truck arrived with its doors
+        already open, which is a claim about the arrival frame itself."""
         with self.lock:
             status_changed = self.bay_status.get(bay) != status
             self.bay_status[bay] = status
+            if door_state is not None:
+                self.bay_door_state[bay] = door_state
             session = self.sessions.setdefault(bay, BaySession(bay))
             # The truck this activity change is ABOUT: on a departure,
             # session.reset() below wipes session.plate before we'd get
@@ -223,6 +319,10 @@ class BayStateEngine:
             # still None/unconfirmed -- before any transition runs.
             truck_number = session.plate or self.unknown_plate_value
 
+            # Passed to _on_arrival rather than re-read there: by the time
+            # a departure/arrival transition runs, self.bay_door_state may
+            # already describe a later frame.
+            arrival_door_state = door_state
             if occupied:
                 # Whether this is a NEW arrival is decided purely by
                 # whether a session is already open -- NOT by comparing
@@ -237,7 +337,7 @@ class BayStateEngine:
                 # the failure this module exists to prevent. With a
                 # session open, any occupied read is a continuation.
                 if not session.open:
-                    self._on_arrival(session, timestamp)
+                    self._on_arrival(session, timestamp, arrival_door_state)
                 elif session.plate is None:
                     self._retry_read(session, timestamp)
             elif departed and session.open:
@@ -255,12 +355,33 @@ class BayStateEngine:
             # or not anything actually changed.
             self._write_csv()
 
-    def _on_arrival(self, session: BaySession, timestamp: str):
+    def _on_arrival(self, session: BaySession, timestamp: str,
+                     door_state=None):
         session.reset()
         session.direction = "enter"
+        self.arrival_time[session.bay] = time.time()
         self.log.info(f"({session.bay}) arrival detected -> enter, "
-                       f"enqueuing ALPR read")
+                       f"enqueuing ALPR read"
+                       + (f" (doors {door_state})" if door_state else ""))
         self._enqueue_read(session, timestamp)
+
+        # The requested alert: a truck that backs in with its doors
+        # ALREADY open, rather than being opened once docked. Raised on
+        # the event itself rather than a separate topic -- one topic to
+        # subscribe to was the point -- so a consumer filters on the
+        # field instead of managing another subscription.
+        alert = "door_open_on_arrival" if door_state == "open" else None
+        if alert:
+            self.log.warning(f"({session.bay}) truck arrived with its doors "
+                              f"ALREADY OPEN")
+        # No confirmed plate this early -- the ALPR read was only just
+        # enqueued above and takes seconds. Publish the arrival now
+        # anyway (a dock system needs to know a truck is there NOW) and
+        # follow up with 'identified' when the plate resolves.
+        self.awaiting_identity.add(session.bay)
+        self._publish_event(session.bay, "arrived", timestamp,
+                             truck_number=self.unknown_plate_value,
+                             door_state=door_state, alert=alert)
         self._publish_state(session, timestamp)
 
     def _retry_read(self, session: BaySession, timestamp: str):
@@ -323,6 +444,19 @@ class BayStateEngine:
         # the same plate/confidence/read_attempts this visit concluded
         # with, but open=False now that direction is cleared, so it's
         # visually distinct from the "still open, unconfirmed" state.
+        duration_sec = None
+        arrived_at = self.arrival_time.pop(session.bay, None)
+        if arrived_at is not None:
+            duration_sec = int(time.time() - arrived_at)
+        self._publish_event(session.bay, "departed", timestamp,
+                             truck_number=session.plate or self.unknown_plate_value,
+                             door_state=self.bay_door_state.get(session.bay),
+                             duration_sec=duration_sec)
+        # A plate confirmed after this point belongs to no visit -- drop
+        # the pending flag so a late ALPR result can't emit an
+        # 'identified' for a truck that has already left.
+        self.awaiting_identity.discard(session.bay)
+
         session.direction = None
         self._publish_state(session, timestamp)
         session.reset()
@@ -355,6 +489,17 @@ class BayStateEngine:
                 session.confidence = reply.get("confidence", 0.0)
                 self.log.info(f"({bay}) plate confirmed this session: "
                                f"{session.plate} (conf {session.confidence})")
+                # Answers the "which truck" half of the arrival that
+                # already went out unidentified. Discarded (not just
+                # checked) so a later re-read of the same visit can't
+                # publish a second one.
+                if bay in self.awaiting_identity:
+                    self.awaiting_identity.discard(bay)
+                    self._publish_event(
+                        bay, "identified", reply.get("ocr_time", ""),
+                        truck_number=session.plate,
+                        confidence=session.confidence,
+                        door_state=self.bay_door_state.get(bay))
                 self._publish_state(session, reply.get("ocr_time", ""))
                 self._write_csv()
             # NO_VALID_PLATE / ERROR: leave session.plate exactly as it

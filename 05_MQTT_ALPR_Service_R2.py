@@ -437,6 +437,74 @@
 #       -- it's the one channel still allowed to push anything, and only
 #       because it's gated on an actual status CHANGE rather than a
 #       timer.
+#   28. A purpose-trained truck/door YOLO model becomes an alternative
+#       classification backend, the MQTT topics collapse to one lean
+#       event stream, and the snapshot webhook grows into a bay query
+#       API. All four parts were requested together.
+#       (a) bay_monitor.classifier picks the backend: "yolo" runs
+#           truck_detector.py against bay_monitor.truck_model_path
+#           (~50ms, deterministic), "ollama" keeps the original vision
+#           prompt. The speed is not the only point: bay_monitor scans
+#           every bay from ONE thread, so a multi-second VLM call
+#           stalled the round-robin for every bay behind it, and a
+#           timing-out call left a bay reporting no status at all
+#           (activity: null) indefinitely. Class mapping is
+#           Truck_Enter_Closed->arriving/closed, Truck_Enter_Open->
+#           arriving/open, Truck_Docked_Closed->docked/closed,
+#           Truck_Docked_Open->loading/open, overridable via
+#           truck_class_map for a model retrained with other names. The
+#           model's Number_Plate class is reported (plate_visible) but
+#           NEVER counts as truck presence -- a bay is occupied whether
+#           or not a plate is readable from the dock camera's angle,
+#           which is exactly why bay_monitor stopped using the ALPR
+#           plate model for presence back in item #19. The single
+#           highest-confidence truck box decides the status, so two
+#           overlapping detections of one truck as different classes
+#           can't have box ORDER decide the answer.
+#       (b) Door state, which the VLM never reported reliably. The
+#           value bay_monitor reports (and GET /bay/<bay> serves) is
+#           debounced over bay_monitor.door_state_debounce_count
+#           agreeing frames, same reasoning as empty_debounce_count.
+#           The requested "truck arrived with its doors already open"
+#           alert deliberately uses the RAW reading from the arrival
+#           frame instead, since that's a claim about one moment and
+#           debouncing it would answer a different question. It rides
+#           on the arrival event as alert="door_open_on_arrival"
+#           rather than a separate topic -- one subscription was the
+#           point.
+#       (c) mqtt.bay_event_topic_prefix, the lean consumer-facing topic
+#           and now the ONLY one published by default: 'arrived' /
+#           'identified' / 'departed', roughly three messages per visit
+#           against the dozens the older topics emitted between them.
+#           arrived fires immediately with the UNKNOWN placeholder
+#           rather than waiting on the ALPR read (a dock system needs
+#           to know a truck is there NOW); identified follows when the
+#           plate resolves, and is suppressed when the plate was
+#           already known at arrival so there's never a redundant pair,
+#           or when the truck has already departed. departed carries
+#           the truck number and duration_sec. bay_status, bay_state
+#           and bay_notification are each still available behind
+#           mqtt.publish_bay_* but default to false now. The enter/
+#           leave ALPR result topics are untouched -- different shape,
+#           different consumer, its own publish_no_valid_plate gate.
+#       (d) snapshot_webhook.py becomes a query API: GET /bays (every
+#           bay in one call), GET /bay/<bay> (occupancy and activity
+#           from bay_monitor merged with truck identity from
+#           bay_state_engine -- neither can answer it alone, so
+#           service.build_bay_state_query composes them rather than
+#           making the two modules reference each other), the existing
+#           GET /snapshot/<bay>, and POST /bay/<bay>/ask, which puts an
+#           arbitrary question to the vision model about a bay's
+#           current frame. That last route is what the VLM is FOR once
+#           a detector handles routine status: "loading or unloading?"
+#           is exactly what a fixed detector vocabulary cannot answer
+#           (the truck model sees doors open at a dock, not which way
+#           the cargo is moving). It passes session=None so the call
+#           opens its own connection rather than borrowing the scan
+#           loop's requests.Session from another thread. A route whose
+#           handler isn't wired up answers 501, not 404 -- "this
+#           service doesn't offer that" must not look like "no such
+#           bay".
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (used if http_trigger.enabled or bay_monitor.

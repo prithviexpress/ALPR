@@ -638,6 +638,48 @@ def load_config(path: Path = None) -> dict:
     # had to build one to make the call at all.)
     bay_monitor.setdefault("attach_frame_to_status",
                            mqtt["publish_bay_notification"])
+    # Model effectiveness probe (model_probe.py, run via
+    # 06_Model_Probe.py). A measuring instrument, entirely separate from
+    # the service -- these keys are read by nothing else, and the probe
+    # never touches bay state, sessions, ALPR reads or enter/leave
+    # results. Polls every camera in turn, runs BOTH models on each
+    # frame, records what each saw, and saves an annotated image when
+    # either finds something.
+    # Deliberately applies NO geometry filters (too_small/upper_half/
+    # off_center) and probes the FULL FRAME by default: those filters and
+    # the ROI are themselves among the things being measured -- in the
+    # field they discarded all 11 boxes on a bay where the plate model
+    # was working perfectly -- so a probe that reproduced them would
+    # report zero and hide exactly what it exists to find.
+    probe = cfg.setdefault("model_probe", {})
+    probe.setdefault("poll_interval_ms", 2000)
+    # Both default to the models the service already uses: the top-level
+    # model_path, and bay_monitor.truck_model_path.
+    probe.setdefault("plate_model_path", None)
+    probe.setdefault("truck_model_path", None)
+    probe.setdefault("plate_conf_threshold", 0.25)
+    probe.setdefault("plate_imgsz", 640)
+    probe.setdefault("truck_conf_threshold", 0.25)
+    probe.setdefault("truck_imgsz", 640)
+    probe.setdefault("truck_plate_class", "Number_Plate")
+    probe.setdefault("truck_class_map", {})
+    # false (the default) shows both models the whole frame; true crops
+    # to each camera's ROI first, to measure what the ROI is costing.
+    probe.setdefault("use_roi", False)
+    # Which frames get an image written: "any" (either model detected
+    # something), "plate", "truck", "all", or "none".
+    probe.setdefault("save_images", "any")
+    probe.setdefault("annotate_saved_images", True)
+    # Per-bay cap so a long run can't fill the disk. 0 = unlimited.
+    probe.setdefault("max_saved_images_per_bay", 500)
+    probe.setdefault("output_subdir", "model_probe")
+    probe.setdefault("summary_every_frames", 100)
+    probe.setdefault("publish_enabled", True)
+    probe.setdefault("topic_prefix", "site/alpr/model_probe")
+    # Capped rather than infinite: an unreachable broker must not hold
+    # the probe at startup forever, since disk is the real output.
+    probe.setdefault("mqtt_max_connect_attempts", 3)
+
     # Per-bay state engine (bay_state.py) -- fuses bay_monitor's
     # continuous status stream with ALPR plate reads into one session per
     # bay, and becomes the authority for enter/leave direction and

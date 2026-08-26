@@ -48,6 +48,55 @@ DEFAULT_CLASS_MAP = {
 PLATE_CLASS_NAME = "Number_Plate"
 
 
+class PlateAssistDetector:
+    """The dedicated plate-only model (the same weights the ALPR workers
+    use, config model_path) run alongside the truck model as a SECOND
+    OPINION on whether anything is at the bay.
+
+    Why bother when the truck model already has a Number_Plate class: the
+    two models fail in different places. The truck model can miss a truck
+    at an awkward angle or in poor light; the plate-only model is trained
+    on one thing and often still picks the plate out of exactly those
+    frames. Taking the union of the two -- a truck OR a plate counts as
+    presence -- catches entries either alone would miss, which is the
+    whole point of running both.
+
+    It answers only "is a plate visible, and where". It deliberately does
+    NOT decide status or door state: it cannot see either, and guessing
+    from a plate box would invent information the model never reported."""
+
+    def __init__(self, model_path, bm_cfg: dict, log=None):
+        self.log = log or get_logger("PLATE_ASSIST")
+        self.conf_threshold = bm_cfg["plate_assist_conf_threshold"]
+        self.imgsz = bm_cfg["plate_assist_imgsz"]
+        t = time.time()
+        self.model = YOLO(str(model_path))
+        self.names = dict(getattr(self.model, "names", {}) or {})
+        self.log.info(f"plate-assist model loaded from {model_path} in "
+                      f"{round(time.time() - t, 1)}s "
+                      f"(conf>={self.conf_threshold}, imgsz={self.imgsz})")
+
+    def detect(self, frame) -> dict:
+        """Every box this model returns counts as a plate: it is a
+        single-purpose plate detector, so unlike the truck model there is
+        no class to filter on -- and filtering by NAME here would break
+        silently against a model whose one class happens to be labelled
+        something else."""
+        t = time.time()
+        results = self.model(frame, conf=self.conf_threshold,
+                             imgsz=self.imgsz, verbose=False)
+        boxes = []
+        for r in results:
+            for b in r.boxes:
+                x1, y1, x2, y2 = (int(v) for v in b.xyxy[0])
+                boxes.append((x1, y1, x2, y2, round(float(b.conf[0]), 3)))
+        return {
+            "plate_visible": bool(boxes),
+            "plate_boxes": boxes,
+            "inference_ms": int((time.time() - t) * 1000),
+        }
+
+
 class TruckDetector:
     """Wraps the truck/door YOLO model. One instance per BayMonitor (which
     is single-threaded), NOT one per worker -- the ALPR workers have their

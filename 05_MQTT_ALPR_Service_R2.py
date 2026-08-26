@@ -532,6 +532,49 @@
 #           different problems that present with the same symptom.
 #           Door state deliberately gates nothing: a plate is readable
 #           regardless of whether the CARGO doors are open.
+#   29. Both models vote on truck entry, and an open door now ends the
+#       plate read instead of prolonging it. Two requests.
+#       (a) bay_monitor.plate_assist_enabled runs the dedicated
+#           plate-only model (by default the same top-level model_path
+#           weights the ALPR workers use) ALONGSIDE the truck model, as
+#           a second opinion on presence. The two fail in different
+#           places -- the truck model can miss a truck at an awkward
+#           angle or in poor light, while the plate-only model is
+#           trained on one thing and often still finds the plate in
+#           exactly those frames -- so their UNION (a truck OR a plate
+#           counts as presence) catches entries either alone would
+#           miss. That union is the entire reason to pay for a second
+#           inference per classification. It also feeds a better
+#           plate_visible signal into item #28(e)'s retry gate, since
+#           the dedicated model is the better judge of that.
+#           When ONLY the plate model sees something, the bay reads as
+#           plate_assist_only_status ("occupied") with door_state left
+#           UNKNOWN rather than guessed: a plate box says nothing about
+#           a cargo door, and inventing "closed" would feed a fabricated
+#           reading straight into the door-open-on-arrival alert. When
+#           the truck model DOES see a truck it keeps deciding status
+#           and door state; the plate model only ever contributes plate
+#           visibility, never overrides.
+#       (b) alpr.abandon_read_when_doors_open stops trying to read a
+#           plate once the truck's doors are reported OPEN, publishing a
+#           "plate_unreadable" event (reason="doors_open") on the
+#           bay_event topic instead. The physical reason: on a
+#           reversed-in trailer the rear doors swing OUT and cover the
+#           number plate, so once they're open the plate is not in the
+#           frame at all -- no amount of retrying, better OCR or a
+#           longer collection window recovers it, and every further
+#           attempt photographs a door while spending the visit's
+#           max_read_attempts budget. Published once per VISIT rather
+#           than per classification, and cleared at both arrival and
+#           departure so the next truck starts fresh.
+#           The ARRIVAL read still fires even for a truck that backs in
+#           with its doors already open: it costs one attempt, it lands
+#           while the truck is still moving into position, and
+#           abandoning before ever looking would mean never reading a
+#           plate that was in fact briefly visible.
+#           door_state is None on the ollama backend, which means no
+#           information and never abandons -- same rule as plate_visible
+#           in item #28(e).
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (used if http_trigger.enabled or bay_monitor.

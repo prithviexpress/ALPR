@@ -249,6 +249,23 @@ def load_config(path: Path = None) -> dict:
     # is most likely facing the camera and the worker polls its own
     # frames across a whole collection window anyway.
     alpr.setdefault("retry_only_when_plate_visible", True)
+    # Stop trying to read a plate once bay_monitor's truck model reports
+    # the truck's doors are OPEN, and publish the observation instead
+    # ("plate_unreadable", reason="doors_open", on the bay_event topic).
+    # On a reversed-in trailer the rear doors swing OUT and physically
+    # cover the number plate, so once they're open the plate is not in
+    # the frame at all -- no amount of retrying, better OCR or a longer
+    # collection window recovers it, and every further attempt just
+    # photographs a door while spending the visit's attempt budget.
+    # Published once per visit, not per classification. The ARRIVAL read
+    # still fires even for a truck that backs in with its doors already
+    # open: it costs one attempt, it happens while the truck is still
+    # moving into position, and abandoning before ever looking would
+    # mean never reading a plate that was in fact briefly visible. Only
+    # has effect with bay_monitor.classifier="yolo" -- door_state is
+    # None on the ollama backend, which means no information and never
+    # abandons.
+    alpr.setdefault("abandon_read_when_doors_open", True)
     # How many times a Worker retries loading YOLO+PaddleOCR at startup
     # before giving up (backoff_sec apart) -- a transient failure (e.g. a
     # proxy blocking a one-time model download) shouldn't need a process
@@ -547,6 +564,26 @@ def load_config(path: Path = None) -> dict:
     # state. Only affects the state the webhook reports -- the
     # door-open-on-arrival alert deliberately uses the raw reading from
     # the arrival frame itself, since that's a claim about one moment.
+    # Run the dedicated plate-only model (the same weights the ALPR
+    # workers use) alongside the truck model as a second opinion on
+    # presence. The two fail in different places -- the truck model can
+    # miss a truck at an awkward angle or in poor light, while the
+    # plate-only model is trained on one thing and often still finds the
+    # plate in exactly those frames -- so their UNION (a truck OR a plate
+    # counts as presence) catches entries either alone would miss. That
+    # is the whole reason to pay for a second inference. It also gives a
+    # better plate_visible signal for alpr.retry_only_when_plate_visible.
+    # When only the plate model sees something, the bay is reported as
+    # plate_assist_only_status with door_state left UNKNOWN rather than
+    # guessed -- a plate box says nothing about a cargo door, and
+    # inventing "closed" would feed a fabricated reading into the
+    # door-open alert. Only has effect with classifier="yolo".
+    # plate_assist_model_path defaults to the top-level model_path.
+    bay_monitor.setdefault("plate_assist_enabled", False)
+    bay_monitor.setdefault("plate_assist_model_path", None)
+    bay_monitor.setdefault("plate_assist_conf_threshold", 0.4)
+    bay_monitor.setdefault("plate_assist_imgsz", 640)
+    bay_monitor.setdefault("plate_assist_only_status", "occupied")
     bay_monitor.setdefault("door_state_debounce_count", 2)
     # Whether the truck-model backend also base64-encodes each classified
     # frame for downstream payloads. Pure overhead unless something

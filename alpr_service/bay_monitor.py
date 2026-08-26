@@ -388,6 +388,7 @@ class BayMonitor:
         # actually good at.
         self.classifier = self.cfg["classifier"]
         self.detector = None
+        self.plate_assist = None
         if self.classifier == "yolo":
             # Weights checked BEFORE importing the detector: a missing
             # .pt is by far the likelier misconfiguration, and it should
@@ -406,6 +407,26 @@ class BayMonitor:
             # shouldn't need the truck model file to exist at all.
             from .truck_detector import TruckDetector
             self.detector = TruckDetector(model_path, self.cfg, self.log)
+
+            # Second opinion on presence from the dedicated plate-only
+            # model (the same weights the ALPR workers use). The two
+            # models fail in different places, so their UNION -- a truck
+            # OR a plate counts as presence -- catches entries either
+            # alone would miss. See PlateAssistDetector.
+            if self.cfg["plate_assist_enabled"]:
+                from .truck_detector import PlateAssistDetector
+                plate_path = config_dir / (self.cfg["plate_assist_model_path"]
+                                            or config["model_path"])
+                if not plate_path.exists():
+                    raise FileNotFoundError(
+                        f"bay_monitor.plate_assist_enabled is true but the "
+                        f"plate model {plate_path} does not exist -- set "
+                        f"bay_monitor.plate_assist_model_path (or the "
+                        f"top-level model_path it defaults to), or turn "
+                        f"plate_assist_enabled off")
+                self.plate_assist = PlateAssistDetector(plate_path, self.cfg,
+                                                         self.log)
+        self.plate_only_status = self.cfg["plate_assist_only_status"]
         self.door_debounce_count = self.cfg["door_state_debounce_count"]
         self.session = requests.Session()
         # Cameras and the Ollama host are always on the local/internal
@@ -743,6 +764,8 @@ class BayMonitor:
                             f"conf={result['confidence']} "
                             f"({result['inference_ms']}ms) -> "
                             f"{result['status']}, counts={result['counts']}")
+            if self.plate_assist is not None:
+                self._merge_plate_assist(bay, img, result)
             image_b64 = None
             if self.attach_frame_to_status:
                 image_b64 = encode_image(img, self.cfg["classify_max_dimension"],
@@ -758,6 +781,49 @@ class BayMonitor:
             return None
         return {"status": status, "comment": comment, "image_b64": image_b64,
                 "door_state": None, "plate_visible": None, "confidence": None}
+
+    def _merge_plate_assist(self, bay: str, img, result: dict):
+        """Fold the plate-only model's opinion into the truck model's
+        reading, in place. Two separate contributions:
+
+        1. PRESENCE. If the truck model found no truck but the plate
+           model found a plate, something is demonstrably at this bay --
+           the truck model just missed it (awkward angle, poor light,
+           whatever). The union of the two is what makes running both
+           worth the second inference. Reported as
+           bay_monitor.plate_assist_only_status, with door_state left
+           None rather than guessed: a plate box says nothing whatsoever
+           about a cargo door, and inventing "closed" here would feed a
+           fabricated reading straight into the door-open alert.
+
+        2. PLATE VISIBILITY. Either model seeing a plate counts, since
+           this drives whether an ALPR read is worth spending
+           (alpr.retry_only_when_plate_visible) and the dedicated
+           plate-only model is generally the better judge of it.
+        """
+        assist = self.plate_assist.detect(img)
+        if not assist["plate_visible"]:
+            return
+
+        if not result["plate_visible"]:
+            result["plate_visible"] = True
+            self.log.debug(f"({bay}) plate-assist model sees a plate the "
+                            f"truck model did not "
+                            f"({assist['inference_ms']}ms)")
+        result["plate_boxes"] = list(result["plate_boxes"]) + assist["plate_boxes"]
+
+        if result["class_name"] is None:
+            # No truck box at all, but there is a plate -- believe the
+            # plate.
+            result["status"] = self.plate_only_status
+            result["door_state"] = None
+            result["comment"] = (
+                f"No truck detected by the truck model, but the plate model "
+                f"found {len(assist['plate_boxes'])} number plate(s), so the "
+                f"bay reads as '{self.plate_only_status}'. Door state unknown.")
+            self.log.info(f"({bay}) presence from the plate model alone -- "
+                           f"truck model saw no truck, plate model found "
+                           f"{len(assist['plate_boxes'])} plate(s)")
 
     def _update_door_state(self, bay: str, state: BayState, observed):
         """Fold this frame's door reading into the bay's CONFIRMED door

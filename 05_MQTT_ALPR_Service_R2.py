@@ -505,6 +505,33 @@
 #           handler isn't wired up answers 501, not 404 -- "this
 #           service doesn't offer that" must not look like "no such
 #           bay".
+#       (e) The truck model's Number_Plate detection now GATES retry
+#           plate reads (alpr.retry_only_when_plate_visible, default
+#           true). Item (a) left plate_visible computed and then thrown
+#           away, so retries stayed blind: bay_state_engine re-ran a
+#           full collection on every classification while a bay was
+#           occupied without a confirmed plate, whether or not a plate
+#           was anywhere in view. Since max_read_attempts is a per-VISIT
+#           budget, a retry fired while the plate is out of view isn't
+#           merely wasted work on one of only service.num_workers
+#           threads -- it makes it likelier the budget is exhausted
+#           before the plate ever comes INTO view, which is precisely
+#           how a truck ends up departing unidentified.
+#           Gates RETRIES only: the arrival read always fires, since
+#           entry is when a truck is most likely facing the camera and
+#           the worker polls its own frames across a whole collection
+#           window afterwards -- "no plate in this one classified
+#           frame" doesn't mean none will appear during that window.
+#           plate_visible=None (what the Ollama backend reports) means
+#           NO INFORMATION, not "no plate", and never suppresses a
+#           retry -- otherwise turning this on would silently stop all
+#           retries for a deployment not running the truck model.
+#           GET /bay/<bay> reports plate_visible too, so "no read yet
+#           because no plate is visible" can be told apart from "a
+#           plate is right there and OCR keeps failing" -- two very
+#           different problems that present with the same symptom.
+#           Door state deliberately gates nothing: a plate is readable
+#           regardless of whether the CARGO doors are open.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (used if http_trigger.enabled or bay_monitor.

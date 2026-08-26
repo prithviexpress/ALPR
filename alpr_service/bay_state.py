@@ -90,6 +90,8 @@ class BayStateEngine:
         self.bay_status = {bay: "" for bay in cameras}
         self.unknown_plate_value = config["alpr"]["unknown_plate_value"]
         self.max_read_attempts = config["alpr"]["max_read_attempts"]
+        self.retry_only_when_plate_visible = \
+            config["alpr"]["retry_only_when_plate_visible"]
         self.state_topic_prefix = config["mqtt"]["bay_state_topic_prefix"]
         self.notification_topic_prefix = config["mqtt"]["bay_notification_topic_prefix"]
         self.event_topic_prefix = config["mqtt"]["bay_event_topic_prefix"]
@@ -284,7 +286,7 @@ class BayStateEngine:
 
     def on_status(self, bay: str, status: str, timestamp: str,
                   occupied: bool, departed: bool, comment=None,
-                  image_b64=None, door_state=None):
+                  image_b64=None, door_state=None, plate_visible=None):
         """Called by bay_monitor after every classification.
 
         `occupied` and `departed` are bay_monitor's OWN interpretation of
@@ -306,7 +308,13 @@ class BayStateEngine:
         which doesn't report it) is bay_monitor's RAW per-frame reading,
         not its debounced one -- deliberately, since the only decision
         made from it here is whether a truck arrived with its doors
-        already open, which is a claim about the arrival frame itself."""
+        already open, which is a claim about the arrival frame itself.
+
+        `plate_visible` is whether the truck model can see a plate right
+        now -- used to decide whether a RETRY read is worth spending (see
+        _retry_read). None means no information (the Ollama backend
+        doesn't report it), which is treated as "go ahead", not as "no
+        plate"."""
         with self.lock:
             status_changed = self.bay_status.get(bay) != status
             self.bay_status[bay] = status
@@ -339,7 +347,7 @@ class BayStateEngine:
                 if not session.open:
                     self._on_arrival(session, timestamp, arrival_door_state)
                 elif session.plate is None:
-                    self._retry_read(session, timestamp)
+                    self._retry_read(session, timestamp, plate_visible)
             elif departed and session.open:
                 self._on_departure(session, timestamp)
 
@@ -384,7 +392,33 @@ class BayStateEngine:
                              door_state=door_state, alert=alert)
         self._publish_state(session, timestamp)
 
-    def _retry_read(self, session: BaySession, timestamp: str):
+    def _retry_read(self, session: BaySession, timestamp: str,
+                     plate_visible=None):
+        # Don't spend one of this visit's limited attempts on a moment
+        # when the truck model can see there is nothing to read. A retry
+        # costs a full collection window on one of only
+        # service.num_workers threads, and the attempt budget is per
+        # visit -- so a retry fired while the plate is out of view is not
+        # merely wasted, it makes it likelier the budget runs out before
+        # the plate ever comes into view.
+        #
+        # plate_visible is None on the Ollama backend, meaning NO
+        # INFORMATION rather than "no plate" -- that must not be read as
+        # a reason to skip, or enabling this would silently stop all
+        # retries for anyone not running the truck model.
+        #
+        # Note this gates RETRIES only. The arrival read always fires
+        # (see _on_arrival): entry is when a truck is most likely facing
+        # the camera, and the worker fetches its own frames over a whole
+        # collection window, so "no plate in this one classified frame"
+        # doesn't mean none will be visible during that window.
+        if (self.retry_only_when_plate_visible and plate_visible is False):
+            self.log.debug(f"({session.bay}) still occupied without a plate, "
+                            f"but the truck model sees no plate in frame -- "
+                            f"not spending a read attempt "
+                            f"({session.read_attempts}/{self.max_read_attempts} "
+                            f"used so far)")
+            return
         # Capped: the truck is stationary and the camera fixed, so attempt
         # N photographs the same obscured plate attempt 1 did. Left
         # uncapped, a truck parked for hours with an unreadable plate

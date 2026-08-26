@@ -234,6 +234,21 @@ def load_config(path: Path = None) -> dict:
     # consulted by bay_state.py; the MQTT/HTTP trigger paths are
     # one-shot and unaffected.
     alpr.setdefault("max_read_attempts", 20)
+    # Spend a RETRY read only when bay_monitor's truck model can actually
+    # see a plate in frame (its Number_Plate class). A retry costs a full
+    # collection window on one of only service.num_workers threads, and
+    # the attempt budget above is per visit -- so a retry fired while the
+    # plate is out of view isn't merely wasted, it makes it likelier the
+    # budget runs out before the plate ever comes INTO view. Gating on
+    # actual visibility is the point of the truck model reporting it.
+    # Only has any effect with bay_monitor.classifier="yolo": the Ollama
+    # backend reports no plate information at all, which is treated as
+    # "go ahead" rather than "no plate", so this can't silently stop
+    # retries for a deployment not running the truck model. Gates retries
+    # ONLY -- the arrival read always fires, since entry is when a truck
+    # is most likely facing the camera and the worker polls its own
+    # frames across a whole collection window anyway.
+    alpr.setdefault("retry_only_when_plate_visible", True)
     # How many times a Worker retries loading YOLO+PaddleOCR at startup
     # before giving up (backoff_sec apart) -- a transient failure (e.g. a
     # proxy blocking a one-time model download) shouldn't need a process

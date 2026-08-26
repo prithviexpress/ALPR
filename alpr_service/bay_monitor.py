@@ -110,6 +110,13 @@ class BayState:
         # one specific moment, and by the time a debounce has confirmed
         # anything the arrival is over. None between visits.
         self.arrival_door_state = None
+        # Whether the truck model saw a plate on the most recent
+        # classification. Reported by the webhook so "no plate read yet
+        # because none is visible" can be told apart from "a plate is
+        # right there and OCR keeps failing" -- very different problems
+        # with the same symptom. None on the Ollama backend (no
+        # information).
+        self.plate_visible = None
 
 
 def downscale(img, max_dimension: int):
@@ -672,6 +679,7 @@ class BayMonitor:
             "occupancy_status": occupancy_status,
             "activity": state.last_status,
             "door_state": state.door_state,
+            "plate_visible": state.plate_visible,
             "classified": state.classified_once,
             "last_classified": last_classified,
         }
@@ -837,6 +845,12 @@ class BayMonitor:
         # debounced. The arrival alert below needs what was actually seen
         # at the moment the truck was first detected.
         door_state = result["door_state"]
+        # Whether the truck model can currently SEE a plate. Passed
+        # through to bay_state_engine, which uses it to decide whether a
+        # retry read is worth spending -- see _retry_read. None on the
+        # Ollama backend (it has no idea), which means "no information",
+        # not "no plate".
+        plate_visible = result["plate_visible"]
         state.classified_once = True
         state.last_status = status
         self._update_door_state(bay, state, door_state)
@@ -895,11 +909,13 @@ class BayMonitor:
         # else: a first-look (or otherwise not-yet-zoomed) result came
         # back empty -- already at baseline, nothing to revert.
 
+        state.plate_visible = plate_visible
         self._notify(bay, status, timestamp, occupied, departed, comment,
-                     image_b64, door_state)
+                     image_b64, door_state, plate_visible)
 
     def _notify(self, bay, status, timestamp, occupied, departed,
-                comment=None, image_b64=None, door_state=None):
+                comment=None, image_b64=None, door_state=None,
+                plate_visible=None):
         """Hand the reading to a consumer as an already-interpreted event.
 
         `occupied` and `departed` are decided here rather than shipping
@@ -919,12 +935,18 @@ class BayMonitor:
         one: the consumer uses it to decide whether a truck ARRIVED with
         its doors open, which is about this instant -- see
         _update_door_state.
+
+        `plate_visible` is whether the truck model currently sees a plate
+        (None on the Ollama backend = NO INFORMATION, not "no plate").
+        bay_state_engine uses it to avoid spending one of a visit's
+        limited retry reads on a moment when there is demonstrably
+        nothing to read -- see its _retry_read.
         """
         if self.on_status is None:
             return
         try:
             self.on_status(bay, status, timestamp, occupied, departed,
-                            comment, image_b64, door_state)
+                            comment, image_b64, door_state, plate_visible)
         except Exception:
             self.log.error(f"({bay}) on_status hook raised", exc_info=True)
 

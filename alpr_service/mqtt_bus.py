@@ -54,12 +54,31 @@ def extract_event(topic: str, payload: bytes, bay_segment_index=1):
     return {"bay": bay, "event_time": event_time, "data": data}
 
 
+def _sub(obj, key):
+    """obj[key] as a dict, treating anything that isn't one -- missing,
+    explicitly null, a string, a list -- as an empty dict.
+
+    Not the same as .get(key, {}): that returns the DEFAULT only when the
+    key is ABSENT, so a payload carrying an explicit JSON null (e.g.
+    "Appearance": null, which these cameras do emit) hands back None and
+    the next .get() in the chain raises AttributeError. Confirmed in the
+    field: that exception escaped on_message into paho's network loop and
+    killed the thread, which silently stops result PUBLISHING as well --
+    the service looks alive while nothing reaches MQTT again."""
+    if not isinstance(obj, dict):
+        return {}
+    value = obj.get(key)
+    return value if isinstance(value, dict) else {}
+
+
 def _iter_detections(data: dict):
     """Yield (class_text, likelihood) pairs out of a VCA event payload's
     Data.Object.Object[].Appearance.Class.Type[]. Both "Object" and "Type"
     may be a single dict or a list, depending on how many objects/
-    classifications the camera reports in one event."""
-    objects = data.get("Data", {}).get("Object", {}).get("Object", [])
+    classifications the camera reports in one event. Every level is
+    traversed defensively (see _sub) -- this parses whatever a camera
+    happens to send, so no shape it produces may raise."""
+    objects = _sub(_sub(data, "Data"), "Object").get("Object", [])
     if isinstance(objects, dict):
         objects = [objects]
     elif not isinstance(objects, list):
@@ -67,7 +86,7 @@ def _iter_detections(data: dict):
     for obj in objects:
         if not isinstance(obj, dict):
             continue
-        types = obj.get("Appearance", {}).get("Class", {}).get("Type", [])
+        types = _sub(_sub(obj, "Appearance"), "Class").get("Type", [])
         if isinstance(types, dict):
             types = [types]
         elif not isinstance(types, list):

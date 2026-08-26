@@ -137,36 +137,55 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus,
     def on_disconnect(client, userdata, *args):
         log.warning("disconnected -- paho will auto-reconnect")
 
+    def _handle_message(direction, msg):
+        """The real VCA-event handler, kept separate from the callback so
+        the callback below is nothing but a guard."""
+        event = extract_event(msg.topic, msg.payload, bay_segment_index)
+        if event is None:
+            return
+        bay = event["bay"]
+        if bay not in cameras:
+            log.warning(f"({direction}) event for unknown bay '{bay}' "
+                        f"(topic {msg.topic})")
+            return
+        if not cameras[bay].get("enabled", True):
+            return
+
+        matched, cls_text, likelihood = matches_class_filter(
+            event["data"], class_types, min_likelihood)
+        if not matched:
+            log.debug(f"({bay}/{direction}) event discarded: no detection "
+                      f"matching class in {class_types} at "
+                      f"likelihood>={min_likelihood} (topic {msg.topic})")
+            return
+        if likelihood is None:
+            log.info(f"({bay}/{direction}) event_filter disabled (empty "
+                     f"class_types), accepting event unconditionally")
+        else:
+            log.info(f"({bay}/{direction}) event matched class='{cls_text}' "
+                     f"likelihood={likelihood:.2f}")
+
+        if bus.try_enqueue(make_job(bay, direction, event["event_time"],
+                                     cls_text, likelihood)):
+            log.info(f"({bay}/{direction}) event queued for processing")
+
     def make_on_message(direction):
         def on_message(client, userdata, msg):
-            event = extract_event(msg.topic, msg.payload, bay_segment_index)
-            if event is None:
-                return
-            bay = event["bay"]
-            if bay not in cameras:
-                log.warning(f"({direction}) event for unknown bay '{bay}' "
-                            f"(topic {msg.topic})")
-                return
-            if not cameras[bay].get("enabled", True):
-                return
-
-            matched, cls_text, likelihood = matches_class_filter(
-                event["data"], class_types, min_likelihood)
-            if not matched:
-                log.debug(f"({bay}/{direction}) event discarded: no detection "
-                          f"matching class in {class_types} at "
-                          f"likelihood>={min_likelihood} (topic {msg.topic})")
-                return
-            if likelihood is None:
-                log.info(f"({bay}/{direction}) event_filter disabled (empty "
-                         f"class_types), accepting event unconditionally")
-            else:
-                log.info(f"({bay}/{direction}) event matched class='{cls_text}' "
-                         f"likelihood={likelihood:.2f}")
-
-            if bus.try_enqueue(make_job(bay, direction, event["event_time"],
-                                         cls_text, likelihood)):
-                log.info(f"({bay}/{direction}) event queued for processing")
+            # Nothing here may raise. paho calls this from its network
+            # loop thread, and an exception propagates out through
+            # _handle_on_message -> _packet_read and kills that thread --
+            # which stops result PUBLISHING too, not just event handling,
+            # so the service goes on looking alive while nothing reaches
+            # the broker again. Confirmed in the field from a VCA payload
+            # carrying an explicit null where a dict was expected (see
+            # mqtt_bus._sub). That exact shape is handled now, but a
+            # camera can send anything, so the guard stays regardless.
+            try:
+                _handle_message(direction, msg)
+            except Exception:
+                log.error(f"({direction}) failed to handle a VCA event from "
+                          f"topic {msg.topic} -- dropping it and staying "
+                          f"connected", exc_info=True)
         return on_message
 
     client.on_connect = on_connect

@@ -640,6 +640,33 @@
 #           The first question about an unexpected reading is always
 #           "from what class, and how sure" -- it belongs on the line
 #           that reports the reading.
+#   32. Two field bugs, both caught from logs.
+#       (a) A VCA payload carrying an explicit null where a dict was
+#           expected ("Appearance": null) crashed the MQTT message
+#           handler: dict.get(key, default) returns the default only
+#           when the key is ABSENT, so an explicit null came back as
+#           None and the next .get() in the chain raised
+#           AttributeError. That exception escaped on_message into
+#           paho's network loop and killed the thread -- which stops
+#           result PUBLISHING as well as event handling, so the service
+#           goes on looking alive while nothing reaches the broker
+#           again. mqtt_bus._sub now traverses every level defensively,
+#           and service.py's on_message wraps the whole handler in a
+#           broad except so no payload shape a camera invents can take
+#           the loop down again.
+#       (b) The startup-occupancy rule from item #30(b) was checked
+#           BEFORE anything else, so it discarded exactly the best read
+#           opportunity there is. Field log: a bay whose first-ever
+#           sighting was Truck_Enter_Closed at 0.82 -- still entering,
+#           doors shut, plate facing the camera -- skipped for
+#           "startup_occupancy" alongside the genuinely long-parked bays
+#           around it. A truck caught mid-ENTRY cannot have been sitting
+#           there since before the process started; it is a live arrival
+#           that merely coincided with startup, and phase="entering" is
+#           direct evidence of that. The startup rule now yields to it,
+#           while the doors_open and docked rules still apply on top --
+#           so an entering truck whose doors are already open is still
+#           skipped, for the accurate reason.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (used if http_trigger.enabled or bay_monitor.

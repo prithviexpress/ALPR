@@ -536,7 +536,20 @@ class BayStateEngine:
 
         Governed by alpr.read_startup_occupancy /
         abandon_read_when_docked / read_arrival_when_doors_open."""
-        if first_ever_status and not self.read_startup_occupancy:
+        # A truck caught mid-ENTRY cannot have been sitting there since
+        # before the process started, whatever the clock says -- it is a
+        # live arrival that merely coincided with startup, and its plate
+        # window is open right now. Checking startup_occupancy first
+        # discarded exactly the best read opportunity there is: confirmed
+        # in the field on a bay whose first sighting was
+        # Truck_Enter_Closed at 0.82 -- entering, doors shut, plate
+        # facing the camera -- skipped for "startup_occupancy" while
+        # genuinely docked bays around it were skipped for the same
+        # reason. The startup rule is about trucks that docked hours ago;
+        # phase="entering" is direct evidence this is not one of them.
+        live_entry = phase == "entering"
+        if (first_ever_status and not live_entry
+                and not self.read_startup_occupancy):
             return "startup_occupancy"
         if self.abandon_when_docked and phase == "docked":
             return "already_docked"

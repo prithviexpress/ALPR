@@ -48,6 +48,23 @@ TRUCK_COLOR = (255, 128, 0)      # blue   -- the truck model's truck classes
 TRUCK_PLATE_COLOR = (0, 255, 255)  # yellow -- the truck model's Number_Plate
 
 
+
+def box_iou(a, b) -> float:
+    """Intersection-over-union of two [x1,y1,x2,y2] boxes."""
+    ax1, ay1, ax2, ay2 = a[:4]
+    bx1, by1, bx2, by2 = b[:4]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
 class ProbeStats:
     """Running tallies across the whole run, per bay and overall.
 
@@ -173,6 +190,19 @@ class ModelProbe:
         self.stats = ProbeStats()
         self.per_bay = {bay: ProbeStats() for bay in cameras}
         self.saved_counts = {bay: 0 for bay in cameras}
+        # Per-bay motion tracking. "Entering" versus "docked" is
+        # inherently TEMPORAL -- a truck is entering because it is
+        # moving -- and a single still frame simply doesn't carry that,
+        # which is why the model confuses the two. Polling every couple
+        # of seconds does carry it, so measure it directly: how much the
+        # biggest truck box moved since this bay's last frame.
+        self.last_box = {}            # bay -> [x1,y1,x2,y2] of the biggest truck
+        self.last_box_time = {}       # bay -> monotonic seconds
+        self.stationary_run = {}      # bay -> consecutive stationary frames
+        self.skipped_stationary = 0
+        self.stationary_iou = self.cfg["stationary_iou_threshold"]
+        self.stationary_min_frames = self.cfg["stationary_min_frames"]
+        self.skip_stationary_saves = self.cfg["skip_stationary_saves"]
 
         config_dir = Path(config["_config_dir"])
         from .truck_detector import TruckDetector, PlateAssistDetector
@@ -275,6 +305,68 @@ class ModelProbe:
                 "truck_count": len(trucks), "plate_count": len(plates),
                 "inference_ms": int((time.time() - t) * 1000)}
 
+    def _motion(self, bay: str, img, truck_res: dict) -> dict:
+        """How much this bay's biggest truck box moved since its last
+        frame -- the numeric answer to "is this really entering, or is it
+        a docked truck the model mislabelled as Enter".
+
+        A truck that has finished reversing in sits still: its box
+        overlaps its previous box almost perfectly (iou_prev near 1.0)
+        frame after frame. One that is genuinely entering moves, so the
+        overlap drops. stationary_frames counts consecutive still frames,
+        which is stronger evidence than any single reading -- one frame
+        of stillness is just a truck pausing, twenty is a parked one.
+
+        The BIGGEST box is tracked rather than the highest-confidence
+        one: this is a geometric question, and area is far more stable
+        across frames than confidence, which can swing while the box
+        barely moves.
+
+        Also records size and position, so a threshold can be picked
+        from the recorded data afterwards rather than guessed now -- on a
+        dome camera a docked truck fills much more of the frame than an
+        approaching one."""
+        h, w = img.shape[:2]
+        frame_area = float(w * h) or 1.0
+        boxes = [e["box"] for e in truck_res["trucks"]]
+        now = time.monotonic()
+
+        if not boxes:
+            # No truck: nothing to compare, and any run of stillness
+            # ends here rather than carrying across an empty gap.
+            self.last_box.pop(bay, None)
+            self.last_box_time.pop(bay, None)
+            self.stationary_run[bay] = 0
+            return {"iou_prev": None, "stationary": None,
+                    "stationary_frames": 0, "secs_since_prev": None,
+                    "area_frac": None, "center": None}
+
+        biggest = max(boxes, key=lambda b: max(0, b[2] - b[0]) * max(0, b[3] - b[1]))
+        x1, y1, x2, y2 = biggest
+        area_frac = round(max(0, x2 - x1) * max(0, y2 - y1) / frame_area, 4)
+        center = [round((x1 + x2) / 2 / w, 4), round((y1 + y2) / 2 / h, 4)]
+
+        prev = self.last_box.get(bay)
+        iou = round(box_iou(biggest, prev), 4) if prev else None
+        secs = (round(now - self.last_box_time[bay], 2)
+                if bay in self.last_box_time else None)
+
+        stationary = None
+        if iou is not None:
+            stationary = iou >= self.stationary_iou
+            self.stationary_run[bay] = (self.stationary_run.get(bay, 0) + 1
+                                        if stationary else 0)
+        else:
+            # First sighting of this truck -- unknown, not stationary.
+            self.stationary_run[bay] = 0
+
+        self.last_box[bay] = biggest
+        self.last_box_time[bay] = now
+        return {"iou_prev": iou, "stationary": stationary,
+                "stationary_frames": self.stationary_run.get(bay, 0),
+                "secs_since_prev": secs, "area_frac": area_frac,
+                "center": center}
+
     def _annotate(self, img, plate_res, truck_res):
         """Both models' boxes drawn on one image, colour-coded, so a
         human can see at a glance where they agree and where they don't:
@@ -299,8 +391,17 @@ class ModelProbe:
                         0.5, TRUCK_PLATE_COLOR, 2)
         return out
 
-    def _should_save(self, plate_res, truck_res) -> bool:
+    def _should_save(self, plate_res, truck_res, motion) -> bool:
         if self.save_mode == "none":
+            return False
+        # Numerically eliminate the docked trucks the model mislabels as
+        # Enter: after stationary_min_frames consecutive frames where the
+        # box barely moved, this truck is parked whatever class came
+        # back. Applied before the mode checks so it holds for all of
+        # them, and never to "all", which means exactly what it says.
+        if (self.skip_stationary_saves and self.save_mode != "all"
+                and motion.get("stationary_frames", 0) >= self.stationary_min_frames):
+            self.skipped_stationary += 1
             return False
         if self.save_mode == "all":
             return True
@@ -384,10 +485,14 @@ class ModelProbe:
         self.stats.record(plate_res, truck_res)
         self.per_bay[bay].record(plate_res, truck_res)
 
+        # Computed before the save decision: whether this truck is
+        # actually moving is one of the things that decides it.
+        motion = self._motion(bay, img, truck_res)
+
         ts = datetime.now(timezone.utc)
         stamp = ts.strftime("%Y%m%d_%H%M%S_%f")[:-3]
         saved = (self._save_image(bay, stamp, img, plate_res, truck_res)
-                 if self._should_save(plate_res, truck_res) else None)
+                 if self._should_save(plate_res, truck_res, motion) else None)
 
         row = {
             "bay": bay,
@@ -408,6 +513,7 @@ class ModelProbe:
                 "class_counts": truck_res["class_counts"],
                 "inference_ms": truck_res["inference_ms"],
             },
+            "motion": motion,
             "image": saved,
         }
         self._record(row)
@@ -420,6 +526,10 @@ class ModelProbe:
                 f"({plate_res['inference_ms']}ms) | truck-model: {classes}, "
                 f"plate x{truck_res['plate_count']} "
                 f"({truck_res['inference_ms']}ms)"
+                + (f" | iou_prev={motion['iou_prev']} "
+                   f"still x{motion['stationary_frames']} "
+                   f"area={motion['area_frac']}"
+                   if motion["iou_prev"] is not None else "")
                 + (f" -> {saved}" if saved else ""))
 
         if self.publish is not None:
@@ -444,7 +554,11 @@ class ModelProbe:
             f"in {s['truck_model']['frames_with_truck']} "
             f"({s['truck_model']['pct_of_frames']}%, avg "
             f"{s['truck_model']['avg_inference_ms']}ms), classes="
-            f"{s['truck_model']['class_counts']}")
+            f"{s['truck_model']['class_counts']}"
+            + (f"; {self.skipped_stationary} frame(s) not saved as "
+               f"stationary (>= {self.stationary_min_frames} frames at "
+               f"iou >= {self.stationary_iou} -- docked, whatever class "
+               f"was reported)" if self.skipped_stationary else ""))
         self.log.info(
             f"SUMMARY plate agreement: both={a['both_found']} "
             f"plate-model-only={a['plate_model_only']} "

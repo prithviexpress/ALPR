@@ -682,27 +682,22 @@ def load_config(path: Path = None) -> dict:
     # plate class included, so "Number_Plate" may be listed too).
     probe.setdefault("save_classes",
                      ["Truck_Enter_Closed", "Truck_Enter_Open"])
-    # Numerically separate a genuinely ENTERING truck from a docked one
-    # the model mislabelled as Enter -- confirmed in the field, where
-    # clearly-docked trucks were reported Truck_Enter_Open.
-    # "Entering" versus "docked" is inherently TEMPORAL: a truck is
-    # entering because it is MOVING, and a single still frame simply
-    # cannot carry that, which is exactly why the model confuses them.
-    # Polling every couple of seconds does carry it, so the probe
-    # measures it: the biggest truck box is tracked between frames, and
-    # its overlap with the previous one (iou_prev) says how far it moved.
-    # A parked truck overlaps itself almost perfectly, frame after
-    # frame; one still reversing in does not.
-    # stationary_min_frames requires that many CONSECUTIVE still frames
-    # before believing it -- one frame of stillness is just a truck
-    # pausing, several is a parked one. With skip_stationary_saves on,
-    # those frames get no image no matter which class was reported.
-    # Every frame's iou_prev, stationary_frames, area_frac and center
-    # are recorded in detections.jsonl regardless, so these thresholds
-    # can be re-picked from real data instead of guessed.
-    probe.setdefault("stationary_iou_threshold", 0.92)
-    probe.setdefault("stationary_min_frames", 3)
-    probe.setdefault("skip_stationary_saves", True)
+    # Geometric test for "is this truck really ENTERING, or is it a
+    # docked one the model labelled Enter" -- confirmed in the field,
+    # where clearly-docked trucks came back as Truck_Enter_Open and
+    # Truck_Enter_Closed, so filtering by class alone still fills the
+    # images folder with parked trucks.
+    # One number does it: a valid entry's box must not reach further
+    # DOWN the frame than this fraction of the frame height (0.75 = the
+    # bottom edge must stay above the three-quarter line). A truck that
+    # has finished reversing in sits right against the dock, and so
+    # against the bottom of the frame, pushing its box bottom past that
+    # line; one still approaching is further away and its box ends
+    # higher up. Decided from the same single frame, with no history
+    # kept. 0 disables the check.
+    # Every box's bottom_frac is recorded in detections.jsonl whatever
+    # gets saved, so this threshold can be re-picked from real data.
+    probe.setdefault("enter_max_bottom_frac", 0.75)
     probe.setdefault("annotate_saved_images", True)
     # Per-bay cap so a long run can't fill the disk. 0 = unlimited.
     probe.setdefault("max_saved_images_per_bay", 500)

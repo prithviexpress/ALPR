@@ -51,6 +51,15 @@
 # so a run full of docked-truck frames is mostly noise when that is the
 # question. detections.jsonl still records EVERY frame from BOTH models
 # regardless, so narrowing what gets saved never costs measurement data.
+# Class alone isn't enough, though: clearly DOCKED trucks come back as
+# Truck_Enter_Open/Closed. A single-frame geometric rule settles it --
+# a valid entry's box must not reach further down the frame than
+# model_probe.enter_max_bottom_frac (3/4 by default). A truck that has
+# finished reversing in sits against the dock, and so against the bottom
+# of the frame, pushing its box past that line; one still approaching
+# ends higher up. Every box's bottom_frac is recorded either way, so the
+# threshold can be re-picked from real data.
+#
 # Other save_images modes: "any", "plate", "truck", "all", "none".
 #
 # The log prints a periodic SUMMARY with the agreement counts that settle

@@ -31,6 +31,8 @@
 #                      of truth, both models' full raw output
 #   summary.json       running totals, per bay and overall, rewritten
 #                      as it goes so it is readable mid-run
+#   plates/*.jpg       the winning plate crop for each successful read,
+#                      named <bay>_<timestamp>_<plate>.jpg
 #   images/*.jpg       annotated frames from every bay, in ONE flat
 #                      folder, named
 #                        <bay>_<timestamp>_p<plate-model boxes>
@@ -63,6 +65,29 @@
 # from real data.
 #
 # Other save_images modes: "any", "plate", "truck", "all", "none".
+#
+# PLATE READING (model_probe.ocr_*, on by default). The probe doesn't
+# just detect -- a valid ENTRY opens a plate-reading session for that
+# bay, and every LATER frame's plate boxes are OCR'd into it until one
+# passes plate_text.is_valid() or the budget runs out. Reading across
+# frames rather than once is the point: a single crop of a moving truck
+# is often motion-blurred or half-turned, and the probe is polling that
+# bay anyway.
+#
+# A session opens on a Truck_Enter_Closed that ALSO passes the geometry
+# test above (doors-closed is exactly when the plate isn't covered by
+# them, and a docked truck mislabelled Enter is rejected first, so the
+# budget is never spent on a plate facing away), or -- with
+# ocr_trigger_on_plate -- on any detected plate at all, which catches
+# entries the truck model misses entirely. Both models' plate boxes get
+# read, since either can see one the other misses.
+#
+# Results publish to model_probe.ocr_topic_prefix + "/<bay>", INCLUDING
+# the failures:
+#   {bay, status: READ|NO_VALID_PLATE|TIMEOUT, plate, confidence, raw,
+#    trigger, attempts, frames, elapsed_sec, reads[]}
+# because "a truck entered and its plate could not be read" is a result
+# worth knowing, not silence.
 #
 # The log prints a periodic SUMMARY with the agreement counts that settle
 # the question -- how often each model sees something the other misses --

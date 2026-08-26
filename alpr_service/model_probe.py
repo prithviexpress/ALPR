@@ -39,6 +39,7 @@ from pathlib import Path
 import cv2
 import requests
 
+from .image_ops import thumbnail, duplicate_thumbs
 from .logging_setup import get_logger
 from .snapshot import build_snapshot_url, build_auth, fetch_snapshot, SnapshotError
 
@@ -201,6 +202,35 @@ class ModelProbe:
         self.truck_model = TruckDetector(truck_path, self._truck_cfg(),
                                           self.log)
 
+        # Plate reading. Loaded only when enabled, so a probe run that
+        # only wants detection counts doesn't pay for PaddleOCR.
+        self.reader = None
+        self.sessions = {}
+        self.ocr_enabled = self.cfg["ocr_enabled"]
+        self.ocr_trigger_classes = {c.strip().lower()
+                                    for c in (self.cfg["ocr_trigger_classes"] or [])}
+        self.ocr_trigger_on_plate = self.cfg["ocr_trigger_on_plate"]
+        self.ocr_max_attempts = self.cfg["ocr_max_attempts"]
+        self.ocr_session_timeout = self.cfg["ocr_session_timeout_sec"]
+        self.ocr_crop_padding_pct = self.cfg["ocr_crop_padding_pct"]
+        self.ocr_topic_prefix = self.cfg["ocr_topic_prefix"]
+        self.ocr_save_crops = self.cfg["ocr_save_crops"]
+        self.plates_read = 0
+        self.sessions_opened = 0
+        self.crops_dir = self.out_dir / "plates" if self.out_dir else None
+        if self.ocr_enabled:
+            from .probe_ocr import PlateReader
+            self.reader = PlateReader(config, self.log)
+            if self.crops_dir is not None:
+                self.crops_dir.mkdir(parents=True, exist_ok=True)
+            self.log.info(
+                f"plate reading on: triggers="
+                f"{sorted(self.ocr_trigger_classes) or 'none'}"
+                + (" + any detected plate" if self.ocr_trigger_on_plate else "")
+                + f", max {self.ocr_max_attempts} attempt(s) or "
+                  f"{self.ocr_session_timeout}s per session -> "
+                  f"{self.ocr_topic_prefix}/<bay>")
+
         self.session = requests.Session()
         self.session.trust_env = False   # cameras are on the local network
         self.auth = build_auth(config)
@@ -293,6 +323,166 @@ class ModelProbe:
         return {"trucks": trucks, "plates": plates, "class_counts": counts,
                 "truck_count": len(trucks), "plate_count": len(plates),
                 "inference_ms": int((time.time() - t) * 1000)}
+
+    def _plate_boxes(self, plate_res, truck_res):
+        """Every plate box in this frame from BOTH models, tagged with
+        which one found it. Both are used because either can see a plate
+        the other misses -- that asymmetry is the thing the probe exists
+        to measure, so the reader should not be limited to one of them."""
+        boxes = [{"source": "plate_model", "box": list(b[:4]), "conf": b[4]}
+                 for b in plate_res["boxes"]]
+        boxes += [{"source": "truck_model", "box": e["box"], "conf": e["conf"]}
+                  for e in truck_res["plates"]]
+        return boxes
+
+    def _ocr_trigger(self, truck_res, plate_boxes):
+        """What, if anything, should open a reading session on this
+        frame. Returns a short reason string, or None.
+
+        Only trucks that pass the geometry test count -- a docked truck
+        mislabelled Enter must not start a session, or the reader spends
+        its whole budget on a plate that faces away from the camera."""
+        for e in truck_res["trucks"]:
+            if (e["class"].lower() in self.ocr_trigger_classes
+                    and self._is_valid_enter(e)):
+                return e["class"]
+        if self.ocr_trigger_on_plate and plate_boxes:
+            return "plate_detected"
+        return None
+
+    def _publish_plate(self, bay, payload):
+        if self.publish is None:
+            return
+        try:
+            self.publish(f"{self.ocr_topic_prefix}/{bay}",
+                         json.dumps(payload, default=str))
+        except Exception:
+            self.log.warning(f"({bay}) failed to publish the plate result",
+                             exc_info=True)
+
+    def _end_session(self, bay, sess, status, plate=None, conf=0.0, raw=None):
+        """Close a reading session and publish its outcome -- including
+        the failures, since "a truck entered and its plate could not be
+        read" is a result worth knowing, not silence."""
+        self.sessions.pop(bay, None)
+        payload = {
+            "bay": bay,
+            "status": status,               # READ | NO_VALID_PLATE | TIMEOUT
+            "plate": plate,
+            "confidence": round(conf, 3),
+            "raw": raw,
+            "trigger": sess.trigger,
+            "attempts": sess.attempts,
+            "frames": sess.frames,
+            "elapsed_sec": sess.elapsed,
+            "started": sess.started_ts,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "reads": sess.reads,
+        }
+        if status == "READ":
+            self.plates_read += 1
+            self.log.info(f"({bay}) PLATE READ: {plate} (conf {conf:.2f}) "
+                          f"after {sess.attempts} OCR attempt(s) over "
+                          f"{sess.frames} frame(s), {sess.elapsed}s since "
+                          f"{sess.trigger}")
+        else:
+            self.log.info(f"({bay}) no valid plate after {sess.attempts} "
+                          f"attempt(s) over {sess.frames} frame(s) "
+                          f"({sess.elapsed}s since {sess.trigger}) -> {status}")
+        self._publish_plate(bay, payload)
+        return payload
+
+    def _save_crop(self, bay, stamp, crop, plate):
+        if self.crops_dir is None or not self.ocr_save_crops:
+            return None
+        try:
+            safe_bay = str(bay).replace("/", "_").replace("\\", "_")
+            safe_plate = (plate or "NOREAD").replace("/", "_")
+            path = self.crops_dir / f"{safe_bay}_{stamp}_{safe_plate}.jpg"
+            ok, buf = cv2.imencode(".jpg", crop)
+            if ok:
+                path.write_bytes(buf.tobytes())
+                return str(path)
+        except Exception:
+            self.log.warning(f"({bay}) failed to save a plate crop",
+                             exc_info=True)
+        return None
+
+    def _read_plates(self, bay, img, stamp, plate_res, truck_res):
+        """Open or continue this bay's reading session on this frame.
+
+        A valid entry opens a session; every LATER frame's plate boxes
+        are then read into it until one passes plate_text.is_valid() or
+        the budget runs out. Reading across frames rather than once is
+        the point: a single crop of a moving truck is often blurred or
+        half-turned, and the probe is polling this bay anyway.
+
+        Returns the per-frame OCR record for detections.jsonl."""
+        from .probe_ocr import ReadSession, crop_with_padding
+
+        plate_boxes = self._plate_boxes(plate_res, truck_res)
+        sess = self.sessions.get(bay)
+
+        if sess is None:
+            trigger = self._ocr_trigger(truck_res, plate_boxes)
+            if trigger is None:
+                return None
+            sess = ReadSession(bay, trigger, datetime.now(timezone.utc).isoformat())
+            self.sessions[bay] = sess
+            self.sessions_opened += 1
+            self.log.info(f"({bay}) plate-reading session opened by {trigger}")
+
+        sess.frames += 1
+        attempted, found = 0, None
+        for pb in plate_boxes:
+            if sess.attempts >= self.ocr_max_attempts:
+                break
+            crop = crop_with_padding(img, pb["box"], self.ocr_crop_padding_pct)
+            if crop is None:
+                continue
+            # Don't spend an attempt re-reading a crop already tried --
+            # a stationary truck presents near-identical pixels every
+            # frame, and each repeat would burn budget for a result
+            # already known.
+            thumb = thumbnail(crop, (64, 32))
+            if any(duplicate_thumbs(thumb, t, 3.0) for t in sess.tried_thumbs):
+                continue
+            sess.tried_thumbs.append(thumb)
+            sess.attempts += 1
+            attempted += 1
+            plate, conf, valid, raw = self.reader.read(crop)
+            sess.reads.append({"source": pb["source"], "box": pb["box"],
+                               "det_conf": pb["conf"], "plate": plate,
+                               "ocr_conf": round(conf, 3), "valid": valid,
+                               "raw": raw})
+            self.log.debug(f"({bay}) OCR attempt {sess.attempts}: "
+                           f"raw='{raw}' -> '{plate}' conf={conf:.2f} "
+                           f"valid={valid} (from {pb['source']})")
+            if valid:
+                found = (plate, conf, raw, crop)
+                break
+
+        if found is not None:
+            plate, conf, raw, crop = found
+            saved = self._save_crop(bay, stamp, crop, plate)
+            result = self._end_session(bay, sess, "READ", plate, conf, raw)
+            return {"session": "closed", "outcome": "READ", "plate": plate,
+                    "confidence": result["confidence"], "crop": saved,
+                    "attempts_this_frame": attempted}
+
+        if sess.attempts >= self.ocr_max_attempts:
+            self._end_session(bay, sess, "NO_VALID_PLATE")
+            return {"session": "closed", "outcome": "NO_VALID_PLATE",
+                    "attempts_this_frame": attempted}
+        if sess.elapsed >= self.ocr_session_timeout:
+            self._end_session(bay, sess, "TIMEOUT")
+            return {"session": "closed", "outcome": "TIMEOUT",
+                    "attempts_this_frame": attempted}
+
+        return {"session": "open", "trigger": sess.trigger,
+                "attempts": sess.attempts, "frames": sess.frames,
+                "elapsed_sec": sess.elapsed,
+                "attempts_this_frame": attempted}
 
     def _is_valid_enter(self, entry: dict) -> bool:
         """Is this box geometrically consistent with a truck still
@@ -443,6 +633,15 @@ class ModelProbe:
         saved = (self._save_image(bay, stamp, img, plate_res, truck_res)
                  if self._should_save(plate_res, truck_res) else None)
 
+        ocr_row = None
+        if self.reader is not None:
+            try:
+                ocr_row = self._read_plates(bay, img, stamp, plate_res, truck_res)
+            except Exception:
+                # A reading failure must never stop the detection
+                # measurement, which is the primary output.
+                self.log.error(f"({bay}) plate reading failed", exc_info=True)
+
         row = {
             "bay": bay,
             "timestamp": ts.isoformat(),
@@ -463,6 +662,7 @@ class ModelProbe:
                 "inference_ms": truck_res["inference_ms"],
             },
             "image": saved,
+            "ocr": ocr_row,
         }
         self._record(row)
 
@@ -499,7 +699,9 @@ class ModelProbe:
             f"({s['truck_model']['pct_of_frames']}%, avg "
             f"{s['truck_model']['avg_inference_ms']}ms), classes="
             f"{s['truck_model']['class_counts']}"
-)
+            + (f"; plate reading: {self.plates_read} read from "
+               f"{self.sessions_opened} session(s)"
+               if self.sessions_opened else ""))
         self.log.info(
             f"SUMMARY plate agreement: both={a['both_found']} "
             f"plate-model-only={a['plate_model_only']} "

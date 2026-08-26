@@ -701,6 +701,34 @@ def load_config(path: Path = None) -> dict:
     # Every box's bottom edge is recorded in detections.jsonl in both
     # forms (box[3] in pixels, bottom_frac as a fraction) whatever gets
     # saved, so the threshold can be re-picked from real data.
+    # Plate reading. A valid ENTRY opens a reading session for that bay
+    # and every LATER frame's plate boxes are OCR'd into it until one
+    # passes plate_text.is_valid() or the budget runs out. Reading
+    # across frames rather than once is the point: a single crop of a
+    # moving truck is often blurred or half-turned, and the probe is
+    # polling that bay anyway.
+    # ocr_trigger_classes opens a session on a truck of that class that
+    # ALSO passes the geometry test below -- Truck_Enter_Closed by
+    # default, since doors-closed is when the plate is not covered.
+    # ocr_trigger_on_plate additionally opens one whenever either model
+    # detects a plate at all, which catches entries the truck model
+    # misses entirely.
+    # Both models' plate boxes are read, since either can see one the
+    # other misses. No geometry filters are applied to the crops (see
+    # probe_ocr) -- those discarded every box on a bay where the plate
+    # model was working perfectly.
+    # Results, including the failures, publish to ocr_topic_prefix +
+    # "/<bay>": {bay, status (READ/NO_VALID_PLATE/TIMEOUT), plate,
+    # confidence, raw, trigger, attempts, frames, elapsed_sec, reads}.
+    probe.setdefault("ocr_enabled", True)
+    probe.setdefault("ocr_trigger_classes", ["Truck_Enter_Closed"])
+    probe.setdefault("ocr_trigger_on_plate", True)
+    probe.setdefault("ocr_max_attempts", 20)
+    probe.setdefault("ocr_session_timeout_sec", 120)
+    probe.setdefault("ocr_min_conf", 0.35)
+    probe.setdefault("ocr_crop_padding_pct", 15)
+    probe.setdefault("ocr_save_crops", True)
+    probe.setdefault("ocr_topic_prefix", "site/alpr/model_probe_plate")
     probe.setdefault("enter_max_bottom_px", 1600)
     probe.setdefault("enter_max_bottom_frac", 0.75)
     probe.setdefault("annotate_saved_images", True)

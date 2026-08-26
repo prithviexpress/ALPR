@@ -82,12 +82,14 @@
 # entries the truck model misses entirely. Both models' plate boxes get
 # read, since either can see one the other misses.
 #
-# Results publish to model_probe.ocr_topic_prefix + "/<bay>", INCLUDING
-# the failures:
-#   {bay, status: READ|NO_VALID_PLATE|TIMEOUT, plate, confidence, raw,
-#    trigger, attempts, frames, elapsed_sec, reads[]}
-# because "a truck entered and its plate could not be read" is a result
-# worth knowing, not silence.
+# Only SUCCESSFUL reads publish, to model_probe.ocr_topic_prefix +
+# "/<bay>":
+#   {bay, status, plate, confidence, raw, trigger, attempts, frames,
+#    elapsed_sec, reads[]}
+# A failed session (NO_VALID_PLATE / TIMEOUT) is still logged and still
+# written to detections.jsonl with its full per-attempt reads[], so
+# nothing is lost for analysis -- only MQTT stays quiet. Set
+# model_probe.ocr_publish_failures true to send those too.
 #
 # The log prints a periodic SUMMARY with the agreement counts that settle
 # the question -- how often each model sees something the other misses --

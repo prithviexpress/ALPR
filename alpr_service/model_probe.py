@@ -206,6 +206,15 @@ class ModelProbe:
         # only wants detection counts doesn't pay for PaddleOCR.
         self.reader = None
         self.sessions = {}
+        # Bays whose reading session has finished -- read or given up --
+        # and must not immediately open another for the SAME truck.
+        # Without this, a truck with an unreadable plate exhausts its
+        # budget, closes, and the very next frame opens a fresh session
+        # with an empty dedupe list that re-reads the identical crops,
+        # forever. Cleared when the bay is next seen with no truck and no
+        # plate at all, i.e. that truck has left, which is the honest
+        # definition of "a new truck may now be read".
+        self.finished_bays = set()
         self.ocr_enabled = self.cfg["ocr_enabled"]
         self.ocr_trigger_classes = {c.strip().lower()
                                     for c in (self.cfg["ocr_trigger_classes"] or [])}
@@ -215,6 +224,7 @@ class ModelProbe:
         self.ocr_crop_padding_pct = self.cfg["ocr_crop_padding_pct"]
         self.ocr_topic_prefix = self.cfg["ocr_topic_prefix"]
         self.ocr_save_crops = self.cfg["ocr_save_crops"]
+        self.ocr_publish_failures = self.cfg["ocr_publish_failures"]
         self.plates_read = 0
         self.sessions_opened = 0
         self.crops_dir = self.out_dir / "plates" if self.out_dir else None
@@ -361,10 +371,16 @@ class ModelProbe:
                              exc_info=True)
 
     def _end_session(self, bay, sess, status, plate=None, conf=0.0, raw=None):
-        """Close a reading session and publish its outcome -- including
-        the failures, since "a truck entered and its plate could not be
-        read" is a result worth knowing, not silence."""
+        """Close a reading session, publishing only a SUCCESSFUL read by
+        default (ocr_publish_failures to send the rest too).
+
+        A failed session is still logged and still written to
+        detections.jsonl with its full per-attempt `reads`, so nothing is
+        lost for analysis -- only MQTT stays quiet. Subscribers to this
+        topic want plate numbers, and a stream where most messages carry
+        plate=null buries the ones that don't."""
         self.sessions.pop(bay, None)
+        self.finished_bays.add(bay)
         payload = {
             "bay": bay,
             "status": status,               # READ | NO_VALID_PLATE | TIMEOUT
@@ -388,8 +404,11 @@ class ModelProbe:
         else:
             self.log.info(f"({bay}) no valid plate after {sess.attempts} "
                           f"attempt(s) over {sess.frames} frame(s) "
-                          f"({sess.elapsed}s since {sess.trigger}) -> {status}")
-        self._publish_plate(bay, payload)
+                          f"({sess.elapsed}s since {sess.trigger}) -> {status} "
+                          f"(not published; the attempts are in "
+                          f"detections.jsonl)")
+        if status == "READ" or self.ocr_publish_failures:
+            self._publish_plate(bay, payload)
         return payload
 
     def _save_crop(self, bay, stamp, crop, plate):
@@ -421,9 +440,21 @@ class ModelProbe:
         from .probe_ocr import ReadSession, crop_with_padding
 
         plate_boxes = self._plate_boxes(plate_res, truck_res)
+
+        # An empty bay means whatever was read (or given up on) has
+        # left, so the next truck gets a fresh session.
+        if not truck_res["trucks"] and not plate_boxes:
+            if bay in self.finished_bays:
+                self.finished_bays.discard(bay)
+                self.log.debug(f"({bay}) bay clear -- ready to read again")
+            return None
+
         sess = self.sessions.get(bay)
 
         if sess is None:
+            if bay in self.finished_bays:
+                # Already handled this truck; wait for the bay to clear.
+                return None
             trigger = self._ocr_trigger(truck_res, plate_boxes)
             if trigger is None:
                 return None

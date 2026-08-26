@@ -717,9 +717,14 @@ def load_config(path: Path = None) -> dict:
     # other misses. No geometry filters are applied to the crops (see
     # probe_ocr) -- those discarded every box on a bay where the plate
     # model was working perfectly.
-    # Results, including the failures, publish to ocr_topic_prefix +
-    # "/<bay>": {bay, status (READ/NO_VALID_PLATE/TIMEOUT), plate,
-    # confidence, raw, trigger, attempts, frames, elapsed_sec, reads}.
+    # Only a SUCCESSFUL read publishes to ocr_topic_prefix + "/<bay>":
+    # {bay, status, plate, confidence, raw, trigger, attempts, frames,
+    # elapsed_sec, reads}. Subscribers to that topic want plate numbers,
+    # and a stream where most messages carry plate=null buries the ones
+    # that don't. A failed session is still logged and still written to
+    # detections.jsonl with its full per-attempt `reads`, so nothing is
+    # lost for analysis -- set ocr_publish_failures true to send the
+    # NO_VALID_PLATE/TIMEOUT outcomes over MQTT as well.
     probe.setdefault("ocr_enabled", True)
     probe.setdefault("ocr_trigger_classes", ["Truck_Enter_Closed"])
     probe.setdefault("ocr_trigger_on_plate", True)
@@ -728,6 +733,7 @@ def load_config(path: Path = None) -> dict:
     probe.setdefault("ocr_min_conf", 0.35)
     probe.setdefault("ocr_crop_padding_pct", 15)
     probe.setdefault("ocr_save_crops", True)
+    probe.setdefault("ocr_publish_failures", False)
     probe.setdefault("ocr_topic_prefix", "site/alpr/model_probe_plate")
     probe.setdefault("enter_max_bottom_px", 1600)
     probe.setdefault("enter_max_bottom_frac", 0.75)

@@ -37,10 +37,14 @@ from .logging_setup import get_logger
 # produced it). Overridable via bay_monitor.truck_class_map so a
 # retrained model with different class names doesn't need a code change.
 DEFAULT_CLASS_MAP = {
-    "Truck_Enter_Closed":  {"status": "arriving", "door_state": "closed"},
-    "Truck_Enter_Open":    {"status": "arriving", "door_state": "open"},
-    "Truck_Docked_Closed": {"status": "docked",   "door_state": "closed"},
-    "Truck_Docked_Open":   {"status": "loading",  "door_state": "open"},
+    "Truck_Enter_Closed":  {"status": "arriving", "door_state": "closed",
+                            "phase": "entering"},
+    "Truck_Enter_Open":    {"status": "arriving", "door_state": "open",
+                            "phase": "entering"},
+    "Truck_Docked_Closed": {"status": "docked",   "door_state": "closed",
+                            "phase": "docked"},
+    "Truck_Docked_Open":   {"status": "loading",  "door_state": "open",
+                            "phase": "docked"},
 }
 
 # Detected, reported, but never treated as truck presence -- see the
@@ -192,12 +196,18 @@ class TruckDetector:
                 if best is None or conf > best["confidence"]:
                     best = {"class_name": name, "confidence": conf,
                             "status": mapped["status"],
-                            "door_state": mapped["door_state"]}
+                            "door_state": mapped["door_state"],
+                            # .get, not [...]: a custom truck_class_map
+                            # written before phase existed simply has no
+                            # opinion, which reads as "unknown" and
+                            # changes no behaviour.
+                            "phase": mapped.get("phase")}
 
         inference_ms = int((time.time() - t) * 1000)
         if best is None:
             return {
-                "status": empty_status, "door_state": None, "confidence": 0.0,
+                "status": empty_status, "door_state": None, "phase": None,
+                "confidence": 0.0,
                 "class_name": None, "plate_boxes": plate_boxes,
                 "plate_visible": bool(plate_boxes), "counts": counts,
                 "comment": "No truck detected in frame.",
@@ -209,6 +219,11 @@ class TruckDetector:
         return {
             "status": best["status"],
             "door_state": best["door_state"],
+            # "entering" vs "docked" -- the plate is only really readable
+            # while a truck is still coming in; once it's reversed into
+            # the bay the plate faces away from the dock camera. See
+            # bay_state.py's read window.
+            "phase": best["phase"],
             "confidence": round(best["confidence"], 3),
             "class_name": best["class_name"],
             "plate_boxes": plate_boxes,

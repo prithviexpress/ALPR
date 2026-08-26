@@ -575,6 +575,46 @@
 #           door_state is None on the ollama backend, which means no
 #           information and never abandons -- same rule as plate_visible
 #           in item #28(e).
+#   30. The plate-readable WINDOW, from a field log: at startup every bay
+#       logged boxes_detected=0 with an empty rejected={} across 11
+#       frames -- the plate model found nothing because there WAS nothing
+#       to find. Each was an already-parked truck that bay_monitor's
+#       startup classification correctly reported as occupied, which
+#       bay_state_engine then treated as an arrival and answered with a
+#       full ~8s collection against a truck that had docked hours
+#       earlier. Two fixes, both about WHEN to read rather than how.
+#       (a) alpr.abandon_read_when_docked. A dock camera can only read a
+#           plate while the truck is still coming IN, plate toward the
+#           camera; once reversed into the bay the plate faces away
+#           entirely. The truck model already distinguishes the two --
+#           its Truck_Enter_* classes now carry phase="entering" and
+#           Truck_Docked_* phase="docked" (truck_detector.
+#           DEFAULT_CLASS_MAP), plumbed through _classify -> on_status.
+#           Reading now stops when phase becomes "docked", publishing
+#           "plate_unreadable" with reason="docked" once per visit --
+#           the same read-window machinery item #29(b) added for
+#           doors_open, which now shares one gate (_check_read_window).
+#           If the FIRST sighting of a visit is already docked, no read
+#           is attempted at all: the entry was missed, so there is
+#           nothing to catch.
+#       (b) alpr.read_startup_occupancy (default false). A truck already
+#           at the bay when the process starts is no longer read at all.
+#           bay_monitor forces one classify per bay at startup precisely
+#           to notice these, and that part is right -- the arrival is
+#           still detected and published, carrying
+#           read_skipped="startup_occupancy" -- but the read itself was
+#           always doomed, and it held a worker thread that genuinely
+#           new arrivals were queueing for.
+#           Detected without any new plumbing: bay_state_engine already
+#           seeds bay_status to "" per bay, so an empty previous status
+#           means "first reading this process has ever taken of this
+#           bay", which coincides exactly with bay_monitor's own forced
+#           first look.
+#       Both skip reasons appear on the arrival event's read_skipped
+#       field, so a consumer can tell "we chose not to look" apart from
+#       "we looked and failed" -- which the older NO_VALID_PLATE result
+#       could never express. phase, like door_state and plate_visible,
+#       is None on the ollama backend and never closes the window.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (used if http_trigger.enabled or bay_monitor.

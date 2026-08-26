@@ -94,6 +94,8 @@ class BayStateEngine:
             config["alpr"]["retry_only_when_plate_visible"]
         self.abandon_when_doors_open = \
             config["alpr"]["abandon_read_when_doors_open"]
+        self.abandon_when_docked = config["alpr"]["abandon_read_when_docked"]
+        self.read_startup_occupancy = config["alpr"]["read_startup_occupancy"]
         # Bays where the plate has been given up on for the CURRENT visit
         # -- the truck's doors opened before it could be read, and on a
         # reversed-in trailer those doors physically cover the plate, so
@@ -294,7 +296,8 @@ class BayStateEngine:
 
     def on_status(self, bay: str, status: str, timestamp: str,
                   occupied: bool, departed: bool, comment=None,
-                  image_b64=None, door_state=None, plate_visible=None):
+                  image_b64=None, door_state=None, plate_visible=None,
+                  phase=None):
         """Called by bay_monitor after every classification.
 
         `occupied` and `departed` are bay_monitor's OWN interpretation of
@@ -324,6 +327,14 @@ class BayStateEngine:
         doesn't report it), which is treated as "go ahead", not as "no
         plate"."""
         with self.lock:
+            # Captured BEFORE the update: an empty/absent previous status
+            # means this is the first reading this process has ever taken
+            # of the bay. If it's already occupied, the truck was parked
+            # there before startup -- see _arrival_read_skip_reason. No
+            # extra plumbing from bay_monitor needed, since it forces
+            # exactly one classify per bay at startup, so its "first look"
+            # and this coincide.
+            first_ever_status = not self.bay_status.get(bay)
             status_changed = self.bay_status.get(bay) != status
             self.bay_status[bay] = status
             if door_state is not None:
@@ -353,14 +364,16 @@ class BayStateEngine:
                 # the failure this module exists to prevent. With a
                 # session open, any occupied read is a continuation.
                 if not session.open:
-                    self._on_arrival(session, timestamp, arrival_door_state)
+                    self._on_arrival(
+                        session, timestamp, arrival_door_state, phase,
+                        self._arrival_read_skip_reason(first_ever_status, phase))
                 elif session.plate is None:
-                    # Checked before retrying, not after: once the doors
-                    # are open there is nothing left to read, so the
-                    # right move is to stop and say so rather than spend
-                    # another attempt finding that out again.
-                    if self._check_doors_closed_read_window(
-                            session, status, door_state, timestamp):
+                    # Checked before retrying, not after: once the read
+                    # window has closed there is nothing left to read, so
+                    # the right move is to stop and say so rather than
+                    # spend another attempt finding that out again.
+                    if self._check_read_window(session, status, door_state,
+                                                phase, timestamp):
                         self._retry_read(session, timestamp, plate_visible)
             elif departed and session.open:
                 self._on_departure(session, timestamp)
@@ -378,17 +391,29 @@ class BayStateEngine:
             self._write_csv()
 
     def _on_arrival(self, session: BaySession, timestamp: str,
-                     door_state=None):
+                     door_state=None, phase=None, skip_reason=None):
         session.reset()
         session.direction = "enter"
         self.arrival_time[session.bay] = time.time()
         # A fresh truck: whatever was given up on last visit says nothing
         # about this one.
         self.read_abandoned.discard(session.bay)
-        self.log.info(f"({session.bay}) arrival detected -> enter, "
-                       f"enqueuing ALPR read"
-                       + (f" (doors {door_state})" if door_state else ""))
-        self._enqueue_read(session, timestamp)
+        detail = "".join([f" (doors {door_state})" if door_state else "",
+                          f" [{phase}]" if phase else ""])
+
+        if skip_reason:
+            # The arrival is still real and still published -- only the
+            # ALPR read is skipped, because the plate-readable window
+            # closed before this service ever saw the truck. Marked
+            # abandoned so the retry path doesn't quietly start reading
+            # on the next classification either.
+            self.read_abandoned.add(session.bay)
+            self.log.info(f"({session.bay}) arrival detected -> enter{detail}, "
+                           f"but NOT reading the plate: {skip_reason}")
+        else:
+            self.log.info(f"({session.bay}) arrival detected -> enter{detail}, "
+                           f"enqueuing ALPR read")
+            self._enqueue_read(session, timestamp)
 
         # The requested alert: a truck that backs in with its doors
         # ALREADY open, rather than being opened once docked. Raised on
@@ -403,50 +428,103 @@ class BayStateEngine:
         # enqueued above and takes seconds. Publish the arrival now
         # anyway (a dock system needs to know a truck is there NOW) and
         # follow up with 'identified' when the plate resolves.
-        self.awaiting_identity.add(session.bay)
+        # Only expect an "identified" follow-up if a read is actually
+        # going to happen -- otherwise this bay would sit in
+        # awaiting_identity for a plate nobody is looking for.
+        if not skip_reason:
+            self.awaiting_identity.add(session.bay)
         self._publish_event(session.bay, "arrived", timestamp,
                              truck_number=self.unknown_plate_value,
-                             door_state=door_state, alert=alert)
+                             door_state=door_state, phase=phase, alert=alert,
+                             read_skipped=skip_reason)
         self._publish_state(session, timestamp)
 
-    def _check_doors_closed_read_window(self, session: BaySession, status: str,
-                                         door_state, timestamp: str) -> bool:
-        """Is it still worth trying to read this truck's plate at all?
+    ABANDON_REASONS = {
+        "doors_open": ("its doors are open, so the plate is behind them now"),
+        "docked": ("it has finished reversing in, so the plate now faces "
+                   "away from the dock camera"),
+    }
 
-        Returns False once the doors are open. On a reversed-in trailer
-        the rear doors swing OUT and physically cover the number plate,
-        so every further attempt photographs a door -- no amount of
-        retrying, better OCR or a longer collection window recovers a
-        plate that is not in the frame any more. Rather than burning the
-        rest of max_read_attempts discovering that repeatedly, give up
-        for this visit and publish the observation, which is the honest
-        answer: a truck is here, its doors are open, and its plate cannot
-        be read.
+    def _check_read_window(self, session: BaySession, status: str,
+                            door_state, phase, timestamp: str) -> bool:
+        """Is there still any point trying to read this truck's plate?
+
+        A dock camera can only read a plate during a narrow window: while
+        the truck is still coming IN, with its doors still shut. Two
+        things close that window, both permanently for this visit:
+
+          docked      the truck has finished reversing into the bay, so
+                      its plate faces away from the camera entirely
+                      (alpr.abandon_read_when_docked)
+          doors_open  the rear doors have swung OUT and now cover the
+                      plate (alpr.abandon_read_when_doors_open)
+
+        Neither is recoverable by retrying: the plate is not in the frame
+        any more, and no amount of extra attempts, better OCR or a longer
+        collection window changes that. Since max_read_attempts is a
+        per-VISIT budget spent on threads shared with genuinely new
+        arrivals, continuing past either point is pure waste -- so give
+        up and publish the observation instead, which is the honest
+        answer: a truck is here, and its plate cannot be read.
 
         Published exactly once per visit (read_abandoned), so a truck
-        that sits with its doors open for an hour of classifications
-        doesn't re-announce it on every one. Cleared at arrival and
-        departure, so the next truck starts fresh.
+        that sits docked for an hour of classifications doesn't
+        re-announce it on every one. Cleared at arrival and departure so
+        the next truck starts fresh.
 
-        door_state is None on the ollama backend (no information), which
-        never abandons -- same rule as plate_visible."""
-        if not self.abandon_when_doors_open or door_state != "open":
-            return True
+        Both door_state and phase are None on the ollama backend, which
+        reports neither -- that means NO INFORMATION and never abandons,
+        the same rule plate_visible follows."""
         if session.bay in self.read_abandoned:
             return False
 
+        reason = None
+        if self.abandon_when_doors_open and door_state == "open":
+            reason = "doors_open"
+        elif self.abandon_when_docked and phase == "docked":
+            reason = "docked"
+        if reason is None:
+            return True
+
         self.read_abandoned.add(session.bay)
         self.log.info(
-            f"({session.bay}) doors are open and no plate was confirmed "
-            f"({session.read_attempts} attempt(s) made) -- the plate is "
-            f"behind the open doors now, so giving up on the read for this "
-            f"visit and publishing the observation instead")
+            f"({session.bay}) no plate confirmed after "
+            f"{session.read_attempts} attempt(s) and {self.ABANDON_REASONS[reason]} "
+            f"-- closing the read window for this visit and publishing the "
+            f"observation instead")
         self._publish_event(
             session.bay, "plate_unreadable", timestamp,
             truck_number=self.unknown_plate_value,
-            reason="doors_open", door_state=door_state, activity=status,
+            reason=reason, door_state=door_state, phase=phase, activity=status,
             read_attempts=session.read_attempts)
         return False
+
+    def _arrival_read_skip_reason(self, first_ever_status: bool, phase):
+        """Why this arrival shouldn't trigger an ALPR read at all, or
+        None to go ahead.
+
+        Both cases mean the same thing: the entry was already missed, so
+        the plate-readable window closed before this service ever looked.
+
+          startup_occupancy  this is the FIRST status ever recorded for
+                             the bay and it's already occupied -- the
+                             truck was parked there before the process
+                             started (bay_monitor forces one classify per
+                             bay at startup precisely to notice this).
+                             Reading it means an 8-second collection
+                             against a truck that docked hours ago.
+          already_docked     the very first sighting of this visit is a
+                             truck that has already finished reversing in
+                             -- entry happened between scans, or the
+                             truck model only picked it up once parked.
+
+        Governed by alpr.read_startup_occupancy / abandon_read_when_docked
+        respectively."""
+        if first_ever_status and not self.read_startup_occupancy:
+            return "startup_occupancy"
+        if self.abandon_when_docked and phase == "docked":
+            return "already_docked"
+        return None
 
     def _retry_read(self, session: BaySession, timestamp: str,
                      plate_visible=None):

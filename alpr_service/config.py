@@ -266,6 +266,36 @@ def load_config(path: Path = None) -> dict:
     # None on the ollama backend, which means no information and never
     # abandons.
     alpr.setdefault("abandon_read_when_doors_open", True)
+    # Stop reading once the truck model reports the truck has finished
+    # reversing INTO the bay (its Truck_Docked_* classes, phase="docked"),
+    # rather than still coming in (Truck_Enter_*, phase="entering").
+    # A dock camera can only read a plate during a narrow window -- while
+    # the truck is still approaching, plate toward the camera. Once
+    # reversed in, the plate faces away from the camera entirely and no
+    # amount of retrying recovers it. Confirmed in the field: every bay
+    # reporting boxes_detected=0 with an empty rejected={} across 11
+    # frames, i.e. the plate model found nothing at all because there was
+    # nothing to find. Publishes a "plate_unreadable" event with
+    # reason="docked" instead, once per visit.
+    # If the FIRST sighting of a visit is already docked, the entry was
+    # missed entirely and no read is attempted at all (reason
+    # "already_docked" on the arrival event's read_skipped field).
+    # Only has effect with bay_monitor.classifier="yolo" -- phase is None
+    # on the ollama backend, which means no information and never
+    # abandons.
+    alpr.setdefault("abandon_read_when_docked", True)
+    # Whether to run an ALPR read for a truck that was ALREADY at the bay
+    # when the service started. Default false: bay_monitor forces one
+    # classify per bay at startup to establish ground truth, which
+    # correctly reports those bays occupied and opens a session for each
+    # -- but the truck docked long before the process began, so its plate
+    # window is long gone and the read is an ~8s collection guaranteed to
+    # return nothing, on a worker thread genuinely new arrivals are
+    # queueing for. The arrival is still detected and published, with
+    # read_skipped="startup_occupancy"; only the doomed read is skipped.
+    # Set true to attempt it anyway (e.g. a forward-facing camera where
+    # a parked truck's plate does stay visible).
+    alpr.setdefault("read_startup_occupancy", False)
     # How many times a Worker retries loading YOLO+PaddleOCR at startup
     # before giving up (backoff_sec apart) -- a transient failure (e.g. a
     # proxy blocking a one-time model download) shouldn't need a process

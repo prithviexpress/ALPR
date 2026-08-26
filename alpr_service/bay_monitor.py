@@ -772,6 +772,7 @@ class BayMonitor:
                                           self.cfg["classify_jpeg_quality"])
             return {"status": result["status"], "comment": result["comment"],
                     "image_b64": image_b64, "door_state": result["door_state"],
+                    "phase": result["phase"],
                     "plate_visible": result["plate_visible"],
                     "confidence": result["confidence"]}
 
@@ -780,7 +781,8 @@ class BayMonitor:
         if status is None:
             return None
         return {"status": status, "comment": comment, "image_b64": image_b64,
-                "door_state": None, "plate_visible": None, "confidence": None}
+                "door_state": None, "phase": None, "plate_visible": None,
+                "confidence": None}
 
     def _merge_plate_assist(self, bay: str, img, result: dict):
         """Fold the plate-only model's opinion into the truck model's
@@ -817,6 +819,7 @@ class BayMonitor:
             # plate.
             result["status"] = self.plate_only_status
             result["door_state"] = None
+            result["phase"] = None
             result["comment"] = (
                 f"No truck detected by the truck model, but the plate model "
                 f"found {len(assist['plate_boxes'])} number plate(s), so the "
@@ -917,6 +920,11 @@ class BayMonitor:
         # Ollama backend (it has no idea), which means "no information",
         # not "no plate".
         plate_visible = result["plate_visible"]
+        # "entering" vs "docked": the plate is only really readable while
+        # a truck is still coming in, since a reversed-in trailer's plate
+        # faces away from the dock camera once parked. bay_state_engine
+        # uses this to close the read window. None on the Ollama backend.
+        phase = result["phase"]
         state.classified_once = True
         state.last_status = status
         self._update_door_state(bay, state, door_state)
@@ -977,11 +985,11 @@ class BayMonitor:
 
         state.plate_visible = plate_visible
         self._notify(bay, status, timestamp, occupied, departed, comment,
-                     image_b64, door_state, plate_visible)
+                     image_b64, door_state, plate_visible, phase)
 
     def _notify(self, bay, status, timestamp, occupied, departed,
                 comment=None, image_b64=None, door_state=None,
-                plate_visible=None):
+                plate_visible=None, phase=None):
         """Hand the reading to a consumer as an already-interpreted event.
 
         `occupied` and `departed` are decided here rather than shipping
@@ -1012,7 +1020,8 @@ class BayMonitor:
             return
         try:
             self.on_status(bay, status, timestamp, occupied, departed,
-                            comment, image_b64, door_state, plate_visible)
+                            comment, image_b64, door_state, plate_visible,
+                            phase)
         except Exception:
             self.log.error(f"({bay}) on_status hook raised", exc_info=True)
 

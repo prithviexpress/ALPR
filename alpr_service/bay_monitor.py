@@ -315,6 +315,14 @@ class BayMonitor:
         self.audit_dir = audit_dir
         self.save_latest_frame = (audit_dir is not None
                                    and self.cfg["save_latest_frame"])
+        # How the on-demand snapshot webhook serves that frame -- see
+        # get_snapshot. Separate from classify_max_dimension/
+        # classify_jpeg_quality (what the vision model is shown): a human
+        # or dashboard pulling a thumbnail and a VLM being asked to
+        # classify want different sizes, and tuning one shouldn't
+        # silently change the other.
+        self.snapshot_max_dimension = self.cfg["snapshot_webhook_max_dimension"]
+        self.snapshot_jpeg_quality = self.cfg["snapshot_webhook_jpeg_quality"]
         self.states = {}
 
         config_dir = Path(config["_config_dir"])
@@ -393,11 +401,30 @@ class BayMonitor:
         fetch -- a live "what does this camera currently see" view for
         remote troubleshooting, without wading through diagnostics_mode's
         much larger per-event dumps. One file per bay, always the most
-        recent frame, never accumulates."""
+        recent frame, never accumulates.
+
+        Written to a .tmp and atomically renamed into place (same reason
+        bay_state.py's _write_csv does): get_snapshot serves this exact
+        file from a DIFFERENT thread, so a plain overwrite lets a webhook
+        request read a half-written JPEG mid-scan and serve a corrupt
+        image.
+
+        Encoded via imencode + write_bytes rather than imwrite(tmp_path):
+        cv2 picks its encoder from the file EXTENSION, and ".jpg.tmp"
+        isn't one it recognizes -- imwrite raises "could not find a
+        writer for the specified extension" on it, which the best-effort
+        except below would swallow into a warning while latest_frame.jpg
+        silently stopped being written at all."""
         try:
             bay_dir = self.audit_dir / bay
             bay_dir.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(bay_dir / "latest_frame.jpg"), frame)
+            ok, buf = cv2.imencode(".jpg", frame)
+            if not ok:
+                self.log.warning(f"({bay}) failed to JPEG-encode latest_frame")
+                return
+            tmp_path = bay_dir / "latest_frame.jpg.tmp"
+            tmp_path.write_bytes(buf.tobytes())
+            tmp_path.replace(bay_dir / "latest_frame.jpg")
         except Exception:
             # Best-effort diagnostics -- must never take the scan loop
             # down over a disk/permission problem.
@@ -489,28 +516,55 @@ class BayMonitor:
         (stateful, not meant for concurrent cross-thread reuse) with
         whatever thread is serving the HTTP request.
 
+        The image is downscaled to snapshot_webhook_max_dimension on its
+        longest side (640 by default, aspect ratio preserved -- so a 4:3
+        camera gives 640x480 and a 16:9 one 640x360) and re-encoded at
+        snapshot_webhook_jpeg_quality, rather than serving the full
+        camera resolution: base64 inflates by ~33%, and a 5MP frame makes
+        a multi-megabyte JSON body out of what is usually wanted as a
+        thumbnail. Set max_dimension to 0 to serve the frame at its
+        original size.
+
         Returns None if there's nothing to serve yet -- an unrecognized
-        bay, or no frame has been saved for it so far (requires
-        save_latest_frame on, which is the default). occupancy_status/
-        activity report this bay's last-known classification (state.
-        last_status), both None until it's ever been classified."""
+        bay, no frame saved for it so far (requires save_latest_frame on,
+        which is the default), or a frame that won't decode.
+        occupancy_status/activity report this bay's last-known
+        classification (state.last_status), both None until it's ever
+        been classified."""
         if bay not in self.cameras or self.audit_dir is None:
             return None
         frame_path = self.audit_dir / bay / "latest_frame.jpg"
         if not frame_path.exists():
+            return None
+        # Read the mtime BEFORE decoding, so the timestamp describes the
+        # frame actually being served rather than a newer one the scan
+        # loop may have dropped in the meantime.
+        mtime = datetime.fromtimestamp(frame_path.stat().st_mtime, tz=timezone.utc)
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            self.log.warning(f"({bay}) latest_frame.jpg could not be decoded, "
+                             f"nothing to serve for this snapshot request")
             return None
         state = self.states.get(bay)
         last_status = state.last_status if state else None
         occupancy_status = None
         if last_status is not None:
             occupancy_status = "empty" if last_status == self.empty_status else "occupied"
-        image_b64 = base64.b64encode(frame_path.read_bytes()).decode("ascii")
-        mtime = datetime.fromtimestamp(frame_path.stat().st_mtime, tz=timezone.utc)
+        # Downscaled once here rather than letting encode_image do it, so
+        # the width/height reported below describe the bytes actually
+        # being served without resizing the same frame twice.
+        served = downscale(img, self.snapshot_max_dimension)
+        image_b64 = encode_image(served, 0, self.snapshot_jpeg_quality)
+        if image_b64 is None:
+            self.log.warning(f"({bay}) failed to JPEG-encode the snapshot")
+            return None
         return {
             "bay": bay,
             "occupancy_status": occupancy_status,
             "activity": last_status,
             "image_base64": image_b64,
+            "width": served.shape[1],
+            "height": served.shape[0],
             "timestamp": mtime.isoformat(),
         }
 

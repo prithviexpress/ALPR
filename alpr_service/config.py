@@ -446,6 +446,17 @@ def load_config(path: Path = None) -> dict:
     bay_monitor.setdefault("snapshot_webhook_host", "0.0.0.0")
     bay_monitor.setdefault("snapshot_webhook_port", 8081)
     bay_monitor.setdefault("snapshot_webhook_threads", 4)
+    # How the served frame is resized before base64-encoding: longest
+    # side capped at max_dimension, aspect ratio preserved (so a 4:3
+    # camera yields 640x480, a 16:9 one 640x360). Full camera resolution
+    # would make a multi-megabyte JSON body -- base64 alone inflates by
+    # ~33% -- out of what is normally wanted as a thumbnail. 0 serves the
+    # frame at its original size. Deliberately separate from
+    # classify_max_dimension/classify_jpeg_quality (what the VISION MODEL
+    # is shown): retuning what a dashboard pulls shouldn't silently
+    # change what gets classified, or vice versa.
+    bay_monitor.setdefault("snapshot_webhook_max_dimension", 640)
+    bay_monitor.setdefault("snapshot_webhook_jpeg_quality", 80)
     # Per-bay state engine (bay_state.py) -- fuses bay_monitor's
     # continuous status stream with ALPR plate reads into one session per
     # bay, and becomes the authority for enter/leave direction and

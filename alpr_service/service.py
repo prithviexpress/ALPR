@@ -125,9 +125,14 @@ def build_mqtt(cameras: dict, config: dict, bus: JobBus,
             client.subscribe(enter_topic, qos=1)
             client.subscribe(leave_topic, qos=1)
         else:
-            log.info("mqtt.trigger_enabled=false -- not subscribing "
-                      "(http_trigger is the active trigger source); "
-                      "this connection is publish-only")
+            # Deliberately doesn't name which source IS active: this
+            # predates bay_state_engine and asserted http_trigger, which
+            # is wrong (and confusing on startup) for the now-normal
+            # setup where bay_state_engine's truck-model classification
+            # is the only trigger and http_trigger is off too.
+            log.info("mqtt.trigger_enabled=false -- not subscribing to VCA "
+                      "events; this connection is publish-only (results are "
+                      "still published normally)")
 
     def on_disconnect(client, userdata, *args):
         log.warning("disconnected -- paho will auto-reconnect")

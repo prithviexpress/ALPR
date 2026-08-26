@@ -96,6 +96,8 @@ class BayStateEngine:
             config["alpr"]["abandon_read_when_doors_open"]
         self.abandon_when_docked = config["alpr"]["abandon_read_when_docked"]
         self.read_startup_occupancy = config["alpr"]["read_startup_occupancy"]
+        self.read_arrival_when_doors_open = \
+            config["alpr"]["read_arrival_when_doors_open"]
         # Bays where the plate has been given up on for the CURRENT visit
         # -- the truck's doors opened before it could be read, and on a
         # reversed-in trailer those doors physically cover the plate, so
@@ -366,7 +368,8 @@ class BayStateEngine:
                 if not session.open:
                     self._on_arrival(
                         session, timestamp, arrival_door_state, phase,
-                        self._arrival_read_skip_reason(first_ever_status, phase))
+                        self._arrival_read_skip_reason(
+                            first_ever_status, phase, arrival_door_state))
                 elif session.plate is None:
                     # Checked before retrying, not after: once the read
                     # window has closed there is nothing left to read, so
@@ -499,31 +502,47 @@ class BayStateEngine:
             read_attempts=session.read_attempts)
         return False
 
-    def _arrival_read_skip_reason(self, first_ever_status: bool, phase):
+    def _arrival_read_skip_reason(self, first_ever_status: bool, phase,
+                                   door_state):
         """Why this arrival shouldn't trigger an ALPR read at all, or
         None to go ahead.
 
-        Both cases mean the same thing: the entry was already missed, so
-        the plate-readable window closed before this service ever looked.
+        All three cases mean the same thing: the plate-readable window
+        had already closed before this service got a look, so a read is
+        an ~8 second collection with a known-empty result.
 
-          startup_occupancy  this is the FIRST status ever recorded for
-                             the bay and it's already occupied -- the
-                             truck was parked there before the process
-                             started (bay_monitor forces one classify per
-                             bay at startup precisely to notice this).
-                             Reading it means an 8-second collection
-                             against a truck that docked hours ago.
-          already_docked     the very first sighting of this visit is a
-                             truck that has already finished reversing in
-                             -- entry happened between scans, or the
-                             truck model only picked it up once parked.
+          startup_occupancy      the FIRST status ever recorded for the
+                                 bay is already occupied -- the truck
+                                 parked there before the process started
+                                 (bay_monitor forces one classify per bay
+                                 at startup precisely to notice this).
+          already_docked         the first sighting of this visit is a
+                                 truck that has already finished
+                                 reversing in -- entry happened between
+                                 scans, or the model only caught it once
+                                 parked.
+          doors_open_on_arrival  the truck backed in with its rear doors
+                                 already open, so they cover the plate
+                                 from the very first frame.
 
-        Governed by alpr.read_startup_occupancy / abandon_read_when_docked
-        respectively."""
+        That last one was originally allowed ONE read anyway, on the
+        reasoning that a single attempt is cheap insurance against a
+        briefly-visible plate. Field logs settled it: essentially every
+        arrival at these bays reports doors already open, so the "rare
+        insurance" case was in fact the normal case, and each one cost a
+        full 8.5s collection that came back boxes_detected=0 every time.
+        Set alpr.read_arrival_when_doors_open true to restore that
+        attempt.
+
+        Governed by alpr.read_startup_occupancy /
+        abandon_read_when_docked / read_arrival_when_doors_open."""
         if first_ever_status and not self.read_startup_occupancy:
             return "startup_occupancy"
         if self.abandon_when_docked and phase == "docked":
             return "already_docked"
+        if (self.abandon_when_doors_open and door_state == "open"
+                and not self.read_arrival_when_doors_open):
+            return "doors_open_on_arrival"
         return None
 
     def _retry_read(self, session: BaySession, timestamp: str,

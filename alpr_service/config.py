@@ -296,6 +296,22 @@ def load_config(path: Path = None) -> dict:
     # Set true to attempt it anyway (e.g. a forward-facing camera where
     # a parked truck's plate does stay visible).
     alpr.setdefault("read_startup_occupancy", False)
+    # Whether a truck that backs in with its rear doors ALREADY open
+    # still gets one arrival read attempt. Default false.
+    # This originally allowed the attempt, reasoning that one read is
+    # cheap insurance against a plate that happened to be briefly
+    # visible. Field logs settled it the other way: essentially every
+    # arrival at these bays reports doors already open, so the "rare
+    # insurance" case was actually the normal case -- and each attempt
+    # cost a full ~8.5s collection that came back boxes_detected=0 with
+    # an empty rejected={} every single time, i.e. the plate model found
+    # nothing because the open doors were covering the plate from the
+    # first frame onward.
+    # Set true to restore the attempt (e.g. a camera angle where a plate
+    # stays visible past the open doors). Only has effect with
+    # abandon_read_when_doors_open on and the truck-model backend, which
+    # is the only thing that reports door state.
+    alpr.setdefault("read_arrival_when_doors_open", False)
     # How many times a Worker retries loading YOLO+PaddleOCR at startup
     # before giving up (backoff_sec apart) -- a transient failure (e.g. a
     # proxy blocking a one-time model download) shouldn't need a process

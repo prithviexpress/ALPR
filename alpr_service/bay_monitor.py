@@ -774,7 +774,8 @@ class BayMonitor:
                     "image_b64": image_b64, "door_state": result["door_state"],
                     "phase": result["phase"],
                     "plate_visible": result["plate_visible"],
-                    "confidence": result["confidence"]}
+                    "confidence": result["confidence"],
+                    "class_name": result["class_name"]}
 
         status, comment, image_b64 = classify_frame(
             img, self.cfg, self.log, bay, self.references, session=self.session)
@@ -782,7 +783,7 @@ class BayMonitor:
             return None
         return {"status": status, "comment": comment, "image_b64": image_b64,
                 "door_state": None, "phase": None, "plate_visible": None,
-                "confidence": None}
+                "confidence": None, "class_name": None}
 
     def _merge_plate_assist(self, bay: str, img, result: dict):
         """Fold the plate-only model's opinion into the truck model's
@@ -929,6 +930,15 @@ class BayMonitor:
         state.last_status = status
         self._update_door_state(bay, state, door_state)
 
+        # Which detection produced this reading, on the INFO line rather
+        # than only at debug: when every bay reports the same status, the
+        # first question is always "what class, and how confidently" --
+        # and needing to restart at DEBUG to answer it means waiting for
+        # the situation to happen again.
+        detected = ""
+        if result["class_name"]:
+            detected = f" ({result['class_name']} {result['confidence']:.2f})"
+
         timestamp = datetime.now(timezone.utc).isoformat()
         # Off by default: this fires on EVERY classification regardless of
         # whether anything changed, which is the single biggest source of
@@ -939,9 +949,9 @@ class BayMonitor:
             topic = f"{self.status_topic_prefix}/{bay}"
             self.publish(topic, json.dumps(
                 {"bay": bay, "status": status, "timestamp": timestamp}))
-            self.log.info(f"({bay}) status={status} -> {topic}")
+            self.log.info(f"({bay}) status={status}{detected} -> {topic}")
         else:
-            self.log.info(f"({bay}) status={status}")
+            self.log.info(f"({bay}) status={status}{detected}")
 
         # Whether this classify counts as an arrival (or a departure) is
         # decided HERE, from the actual answer, rather than earlier from

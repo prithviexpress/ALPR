@@ -615,6 +615,31 @@
 #       "we looked and failed" -- which the older NO_VALID_PLATE result
 #       could never express. phase, like door_state and plate_visible,
 #       is None on the ollama backend and never closes the window.
+#   31. Two corrections after the truck-model backend's first real run.
+#       (a) alpr.read_arrival_when_doors_open (default false) reverses
+#           item #29(b)'s deliberate exception. That allowed ONE arrival
+#           read even for a truck that backed in with its doors already
+#           open, reasoning that a single attempt was cheap insurance
+#           against a briefly-visible plate. The field logs settled it
+#           the other way: essentially EVERY arrival at these bays
+#           reported doors already open, so the "rare insurance" case was
+#           in fact the normal case -- and each one cost a full ~8.5s
+#           collection returning boxes_detected=0 with an empty
+#           rejected={}, every time, because the open doors covered the
+#           plate from the first frame onward. The arrival is still
+#           detected, still published, and still raises
+#           alert=door_open_on_arrival; only the doomed read is skipped,
+#           reported as read_skipped="doors_open_on_arrival".
+#       (b) bay_monitor's per-classification INFO line now names the
+#           detected class and its confidence -- "status=arriving
+#           (Truck_Enter_Open 0.87)" rather than bare "status=arriving".
+#           Previously that only existed at DEBUG, so when every bay
+#           started reporting the same status there was no way to judge
+#           whether the model was confident or marginal without
+#           restarting at DEBUG and waiting for the situation to recur.
+#           The first question about an unexpected reading is always
+#           "from what class, and how sure" -- it belongs on the line
+#           that reports the reading.
 #
 # New dependencies: `requests` (HTTP snapshot fetch + digest auth),
 # `flask` and `waitress` (used if http_trigger.enabled or bay_monitor.

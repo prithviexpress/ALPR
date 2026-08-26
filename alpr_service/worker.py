@@ -326,6 +326,41 @@ class Worker(threading.Thread):
             self.log.warning(f"({bay}/{direction}) failed to save "
                              f"all_attempts frame", exc_info=True)
 
+    def _describe_rejections(self, rejected: dict) -> str:
+        """"upper_half x6 (alpr.upper_half_fraction=0.45 -- lower it if
+        the camera angle puts plates high in the ROI)" and so on.
+
+        Each rejection reason is paired with the config key that causes
+        it and that key's CURRENT value, because the reason name alone
+        ("upper_half") doesn't tell anyone which setting to change or
+        what it's set to now -- which is the whole question being asked
+        when this fires."""
+        hints = {
+            'upper_half': (
+                f"alpr.upper_half_fraction={self.upper_half_fraction} -- "
+                f"lower it (or 0 to disable) if the camera angle puts "
+                f"plates high in the ROI"),
+            'too_small': (
+                f"alpr.min_plate_width/min_plate_height="
+                f"{self.min_plate_width}x{self.min_plate_height} -- lower "
+                f"if the plate is genuinely small at this distance"),
+            'off_center': (
+                f"alpr.center_distance_limit={self.center_distance_limit} "
+                f"-- raise it if plates sit off to one side of the ROI"),
+            'duplicate': (
+                f"alpr.duplicate_diff_threshold="
+                f"{self.duplicate_diff_threshold} -- every crop looked "
+                f"like one already tried"),
+            'empty_roi': "the roi in cameras.json falls outside the frame",
+            'fetch_fail': "the camera snapshot fetch failed",
+        }
+        parts = []
+        for reason, count in sorted(rejected.items(),
+                                     key=lambda kv: -kv[1]):
+            hint = hints.get(reason)
+            parts.append(f"{reason} x{count}" + (f" ({hint})" if hint else ""))
+        return "; ".join(parts) if parts else "no reason recorded"
+
     # --------- per-job pipeline ---------
     def handle(self, job):
         bay = job['bay']
@@ -369,6 +404,26 @@ class Worker(threading.Thread):
                 f"model file, and camera framing (see debug/ images; "
                 f"set alpr.diagnostics_mode='troubleshooting' for a full "
                 f"per-frame dump)")
+        elif cstats['ocr_attempts'] == 0:
+            # Boxes WERE found and every one was filtered out before OCR.
+            # A very different problem from zero boxes, and a much more
+            # actionable one: the model is doing its job, the geometry
+            # filters are throwing the results away -- so name the count
+            # per reason alongside the exact config key that governs it,
+            # with its current value. Confirmed in the field on a bay
+            # where all 11 detected boxes were dropped (5 too_small, 6
+            # upper_half) and the only way to find out was opening
+            # result.json by hand.
+            self.log.warning(
+                f"({bay}/{direction}) the model found "
+                f"{cstats['total_boxes_detected']} box(es) across "
+                f"{cstats['frames_read']} frames but EVERY one was filtered "
+                f"out before OCR, so nothing was read: "
+                f"{self._describe_rejections(cstats['rejected'])}. The plate "
+                f"model is working here -- these thresholds are what's "
+                f"discarding it (see debug/ images; set alpr.diagnostics_"
+                f"mode='troubleshooting' to see each box drawn with its "
+                f"rejection reason)")
 
         confidence = 0.0
         supporting_reads = 0

@@ -54,11 +54,13 @@
 # Class alone isn't enough, though: clearly DOCKED trucks come back as
 # Truck_Enter_Open/Closed. A single-frame geometric rule settles it --
 # a valid entry's box must not reach further down the frame than
-# model_probe.enter_max_bottom_frac (3/4 by default). A truck that has
-# finished reversing in sits against the dock, and so against the bottom
-# of the frame, pushing its box past that line; one still approaching
-# ends higher up. Every box's bottom_frac is recorded either way, so the
-# threshold can be re-picked from real data.
+# model_probe.enter_max_bottom_px (1600 of 1944 on these cameras; the
+# enter_max_bottom_frac fraction is the fallback when it isn't set). A
+# truck that has finished reversing in sits against the dock, and so
+# against the bottom of the frame, pushing its box past that line; one
+# still approaching ends higher up. Every box's bottom edge is recorded
+# in pixels and as a fraction either way, so the line can be re-picked
+# from real data.
 #
 # Other save_images modes: "any", "plate", "truck", "all", "none".
 #

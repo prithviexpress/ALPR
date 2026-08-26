@@ -149,8 +149,11 @@ class ModelProbe:
         # on every frame of every bay.
         self.save_classes = {c.strip().lower()
                              for c in (self.cfg["save_classes"] or [])}
-        # A valid entry's box must not reach further down the frame
-        # than this (3/4 by default) -- see _is_valid_enter.
+        # A valid entry's box must not reach further down the frame than
+        # this -- see _is_valid_enter. The pixel form wins when set,
+        # since that's how the line is actually measured off a frame;
+        # the fraction is the resolution-independent fallback.
+        self.enter_max_bottom_px = self.cfg["enter_max_bottom_px"]
         self.enter_max_bottom_frac = self.cfg["enter_max_bottom_frac"]
         self.save_annotated = self.cfg["annotate_saved_images"]
         self.max_saved_per_bay = self.cfg["max_saved_images_per_bay"]
@@ -206,9 +209,11 @@ class ModelProbe:
             f"poll_interval={self.cfg['poll_interval_ms']}ms "
             f"region={'roi' if self.use_roi else 'full_frame'} "
             f"save_images={self.save_mode}"
-            + (f" ({', '.join(sorted(self.save_classes))}, "
-               f"box bottom <= {self.enter_max_bottom_frac} of frame)"
-               if self.save_mode == "classes" else "")
+            + (f" ({', '.join(sorted(self.save_classes))}, box bottom <= "
+               + (f"{self.enter_max_bottom_px}px"
+                  if self.enter_max_bottom_px
+                  else f"{self.enter_max_bottom_frac} of frame height")
+               + ")" if self.save_mode == "classes" else "")
             + f" output={self.out_dir}")
 
     def _plate_cfg(self):
@@ -293,19 +298,26 @@ class ModelProbe:
         """Is this box geometrically consistent with a truck still
         ENTERING, rather than one already docked?
 
-        The rule is one number: a genuine entry's box must not reach
-        further down the frame than enter_max_bottom_frac (3/4 by
-        default). A truck that has finished reversing in sits right up
-        against the dock and therefore against the bottom of the frame,
-        so its box bottom runs past that line; one still approaching is
-        further away and its box ends higher up.
+        The rule is one line across the frame: a genuine entry's box
+        must not reach further DOWN than it. A truck that has finished
+        reversing in sits right up against the dock and therefore
+        against the bottom of the frame, so its box bottom runs past
+        that line; one still approaching is further away and its box
+        ends higher up.
 
         This exists because the model cannot make the distinction
         itself -- clearly docked trucks come back as Truck_Enter_Open
-        and Truck_Enter_Closed -- and geometry decides it from the same
-        single frame, with no history to keep.
+        and Truck_Enter_Closed at both high and low confidence -- and
+        geometry decides it from the same single frame, with no history
+        to keep.
 
-        0 disables the check."""
+        enter_max_bottom_px wins when set, because that is how the line
+        is actually measured: read straight off a frame in the same
+        pixel coordinates the boxes use (e.g. 1600 on a 1944-tall
+        frame). enter_max_bottom_frac is the resolution-independent
+        fallback for when it isn't. Both 0 disables the check."""
+        if self.enter_max_bottom_px:
+            return entry["box"][3] <= self.enter_max_bottom_px
         if not self.enter_max_bottom_frac:
             return True
         return entry.get("bottom_frac", 0.0) <= self.enter_max_bottom_frac

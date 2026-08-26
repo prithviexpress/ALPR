@@ -687,16 +687,21 @@ def load_config(path: Path = None) -> dict:
     # where clearly-docked trucks came back as Truck_Enter_Open and
     # Truck_Enter_Closed, so filtering by class alone still fills the
     # images folder with parked trucks.
-    # One number does it: a valid entry's box must not reach further
-    # DOWN the frame than this fraction of the frame height (0.75 = the
-    # bottom edge must stay above the three-quarter line). A truck that
-    # has finished reversing in sits right against the dock, and so
-    # against the bottom of the frame, pushing its box bottom past that
-    # line; one still approaching is further away and its box ends
-    # higher up. Decided from the same single frame, with no history
-    # kept. 0 disables the check.
-    # Every box's bottom_frac is recorded in detections.jsonl whatever
-    # gets saved, so this threshold can be re-picked from real data.
+    # One line across the frame does it: a valid entry's box must not
+    # reach further DOWN than it. A truck that has finished reversing in
+    # sits right against the dock, and so against the bottom of the
+    # frame, pushing its box bottom past that line; one still
+    # approaching is further away and its box ends higher up. Decided
+    # from the same single frame, with no history kept.
+    # enter_max_bottom_px wins when set, because that is how the line is
+    # actually measured -- read straight off a frame, in the same pixel
+    # coordinates the boxes use. 1600 on these 2592x1944 cameras.
+    # enter_max_bottom_frac is the resolution-independent fallback for
+    # when the pixel value isn't set. Both 0 disables the check.
+    # Every box's bottom edge is recorded in detections.jsonl in both
+    # forms (box[3] in pixels, bottom_frac as a fraction) whatever gets
+    # saved, so the threshold can be re-picked from real data.
+    probe.setdefault("enter_max_bottom_px", 1600)
     probe.setdefault("enter_max_bottom_frac", 0.75)
     probe.setdefault("annotate_saved_images", True)
     # Per-bay cap so a long run can't fill the disk. 0 = unlimited.

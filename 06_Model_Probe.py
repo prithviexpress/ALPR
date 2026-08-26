@@ -31,10 +31,14 @@
 #                      of truth, both models' full raw output
 #   summary.json       running totals, per bay and overall, rewritten
 #                      as it goes so it is readable mid-run
-#   <bay>/*.jpg        annotated frames; the filename carries the
-#                      verdict (p<plate-model> t<trucks> tp<truck-model
-#                      plates>), so a folder listing alone shows which
-#                      model found what
+#   images/*.jpg       every annotated frame from every bay, in ONE flat
+#                      folder, named
+#                        <bay>_<timestamp>_p<plate-model boxes>
+#                        _t<trucks>_tp<truck-model plates>.jpg
+#                      Bay and time lead, so one sorted listing groups
+#                      each camera chronologically; the verdict trails,
+#                      so the listing alone shows which model found what
+#                      without opening anything.
 #
 # Box colours on the saved images: GREEN = the dedicated plate model,
 # BLUE = the truck model's truck classes, YELLOW = the truck model's own

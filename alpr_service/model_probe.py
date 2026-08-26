@@ -151,8 +151,18 @@ class ModelProbe:
 
         self.out_dir = (audit_dir / self.cfg["output_subdir"]
                         if audit_dir else None)
+        # Every image from every bay in ONE flat folder, named
+        # "<bay>_<timestamp>...": a per-bay folder tree meant opening one
+        # directory per camera to review a run, which is exactly the
+        # friction this tool exists to remove. Named bay-first so a
+        # single sorted listing still groups each camera's frames
+        # together, chronologically within the group. They sit in an
+        # images/ subfolder purely so detections.jsonl and summary.json
+        # aren't buried among thousands of jpgs.
+        self.images_dir = self.out_dir / "images" if self.out_dir else None
         if self.out_dir is not None:
             self.out_dir.mkdir(parents=True, exist_ok=True)
+            self.images_dir.mkdir(parents=True, exist_ok=True)
         self.jsonl_path = (self.out_dir / "detections.jsonl"
                            if self.out_dir else None)
 
@@ -306,11 +316,15 @@ class ModelProbe:
                 and self.saved_counts.get(bay, 0) >= self.max_saved_per_bay):
             return None
         try:
-            bay_dir = self.out_dir / bay
-            bay_dir.mkdir(parents=True, exist_ok=True)
-            # The filename carries the verdict, so a folder listing alone
-            # shows which model found what without opening anything.
-            name = (f"{ts}_p{plate_res['count']}"
+            # "<bay>_<timestamp>_p<plate-model>_t<trucks>_tp<truck-model
+            # plates>.jpg" -- bay and time up front so a sorted listing
+            # groups each camera chronologically, then the verdict, so
+            # the listing alone shows which model found what without
+            # opening anything. A bay name is used as a path component
+            # here, so strip separators the way worker.py does for
+            # plates.
+            safe_bay = str(bay).replace("/", "_").replace("\\", "_")
+            name = (f"{safe_bay}_{ts}_p{plate_res['count']}"
                     f"_t{truck_res['truck_count']}"
                     f"_tp{truck_res['plate_count']}.jpg")
             out = (self._annotate(img, plate_res, truck_res)
@@ -318,9 +332,10 @@ class ModelProbe:
             ok, buf = cv2.imencode(".jpg", out)
             if not ok:
                 return None
-            (bay_dir / name).write_bytes(buf.tobytes())
+            path = self.images_dir / name
+            path.write_bytes(buf.tobytes())
             self.saved_counts[bay] = self.saved_counts.get(bay, 0) + 1
-            return str(bay_dir / name)
+            return str(path)
         except Exception:
             self.log.warning(f"({bay}) failed to save probe image",
                              exc_info=True)

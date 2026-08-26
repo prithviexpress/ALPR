@@ -144,6 +144,10 @@ class ModelProbe:
         self.interval_sec = self.cfg["poll_interval_ms"] / 1000
         self.use_roi = self.cfg["use_roi"]
         self.save_mode = self.cfg["save_images"]
+        # Lowercased once here rather than per frame -- _should_save runs
+        # on every frame of every bay.
+        self.save_classes = {c.strip().lower()
+                             for c in (self.cfg["save_classes"] or [])}
         self.save_annotated = self.cfg["annotate_saved_images"]
         self.max_saved_per_bay = self.cfg["max_saved_images_per_bay"]
         self.summary_every = self.cfg["summary_every_frames"]
@@ -197,7 +201,10 @@ class ModelProbe:
             f"model probe ready: {len(cameras)} camera(s), "
             f"poll_interval={self.cfg['poll_interval_ms']}ms "
             f"region={'roi' if self.use_roi else 'full_frame'} "
-            f"save_images={self.save_mode} output={self.out_dir}")
+            f"save_images={self.save_mode}"
+            + (f" ({', '.join(sorted(self.save_classes))})"
+               if self.save_mode == "classes" else "")
+            + f" output={self.out_dir}")
 
     def _plate_cfg(self):
         return {"plate_assist_conf_threshold": self.cfg["plate_conf_threshold"],
@@ -297,13 +304,23 @@ class ModelProbe:
             return False
         if self.save_mode == "all":
             return True
+        if self.save_mode == "classes":
+            # Only frames where the truck model reported one of
+            # save_classes -- by default the two ENTERING classes, since
+            # entry is the only moment a dock camera can read a plate and
+            # a run full of docked-truck frames is mostly noise when
+            # that's the question. Compared case-insensitively so a
+            # config typo in casing doesn't silently save nothing.
+            seen = {e["class"].lower()
+                    for e in truck_res["trucks"] + truck_res["plates"]}
+            return bool(seen & self.save_classes)
         found_plate = plate_res["count"] > 0 or truck_res["plate_count"] > 0
         found_truck = truck_res["truck_count"] > 0
         if self.save_mode == "plate":
             return found_plate
         if self.save_mode == "truck":
             return found_truck
-        # "any" (the default): either model saw anything at all
+        # "any": either model saw anything at all
         return found_plate or found_truck
 
     def _save_image(self, bay: str, ts: str, img, plate_res, truck_res):

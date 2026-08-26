@@ -31,7 +31,7 @@
 #                      of truth, both models' full raw output
 #   summary.json       running totals, per bay and overall, rewritten
 #                      as it goes so it is readable mid-run
-#   images/*.jpg       every annotated frame from every bay, in ONE flat
+#   images/*.jpg       annotated frames from every bay, in ONE flat
 #                      folder, named
 #                        <bay>_<timestamp>_p<plate-model boxes>
 #                        _t<trucks>_tp<truck-model plates>.jpg
@@ -44,6 +44,14 @@
 # BLUE = the truck model's truck classes, YELLOW = the truck model's own
 # Number_Plate class. Where green and yellow disagree is the direct A/B
 # between the two on plate detection.
+#
+# By default only frames where the truck model reported Truck_Enter_Closed
+# or Truck_Enter_Open get an image (model_probe.save_images="classes" +
+# save_classes): entry is the only moment a dock camera can read a plate,
+# so a run full of docked-truck frames is mostly noise when that is the
+# question. detections.jsonl still records EVERY frame from BOTH models
+# regardless, so narrowing what gets saved never costs measurement data.
+# Other save_images modes: "any", "plate", "truck", "all", "none".
 #
 # The log prints a periodic SUMMARY with the agreement counts that settle
 # the question -- how often each model sees something the other misses --

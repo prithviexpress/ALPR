@@ -666,9 +666,22 @@ def load_config(path: Path = None) -> dict:
     # false (the default) shows both models the whole frame; true crops
     # to each camera's ROI first, to measure what the ROI is costing.
     probe.setdefault("use_roi", False)
-    # Which frames get an image written: "any" (either model detected
-    # something), "plate", "truck", "all", or "none".
-    probe.setdefault("save_images", "any")
+    # Which frames get an image written:
+    #   "classes" (default) only frames where the truck model reported
+    #             one of save_classes below
+    #   "any"     either model detected anything at all
+    #   "plate"   either model saw a plate
+    #   "truck"   the truck model saw a truck
+    #   "all"     every frame
+    #   "none"    no images, JSONL only
+    probe.setdefault("save_images", "classes")
+    # Defaults to the two ENTERING classes: entry is the only moment a
+    # dock camera can read a plate, so a run full of docked-truck frames
+    # is mostly noise when that's the question being asked. Matched
+    # case-insensitively against the truck model's class names (its
+    # plate class included, so "Number_Plate" may be listed too).
+    probe.setdefault("save_classes",
+                     ["Truck_Enter_Closed", "Truck_Enter_Open"])
     probe.setdefault("annotate_saved_images", True)
     # Per-bay cap so a long run can't fill the disk. 0 = unlimited.
     probe.setdefault("max_saved_images_per_bay", 500)

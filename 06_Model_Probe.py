@@ -82,10 +82,22 @@
 # entries the truck model misses entirely. Both models' plate boxes get
 # read, since either can see one the other misses.
 #
-# Only SUCCESSFUL reads publish, to model_probe.ocr_topic_prefix +
-# "/<bay>":
-#   {bay, status, plate, confidence, raw, trigger, attempts, frames,
-#    elapsed_sec, reads[]}
+# Only SUCCESSFUL reads publish, and the payload is EXACTLY what the
+# ALPR service already sends -- results.build_reply's seven keys:
+#   {"bay": "AR-L5", "direction": "enter", "truck_number": "HR47G4607",
+#    "confidence": 0.894, "status": "SUCCESS",
+#    "event_time": "...", "ocr_time": "..."}
+# so a probe read drops into the existing downstream pipeline with no
+# change at either end. event_time is when the ENTRY was detected, not
+# when OCR finished. The probe's own diagnostics (trigger, attempts,
+# frames, per-attempt reads) stay in detections.jsonl rather than on the
+# wire, where they could surprise a consumer expecting those keys.
+#
+# It goes to model_probe.ocr_topic_prefix + "/<bay>", which defaults to
+# a topic of the PROBE's own so a measurement run can't inject readings
+# into a live result stream. Point it at mqtt.enter_result_topic_prefix
+# to feed the existing pipeline directly.
+#
 # A failed session (NO_VALID_PLATE / TIMEOUT) is still logged and still
 # written to detections.jsonl with its full per-attempt reads[], so
 # nothing is lost for analysis -- only MQTT stays quiet. Set

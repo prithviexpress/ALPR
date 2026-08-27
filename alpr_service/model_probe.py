@@ -41,6 +41,7 @@ import requests
 
 from .image_ops import thumbnail, duplicate_thumbs
 from .logging_setup import get_logger
+from .results import build_reply, result_topic
 from .snapshot import build_snapshot_url, build_auth, fetch_snapshot, SnapshotError
 
 # BGR, drawn on the saved frames.
@@ -361,6 +362,11 @@ class ModelProbe:
         return None
 
     def _publish_plate(self, bay, payload):
+        """Publishes to ocr_topic_prefix + "/<bay>" by default -- a topic
+        of the probe's own, so a measurement run can't inject readings
+        into a live result stream. Point ocr_topic_prefix at
+        mqtt.enter_result_topic_prefix to feed the existing pipeline
+        directly, which the payload shape already matches."""
         if self.publish is None:
             return
         try:
@@ -374,27 +380,35 @@ class ModelProbe:
         """Close a reading session, publishing only a SUCCESSFUL read by
         default (ocr_publish_failures to send the rest too).
 
-        A failed session is still logged and still written to
-        detections.jsonl with its full per-attempt `reads`, so nothing is
-        lost for analysis -- only MQTT stays quiet. Subscribers to this
-        topic want plate numbers, and a stream where most messages carry
-        plate=null buries the ones that don't."""
+        The published payload is results.build_reply's -- the exact
+        contract the ALPR service already publishes and the existing
+        downstream pipeline already consumes -- so a probe read drops
+        into that pipeline with no change at either end. Built through
+        the shared helper rather than hand-assembled here for the reason
+        results.py exists at all: two producers of one message shape is
+        how they drift.
+
+        Nothing extra is added to it. The probe's own diagnostics
+        (trigger, attempts, frames, elapsed, every per-attempt read) go
+        to detections.jsonl instead, where they can't surprise a
+        consumer expecting the standard seven keys.
+
+        A failed session is still logged and still recorded, so nothing
+        is lost for analysis -- only MQTT stays quiet. Subscribers want
+        plate numbers, and a stream where most messages carry the
+        unknown placeholder buries the ones that don't."""
         self.sessions.pop(bay, None)
         self.finished_bays.add(bay)
-        payload = {
-            "bay": bay,
-            "status": status,               # READ | NO_VALID_PLATE | TIMEOUT
-            "plate": plate,
-            "confidence": round(conf, 3),
-            "raw": raw,
-            "trigger": sess.trigger,
-            "attempts": sess.attempts,
-            "frames": sess.frames,
-            "elapsed_sec": sess.elapsed,
-            "started": sess.started_ts,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "reads": sess.reads,
-        }
+        # event_time is when the ENTRY was detected (the session opened),
+        # not when OCR happened -- that's what event_time means in this
+        # contract, and it's what lets a consumer line the read up with
+        # the moment the truck actually arrived.
+        payload = build_reply(
+            self.config, bay, "enter",
+            plate if status == "READ" else None,
+            round(conf, 3),
+            "SUCCESS" if status == "READ" else "NO_VALID_PLATE",
+            sess.started_ts)
         if status == "READ":
             self.plates_read += 1
             self.log.info(f"({bay}) PLATE READ: {plate} (conf {conf:.2f}) "
@@ -409,7 +423,12 @@ class ModelProbe:
                           f"detections.jsonl)")
         if status == "READ" or self.ocr_publish_failures:
             self._publish_plate(bay, payload)
-        return payload
+        # The probe's own record keeps the detail the lean payload
+        # deliberately omits.
+        return {**payload, "_probe": {
+            "outcome": status, "trigger": sess.trigger,
+            "attempts": sess.attempts, "frames": sess.frames,
+            "elapsed_sec": sess.elapsed, "raw": raw, "reads": sess.reads}}
 
     def _save_crop(self, bay, stamp, crop, plate):
         if self.crops_dir is None or not self.ocr_save_crops:
@@ -497,9 +516,10 @@ class ModelProbe:
             plate, conf, raw, crop = found
             saved = self._save_crop(bay, stamp, crop, plate)
             result = self._end_session(bay, sess, "READ", plate, conf, raw)
-            return {"session": "closed", "outcome": "READ", "plate": plate,
+            return {"session": "closed", "outcome": "READ",
+                    "plate": result["truck_number"],
                     "confidence": result["confidence"], "crop": saved,
-                    "attempts_this_frame": attempted}
+                    "published": result, "attempts_this_frame": attempted}
 
         if sess.attempts >= self.ocr_max_attempts:
             self._end_session(bay, sess, "NO_VALID_PLATE")

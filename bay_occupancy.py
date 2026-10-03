@@ -20,6 +20,7 @@ How it decides
 Run:  python bay_occupancy.py [config.json] [cameras.json]
 """
 import json
+import re
 import sys
 import threading
 import time
@@ -79,6 +80,13 @@ DEFAULTS = {
     "empty_confirm_count": 4,
     "round_interval_sec": 3.0,
     "fetch_workers": 8,
+    # Pixels trimmed from each edge of the snapshot BEFORE detection (and
+    # before saving). A camera in cameras.json may carry its own "crop".
+    "crop": {"top": 0, "bottom": 0, "left": 0, "right": 0},
+    # Keep only the newest image per bay: <bay>_<status>_<YYYYmmdd_HHMMSS>.jpg
+    "save_images": True,
+    "save_dir": "latest",
+    "save_interval_sec": 10,      # also saved immediately on a status change
     "snapshot": {"url_template": "http://{ip}:{port}/snap.jpg", "port": 80,
                  "username": None, "password": None,
                  "connect_timeout_ms": 3000, "read_timeout_ms": 3000},
@@ -152,6 +160,11 @@ class Monitor:
                     for b in self.cameras}
         self.model = model
         self.mqtt = mqtt_client
+        self.last_saved = {}      # bay -> (path, time)
+        if cfg["save_images"]:
+            Path(cfg["save_dir"]).mkdir(parents=True, exist_ok=True)
+            for b in self.cameras:
+                self._remove_old_images(b)
         self.stop = threading.Event()
         self._tls = threading.local()   # one HTTP session per fetch thread
 
@@ -172,6 +185,44 @@ class Monitor:
         except SnapshotError as e:
             log.warning(f"{bay}: snapshot failed ({e}) -- state held")
             return bay, None
+
+    def _crop(self, bay, frame):
+        c = dict(self.cfg["crop"])
+        c.update(self.cameras[bay].get("crop") or {})
+        h, w = frame.shape[:2]
+        t, b = int(c["top"]), int(c["bottom"])
+        l, r = int(c["left"]), int(c["right"])
+        if t + b >= h or l + r >= w:
+            log.warning(f"{bay}: crop {c} leaves nothing of {w}x{h} "
+                        f"-- using the full frame")
+            return frame
+        return frame[t:h - b, l:w - r]
+
+    def _remove_old_images(self, bay):
+        pat = re.compile(rf"^{re.escape(bay)}_(occupied|empty)_"
+                         r"\d{8}_\d{6}\.jpg$")
+        for f in Path(self.cfg["save_dir"]).iterdir():
+            if pat.match(f.name):
+                f.unlink(missing_ok=True)
+
+    def save_image(self, bay, frame, status, force=False):
+        """Newest image per bay only: write the new file, drop the old."""
+        now = time.time()
+        prev = self.last_saved.get(bay)
+        if (not force and prev
+                and now - prev[1] < self.cfg["save_interval_sec"]):
+            return
+        path = Path(self.cfg["save_dir"]) / (
+            f"{bay}_{status}_{time.strftime('%Y%m%d_%H%M%S')}.jpg")
+        ok, buf = cv2.imencode(".jpg", frame)
+        if not ok:
+            return
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(buf.tobytes())
+        tmp.replace(path)
+        if prev and prev[0] != path:
+            prev[0].unlink(missing_ok=True)
+        self.last_saved[bay] = (path, now)
 
     def _detect(self, frame):
         res = self.model(frame, conf=self.cfg["min_conf"],
@@ -210,9 +261,18 @@ class Monitor:
         for bay, frame in pool.map(self._fetch, list(self.cameras)):
             if frame is None:
                 continue
+            frame = self._crop(bay, frame)
             occupied, best = self._detect(frame)
-            if self.deb[bay].update(occupied):
+            changed = self.deb[bay].update(occupied)
+            if changed:
                 self.publish(bay, occupied, best)
+            if self.cfg["save_images"]:
+                # Confirmed state if there is one, else this frame's reading.
+                state = self.deb[bay].state
+                state = occupied if state is None else state
+                self.save_image(bay, frame,
+                                "occupied" if state else "empty",
+                                force=changed)
 
     def run(self):
         interval = self.cfg["round_interval_sec"]

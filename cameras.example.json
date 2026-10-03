@@ -1,5 +1,5 @@
 {
-  "_comment": "One entry per bay: its camera IP. Set \"enabled\": false to skip one.",
-  "AR-FS":   {"ip": "10.69.10.100"},
+  "_comment": "One entry per bay: its camera IP. Set \"enabled\": false to skip one. Optional \"crop\" (pixels from top/bottom/left/right) overrides config.json for that bay.",
+  "AR-FS":   {"ip": "10.69.10.100", "crop": {"top": 200, "left": 800, "right": 700}},
   "AR-DOCK2": {"ip": "10.69.10.101", "enabled": true}
 }

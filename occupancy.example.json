@@ -1,0 +1,13 @@
+{
+  "_notes": "Only keys you want to change need to be here; everything else uses the defaults in 07_Bay_Occupancy.py. min_box_area_frac: smallest truck box (as a fraction of the whole frame) that counts as a truck in the bay. occupied_confirm_count/empty_confirm_count: consecutive rounds that must agree before the state flips (empty is higher so a missed detection can't flap the bay). MQTT publishes only on a confirmed change, retained, to <topic_prefix>/<bay>.",
+  "model_path": "Truck_model.pt",
+  "min_conf": 0.4,
+  "min_box_area_frac": 0.05,
+  "occupied_confirm_count": 2,
+  "empty_confirm_count": 4,
+  "round_interval_sec": 3.0,
+  "snapshot": {"username": "camera_admin", "password": "CHANGE_ME"},
+  "mqtt": {"host": "mqtt.example.local", "port": 1883,
+           "username": "alpr_service", "password": "CHANGE_ME",
+           "topic_prefix": "site/alpr/bay_occupancy"}
+}

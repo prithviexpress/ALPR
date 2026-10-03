@@ -1,15 +1,5 @@
 {
-  "_comment": "Every camera is reached via its HTTP snapshot endpoint (config.json 'snapshot'), so only 'ip' is needed here -- no guid, no per-camera credentials. The one common username/password lives in config.json snapshot.username/password.",
-
-  "AR-FS": {
-    "ip": "10.69.10.100",
-    "roi": [850, 250, 1750, 1800],
-    "enabled": true
-  },
-
-  "AR-DOCK2": {
-    "ip": "10.69.10.101",
-    "roi": [800, 300, 1700, 1750],
-    "enabled": true
-  }
+  "_comment": "One entry per bay: its camera IP. Set \"enabled\": false to skip one.",
+  "AR-FS":   {"ip": "10.69.10.100"},
+  "AR-DOCK2": {"ip": "10.69.10.101", "enabled": true}
 }

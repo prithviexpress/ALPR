@@ -1,7 +1,6 @@
 """Simple bay occupancy monitor: is each bay occupied or empty?
 
-Standalone -- no ALPR, OCR, Ollama or trigger plumbing. It reuses only
-the camera registry (cameras.json) and the HTTP snapshot helper.
+Fully standalone: one file, one config.json, one cameras.json.
 
 How it decides
   1. Each round, every enabled camera's snapshot is fetched in parallel.
@@ -18,7 +17,7 @@ How it decides
      confirmed state after startup), retained, so a late subscriber
      still sees the current state of every bay.
 
-Run:  python 07_Bay_Occupancy.py [occupancy.json] [cameras.json]
+Run:  python bay_occupancy.py [config.json] [cameras.json]
 """
 import json
 import sys
@@ -27,14 +26,48 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import logging
+
+import cv2
+import numpy as np
 import requests
+from requests.auth import HTTPDigestAuth
 
-from alpr_service.cameras import load_cameras
-from alpr_service.logging_setup import get_logger
-from alpr_service.snapshot import (SnapshotError, build_auth,
-                                   build_snapshot_url, fetch_snapshot)
+logging.basicConfig(level=logging.INFO, format=(
+    "%(asctime)s [%(levelname)s] %(message)s"))
+log = logging.getLogger("occupancy")
 
-log = get_logger("OCCUPANCY")
+
+class SnapshotError(RuntimeError):
+    pass
+
+
+def fetch_snapshot(session, url, auth, connect_ms, read_ms):
+    """One JPEG from the camera's snapshot URL -> decoded BGR frame."""
+    try:
+        resp = session.get(url, auth=auth,
+                           timeout=(connect_ms / 1000, read_ms / 1000))
+    except requests.RequestException as e:
+        raise SnapshotError(f"request failed: {e}") from e
+    if resp.status_code != 200:
+        raise SnapshotError(f"HTTP {resp.status_code}")
+    frame = cv2.imdecode(np.frombuffer(resp.content, np.uint8),
+                         cv2.IMREAD_COLOR)
+    if frame is None:
+        raise SnapshotError("could not decode JPEG")
+    return frame
+
+
+def load_cameras(path: Path) -> dict:
+    """cameras.json: {"C9": {"ip": "10.0.0.9"}, ...}. Keys starting with
+    "_" are comments; "enabled": false skips a camera."""
+    raw = json.loads(path.read_text())
+    cams = {b: c for b, c in raw.items()
+            if not b.startswith("_") and c.get("enabled", True)}
+    for b, c in cams.items():
+        if not c.get("ip"):
+            sys.exit(f"camera '{b}' has no 'ip' in {path}")
+    return cams
 
 DEFAULTS = {
     "model_path": "Truck_model.pt",
@@ -113,8 +146,7 @@ class BayDebouncer:
 class Monitor:
     def __init__(self, cfg, cameras, model=None, mqtt_client=None):
         self.cfg = cfg
-        self.cameras = {b: c for b, c in cameras.items()
-                        if c.get("enabled", True)}
+        self.cameras = cameras
         self.deb = {b: BayDebouncer(cfg["occupied_confirm_count"],
                                     cfg["empty_confirm_count"])
                     for b in self.cameras}
@@ -127,14 +159,15 @@ class Monitor:
     def _fetch(self, bay):
         if not hasattr(self._tls, "session"):
             self._tls.session = requests.Session()
-            self._tls.auth = build_auth(self.cfg)
+            self._tls.auth = HTTPDigestAuth(self.cfg["snapshot"]["username"],
+                                            self.cfg["snapshot"]["password"])
         s = self.cfg["snapshot"]
+        url = s["url_template"].format(ip=self.cameras[bay]["ip"],
+                                       port=s["port"])
         try:
-            frame, _, _ = fetch_snapshot(
-                self._tls.session,
-                build_snapshot_url(self.cameras[bay], self.cfg),
-                self._tls.auth, s["connect_timeout_ms"],
-                s["read_timeout_ms"])
+            frame = fetch_snapshot(self._tls.session, url, self._tls.auth,
+                                   s["connect_timeout_ms"],
+                                   s["read_timeout_ms"])
             return bay, frame
         except SnapshotError as e:
             log.warning(f"{bay}: snapshot failed ({e}) -- state held")
@@ -195,7 +228,7 @@ class Monitor:
 
 
 def main():
-    cfg_path = Path(sys.argv[1] if len(sys.argv) > 1 else "occupancy.json")
+    cfg_path = Path(sys.argv[1] if len(sys.argv) > 1 else "config.json")
     cam_path = Path(sys.argv[2] if len(sys.argv) > 2 else "cameras.json")
     cfg = load_config(cfg_path)
     cameras = load_cameras(cam_path)

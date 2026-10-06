@@ -1,5 +1,5 @@
 {
-  "_notes": "Copy to config.json. Only keys you want to change need to be here; the rest use defaults in bay_occupancy.py. min_box_area_frac = smallest truck box (fraction of the whole frame) that counts. *_confirm_count = consecutive rounds that must agree before a bay flips state (empty is higher so one missed detection can't flap it). crop = pixels trimmed from each edge before detection (a camera in cameras.json can have its own \"crop\" to override). save_images keeps only the newest image per bay as <bay>_<status>_<YYYYmmdd_HHMMSS>.jpg in save_dir (refreshed every save_interval_sec and immediately on a status change). MQTT publishes only on a confirmed change, retained, to <topic_prefix>/<bay>.",
+  "_notes": "Copy to config.json. Only keys you want to change need to be here; the rest use defaults in bay_occupancy.py. min_box_area_frac = smallest truck box (fraction of the whole frame) that counts. *_confirm_count = consecutive rounds that must agree before a bay flips state (empty is higher so one missed detection can't flap it). crop = pixels trimmed from each edge before detection (a camera in cameras.json can have its own \"crop\" to override). save_images keeps only the newest image per bay as <bay>_<status>_<YYYYmmdd_HHMMSS>.jpg in save_dir (refreshed every save_interval_sec and immediately on a status change). webhook: GET http://host:8081/bay/<bay> returns {status, timestamp, status_since, snapshot_base64 (JPEG downscaled to max_dimension)}; ?image=0 omits the image, /bays lists all. MQTT publishes only on a confirmed change, retained, to <topic_prefix>/<bay>.",
   "model_path": "Truck_model.pt",
   "min_conf": 0.4,
   "min_box_area_frac": 0.05,
@@ -10,6 +10,7 @@
   "save_images": true,
   "save_dir": "latest",
   "save_interval_sec": 10,
+  "webhook": {"enabled": true, "host": "0.0.0.0", "port": 8081, "max_dimension": 640, "jpeg_quality": 80},
   "snapshot": {"username": "camera_admin", "password": "CHANGE_ME"},
   "mqtt": {"host": "mqtt.example.local", "port": 1883,
            "username": "mqtt_user", "password": "CHANGE_ME",

@@ -17,15 +17,22 @@ How it decides
      confirmed state after startup), retained, so a late subscriber
      still sees the current state of every bay.
 
+Query: GET http://<host>:8081/bay/<bay>  ->  {bay, status, timestamp,
+       status_since, class, confidence, snapshot_base64}. Add ?image=0 to
+       skip the image; GET /bays lists every bay without images.
+
 Run:  python bay_occupancy.py [config.json] [cameras.json]
 """
+import base64
 import json
 import re
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import logging
 
@@ -87,6 +94,9 @@ DEFAULTS = {
     "save_images": True,
     "save_dir": "latest",
     "save_interval_sec": 10,      # also saved immediately on a status change
+    # Query webhook: GET /bay/<bay> -> status + timestamp + base64 JPEG.
+    "webhook": {"enabled": True, "host": "0.0.0.0", "port": 8081,
+                "max_dimension": 640, "jpeg_quality": 80},
     "snapshot": {"url_template": "http://{ip}:{port}/snap.jpg", "port": 80,
                  "username": None, "password": None,
                  "connect_timeout_ms": 3000, "read_timeout_ms": 3000},
@@ -160,6 +170,8 @@ class Monitor:
                     for b in self.cameras}
         self.model = model
         self.mqtt = mqtt_client
+        self.latest = {}          # bay -> dict served by the webhook
+        self.latest_lock = threading.Lock()
         self.last_saved = {}      # bay -> (path, time)
         if cfg["save_images"]:
             Path(cfg["save_dir"]).mkdir(parents=True, exist_ok=True)
@@ -266,6 +278,8 @@ class Monitor:
             changed = self.deb[bay].update(occupied)
             if changed:
                 self.publish(bay, occupied, best)
+            if self.cfg["webhook"]["enabled"]:
+                self._update_latest(bay, frame, occupied, best, changed)
             if self.cfg["save_images"]:
                 # Confirmed state if there is one, else this frame's reading.
                 state = self.deb[bay].state
@@ -273,6 +287,94 @@ class Monitor:
                 self.save_image(bay, frame,
                                 "occupied" if state else "empty",
                                 force=changed)
+
+    # -- query webhook ----------------------------------------------------
+    def _update_latest(self, bay, frame, occupied, best, changed):
+        """Keep what the webhook serves: a small JPEG per bay, encoded once
+        per round (full-size frames for every bay would be gigabytes)."""
+        w = self.cfg["webhook"]
+        h, wd = frame.shape[:2]
+        scale = min(1.0, w["max_dimension"] / max(h, wd))
+        small = frame if scale == 1.0 else cv2.resize(
+            frame, (int(wd * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY,
+                                               int(w["jpeg_quality"])])
+        state = self.deb[bay].state
+        now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        with self.latest_lock:
+            prev = self.latest.get(bay, {})
+            self.latest[bay] = {
+                "bay": bay,
+                # Confirmed state only; "unknown" until debounce confirms.
+                "status": ("unknown" if state is None
+                           else "occupied" if state else "empty"),
+                "timestamp": now,
+                "status_since": (now if changed or "status_since" not in prev
+                                 else prev["status_since"]),
+                "class": best[0] if best else None,
+                "confidence": round(best[1], 3) if best else None,
+                "jpeg": buf.tobytes() if ok else None,
+            }
+
+    def query(self, bay, include_image=True):
+        """Dict for one bay, or None if the bay is unknown/not scanned yet."""
+        with self.latest_lock:
+            d = self.latest.get(bay)
+        if d is None:
+            return None
+        out = {k: v for k, v in d.items() if k != "jpeg"}
+        if include_image:
+            out["snapshot_base64"] = (base64.b64encode(d["jpeg"]).decode()
+                                      if d["jpeg"] else None)
+        return out
+
+    def start_webhook(self):
+        w = self.cfg["webhook"]
+        mon = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send(self, code, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                u = urlparse(self.path)
+                parts = [p for p in u.path.split("/") if p]
+                q = parse_qs(u.query)
+                if parts == ["healthz"]:
+                    return self._send(200, {"ok": True,
+                                            "bays": len(mon.cameras)})
+                if parts == ["bays"]:
+                    with mon.latest_lock:
+                        bays = list(mon.latest)
+                    return self._send(200, {"bays": [
+                        mon.query(b, include_image=False) for b in bays]})
+                bay = (parts[1] if len(parts) == 2 and parts[0] == "bay"
+                       else (q.get("bay") or [None])[0]
+                       if parts == ["bay"] else None)
+                if bay is None:
+                    return self._send(404, {"error": "use /bay/<bay>"})
+                img = (q.get("image") or ["1"])[0] not in ("0", "false")
+                d = mon.query(bay, include_image=img)
+                if d is None:
+                    known = bay in mon.cameras
+                    return self._send(404 if not known else 503, {
+                        "error": ("no reading yet for bay" if known
+                                  else "unknown bay"), "bay": bay})
+                self._send(200, d)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer((w["host"], int(w["port"])), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log.info(f"webhook on http://{w['host']}:{w['port']}/bay/<bay>")
+        return srv
 
     def run(self):
         interval = self.cfg["round_interval_sec"]
@@ -309,6 +411,8 @@ def main():
 
     mon = Monitor(cfg, cameras, model, client)
     log.info(f"monitoring {len(mon.cameras)} bays")
+    if cfg["webhook"]["enabled"]:
+        mon.start_webhook()
     try:
         mon.run()
     except KeyboardInterrupt:

@@ -7,3 +7,4 @@ logs/
 best.pt
 paddleocr_models/
 latest/
+bay_events.csv

@@ -24,6 +24,7 @@ Query: GET http://<host>:8081/bay/<bay>  ->  {bay, status, timestamp,
 Run:  python bay_occupancy.py [config.json] [cameras.json]
 """
 import base64
+import csv
 import json
 import re
 import sys
@@ -94,6 +95,8 @@ DEFAULTS = {
     "save_images": True,
     "save_dir": "latest",
     "save_interval_sec": 10,      # also saved immediately on a status change
+    # One row per confirmed status change, all bays. "" disables.
+    "events_csv": "bay_events.csv",
     # Query webhook: GET /bay/<bay> -> status + timestamp + base64 JPEG.
     "webhook": {"enabled": True, "host": "0.0.0.0", "port": 8081,
                 "max_dimension": 640, "jpeg_quality": 80},
@@ -172,6 +175,7 @@ class Monitor:
         self.mqtt = mqtt_client
         self.latest = {}          # bay -> dict served by the webhook
         self.latest_lock = threading.Lock()
+        self.last_change = {}     # bay -> (status, epoch) for the CSV
         self.last_saved = {}      # bay -> (path, time)
         if cfg["save_images"]:
             Path(cfg["save_dir"]).mkdir(parents=True, exist_ok=True)
@@ -264,9 +268,36 @@ class Monitor:
         topic = f"{m['topic_prefix']}/{bay}"
         log.info(f"{bay}: -> {payload['status']} "
                  f"({payload['class']} {payload['confidence']})")
+        self.record_event(payload)
         if self.mqtt:
             self.mqtt.publish(topic, json.dumps(payload), qos=1,
                               retain=bool(m.get("retain", True)))
+
+    CSV_COLUMNS = ["timestamp", "bay", "status", "previous_status",
+                   "previous_duration_sec", "class", "confidence"]
+
+    def record_event(self, payload):
+        """Append one row per confirmed change. previous_* are blank for a
+        bay's first confirmed state after startup."""
+        path = self.cfg.get("events_csv")
+        if not path:
+            return
+        bay, now = payload["bay"], time.time()
+        prev = self.last_change.get(bay)
+        self.last_change[bay] = (payload["status"], now)
+        row = [payload["timestamp"], bay, payload["status"],
+               prev[0] if prev else "",
+               round(now - prev[1]) if prev else "",
+               payload["class"] or "", payload["confidence"] or ""]
+        try:
+            new = not Path(path).exists() or Path(path).stat().st_size == 0
+            with open(path, "a", newline="") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(self.CSV_COLUMNS)
+                w.writerow(row)
+        except OSError as e:
+            log.warning(f"could not write {path}: {e}")
 
     # -- loop -------------------------------------------------------------
     def run_round(self, pool):

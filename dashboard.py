@@ -24,11 +24,13 @@ How it works
 Config (optional keys in config.json under "dashboard"):
   {"dashboard": {"host": "0.0.0.0", "port": 8082, "db_path": "dashboard.db",
                  "group_prefix_len": 2}}
+overstay_hours: a bay occupied longer than this is flagged (0 = off).
 group_prefix_len: bays are grouped by the first N characters of their
 name (AR-K3 -> "AR"); 0 puts everything in one group.
 and top-level "events_csv" (shared with bay_occupancy.py).
 """
 import csv
+import io
 import json
 import sqlite3
 import statistics
@@ -41,7 +43,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULTS = {"host": "0.0.0.0", "port": 8082, "db_path": "dashboard.db",
-            "group_prefix_len": 2}
+            "group_prefix_len": 2, "overstay_hours": 4}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(
   ts INTEGER NOT NULL, bay TEXT NOT NULL, status TEXT NOT NULL,
@@ -246,8 +248,103 @@ def _segments(visits, d_start, d_end):
             if v["start"] < d_end and (v["end"] is None or v["end"] > d_start)]
 
 
+TTAT_EDGES = [1800, 3600, 7200, 14400]
+TTAT_LABELS = ["<30 min", "30-60 min", "1-2 h", "2-4 h", "4 h+"]
+
+
+def _ttat_hist(ttats):
+    out = [0] * len(TTAT_LABELS)
+    for t in ttats:
+        out[sum(t >= e for e in TTAT_EDGES)] += 1
+    return out
+
+
+def _concurrency(bay_visits, w_start, w_end):
+    """Peak number of bays occupied at once in the window -> (count, t)."""
+    pts = []
+    for visits in bay_visits:
+        for v in visits:
+            e = v["end"] if v["end"] is not None else w_end
+            cs, ce = max(v["start"], w_start), min(e, w_end)
+            if ce > cs:
+                pts += [(cs, 1), (ce, -1)]
+    best, cur, at = 0, 0, None
+    for t, d in sorted(pts, key=lambda p: (p[0], p[1])):   # leaves first
+        cur += d
+        if cur > best:
+            best, at = cur, t
+    return best, at
+
+
+def _period_numbers(visits, bays, w_start, w_end):
+    """visits/ttat/utilisation for a window -- used for the previous
+    period, so cards can show change."""
+    window = max(1.0, w_end - w_start)
+    ttats, utils = [], []
+    for b in bays:
+        occ, tt, _ = _stats_for(visits.get(b, []), w_start, w_end)
+        ttats += tt
+        utils.append(100 * occ / window)
+    return {"visits": len(ttats),
+            "ttat_avg": round(statistics.mean(ttats)) if ttats else None,
+            "utilisation_pct": (round(statistics.mean(utils), 1)
+                                if utils else 0)}
+
+
+def _previous(visits, bays, events, now, days, d_start, d_end, w_end):
+    """Same-length window just before the displayed one. For a day still
+    in progress (today) it covers only the same elapsed time, so the
+    comparison is like-for-like. None when there is no earlier data."""
+    first = min(e[0] for e in events)
+    if days is None and d_end == now and d_start == first:
+        return None                                  # "all time"
+    length = d_end - d_start
+    p_start = d_start - length
+    p_end = p_start + (w_end - d_start)
+    if p_end <= first or p_end <= p_start:
+        return None
+    p_start = max(p_start, first)
+    out = _period_numbers(visits, bays, p_start, p_end)
+    out["label"] = ("same time yesterday" if length == 86400 and d_end > now
+                    else "previous period")
+    return out
+
+
+def _highlights(visits, last_status, shown, w_start, w_end, now, timeline,
+                overstay_sec):
+    hl = {}
+    peak = max(timeline, key=lambda r: r["arrivals"], default=None)
+    if peak and peak["arrivals"]:
+        hl["busiest_slot"] = {"t": peak["t"], "arrivals": peak["arrivals"]}
+    n, at = _concurrency([visits[b["bay"]] for b in shown], w_start, w_end)
+    if n:
+        hl["peak_occupied"] = {"count": n, "t": int(at)}
+    longest = None
+    for b in shown:
+        for v in visits[b["bay"]]:
+            if (v["end"] is not None and not v["partial"]
+                    and w_start <= v["end"] <= w_end):
+                d = v["end"] - v["start"]
+                if longest is None or d > longest["ttat"]:
+                    longest = {"bay": b["bay"], "ttat": d, "t": v["start"]}
+    if longest:
+        hl["longest_stay"] = longest
+    occ = [b for b in shown if b["status"] == "occupied"]
+    if occ:
+        o = min(occ, key=lambda b: b["since"])
+        hl["longest_in_bay_now"] = {"bay": o["bay"], "since": o["since"]}
+    idle = [b for b in shown if b["status"] == "empty"]
+    if idle:
+        i = min(idle, key=lambda b: b["since"])
+        hl["longest_idle_now"] = {"bay": i["bay"], "since": i["since"]}
+    hl["overstay_sec"] = overstay_sec
+    hl["overstay_bays"] = [b["bay"] for b in occ
+                           if overstay_sec and now - b["since"] > overstay_sec]
+    return hl
+
+
 def build_stats(events, now, days=None, group=None, prefix_len=2,
-                start=None, end=None):
+                start=None, end=None, overstay_sec=4 * 3600):
     """Overview for the last `days` days, or the explicit [start, end)
     range in epoch seconds (e.g. today 00:00 -> 24:00). `group` restricts
     bays/charts/cards to one bay group; `groups` always lists all."""
@@ -256,7 +353,9 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
                 "fleet": {}, "by_hour": [0] * 24, "by_day": [],
                 "timeline": [], "unit": "hour", "window_sec": 0,
                 "group": group, "range_start": int(now),
-                "range_end": int(now)}
+                "range_end": int(now), "highlights": {}, "prev": None,
+                "ttat_hist": {"labels": TTAT_LABELS,
+                              "counts": [0] * len(TTAT_LABELS)}}
     d_start, d_end, w_start, w_end, window = _resolve_window(
         events, now, days, start, end)
     unit = "hour" if d_end - d_start <= HOURLY_MAX_SEC else "day"
@@ -302,10 +401,20 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
                 by_hour[dt.hour] += 1
                 d = dt.strftime("%Y-%m-%d")
                 by_day[d] = by_day.get(d, 0) + 1
+    timeline = _timeline([visits[b["bay"]] for b in shown], d_start,
+                         d_end, w_start, w_end, unit, now)
+    for b in shown:
+        b["overstay"] = bool(overstay_sec and b["status"] == "occupied"
+                             and now - b["since"] > overstay_sec)
     return {
         "generated": int(now), "window_sec": int(window), "days": days,
         "range_start": int(d_start), "range_end": int(d_end), "unit": unit,
         "group": group or None, "bays": shown, "groups": groups,
+        "highlights": _highlights(visits, last_status, shown, w_start,
+                                  w_end, now, timeline, overstay_sec),
+        "prev": _previous(visits, [b["bay"] for b in shown], events, now,
+                          days, d_start, d_end, w_end),
+        "ttat_hist": {"labels": TTAT_LABELS, "counts": _ttat_hist(all_ttat)},
         "fleet": {
             "bays": len(shown),
             "occupied_now": sum(b["status"] == "occupied" for b in shown),
@@ -316,8 +425,7 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
             "utilisation_pct": (round(statistics.mean(
                 b["utilisation_pct"] for b in shown), 1) if shown else 0),
         },
-        "timeline": _timeline([visits[b["bay"]] for b in shown], d_start,
-                              d_end, w_start, w_end, unit, now),
+        "timeline": timeline,
         "by_hour": by_hour,
         "by_day": [{"day": d, "visits": by_day[d]} for d in sorted(by_day)],
     }
@@ -365,12 +473,39 @@ def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
         "timeline": _timeline([visits], d_start, d_end, w_start, w_end,
                               unit, now),
         "arrivals_by_hour": arrivals, "occupancy_pct_by_hour": occ_pct,
+        "ttat_hist": {"labels": TTAT_LABELS, "counts": _ttat_hist(ttats)},
         "trucks": [{"start": v["start"], "end": v["end"],
                     "ttat": (v["end"] - v["start"]
                              if v["end"] is not None else None),
                     "partial": v["partial"], "class": v["cls"]}
                    for v in listed],
     }
+
+
+def visits_csv(events, now, days=None, group=None, bay=None, prefix_len=2,
+               start=None, end=None):
+    """CSV text: one row per visit overlapping the range."""
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["bay", "group", "arrived", "left", "ttat_sec", "status",
+                "already_there_at_startup", "class"])
+    if events:
+        d_start, d_end, *_ = _resolve_window(events, now, days, start, end)
+        iso = lambda t: (datetime.fromtimestamp(t).astimezone()
+                         .isoformat(timespec="seconds"))
+        for b, vs in sorted(build_visits(events, now).items()):
+            if bay and b != bay or group and group_of(b, prefix_len) != group:
+                continue
+            for v in vs:
+                if v["start"] >= d_end or (v["end"] is not None
+                                           and v["end"] < d_start):
+                    continue
+                w.writerow([b, group_of(b, prefix_len), iso(v["start"]),
+                            iso(v["end"]) if v["end"] else "",
+                            v["end"] - v["start"] if v["end"] else "",
+                            "completed" if v["end"] else "in_bay",
+                            int(v["partial"]), v["cls"] or ""])
+    return out.getvalue()
 
 
 def load_events(db):
@@ -407,9 +542,13 @@ tr.click{cursor:pointer}tr.click:hover td{background:var(--bg)}
 .occupied{background:var(--bad)}.empty{background:var(--ok)}
 .bar{display:inline-block;height:8px;border-radius:4px;background:var(--acc);
 vertical-align:middle;margin-right:6px}
-.chart{display:flex;align-items:flex-end;gap:3px;height:110px}
-.chart div{flex:1;background:var(--acc);border-radius:3px 3px 0 0;min-height:1px}
-.chart.b div{background:var(--acc2)}.chart div.part{opacity:.4}
+.chart{display:flex;align-items:flex-end;gap:3px;height:128px;padding-top:16px}
+.chart .c{flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end}
+.chart .c>*{flex:none}.chart .v{font-size:10px;line-height:13px;text-align:center;color:var(--mut);font-weight:600;white-space:nowrap;overflow:visible}
+.chart i{display:block;background:var(--acc);border-radius:3px 3px 0 0;min-height:1px}
+.chart.b i{background:var(--acc2)}.chart i.part{opacity:.4}
+.card small{display:block;margin-top:2px}.up{color:var(--ok)}.dn{color:var(--bad)}
+.flag{color:#d33;font-weight:600}tr.over td:first-child{color:#d33;font-weight:600}
 .axis{display:flex;gap:3px;color:var(--mut);font-size:10px}.axis span{flex:1;text-align:center;overflow:hidden}
 small{color:var(--mut)}.gantt{position:relative;display:grid;grid-template-columns:90px 1fr;gap:3px 8px;align-items:center}
 .gantt .lbl{font-size:12px;cursor:pointer}.gantt .track{position:relative;height:16px;background:var(--bg);border-radius:3px}
@@ -425,7 +564,7 @@ a.back{color:var(--acc);cursor:pointer;text-decoration:none}
 <option value="30">Last 30 days</option><option value="all">All time</option>
 <option value="date">Pick a day…</option></select>
 <input type="date" id="pick" style="display:none;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 8px">
-<small id="gen"></small></span></header>
+<small id="gen"></small> <a id="csv" class="back" href="#" title="Visits in this range as CSV">⬇ CSV</a></span></header>
 <div id="view"></div>
 </main><script>
 const $=id=>document.getElementById(id);
@@ -433,15 +572,18 @@ let data=null,sort={k:'bay',d:1},group='',route=location.hash||'#/';
 const dur=s=>s==null?'–':s>=3600?(s/3600).toFixed(1)+' h':s>=60?Math.round(s/60)+' min':s+' s';
 const ago=t=>t?dur(Math.max(0,data.generated-t))+' ago':'–';
 const fmt=t=>t?new Date(t*1000).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'–';
-const card=(l,v)=>`<div class=card><b>${v}</b><span>${l}</span></div>`;
-const bars=(vals,labels,cls='',tip=(i,v)=>v,parts=[])=>{const m=Math.max(1,...vals);
-return `<div class="chart ${cls}">`+vals.map((v,i)=>`<div class="${parts[i]?'part':''}" style="height:${100*v/m}%" title="${labels[i]}: ${tip(i,v)}"></div>`).join('')+
+const card=(l,v,sub='')=>`<div class=card><b>${v}</b><span>${l}</span>${sub?`<small>${sub}</small>`:''}</div>`;
+const delta=(cur,prev,fmtf,label,lowerBetter)=>{if(prev==null||cur==null)return '';const d=cur-prev;if(!d)return `= ${label}`;
+const good=lowerBetter?d<0:d>0;return `<span class="${good?'up':'dn'}">${d>0?'▲':'▼'} ${fmtf(Math.abs(d))}</span> vs ${label}`};
+const hhmm=t=>new Date(t*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+const bars=(vals,labels,cls='',tip=(i,v)=>v,parts=[],lab=(i,v)=>v?String(v):'')=>{const m=Math.max(1,...vals),show=vals.length<=40;
+return `<div class="chart ${cls}">`+vals.map((v,i)=>`<div class=c title="${labels[i]}: ${tip(i,v)}"><b class=v>${show?lab(i,v):''}</b><i class="${parts[i]?'part':''}" style="height:${100*v/m}%"></i></div>`).join('')+
 `</div><div class=axis>`+labels.map((l,i)=>`<span>${vals.length>14&&i%Math.ceil(vals.length/14)?'':l}</span>`).join('')+`</div>`};
 const pad=n=>String(n).padStart(2,'0');
 const tlabel=(t,unit)=>{const d=new Date(t*1000);return unit=='day'?`${d.getMonth()+1}-${pad(d.getDate())}`:(d.getHours()==0?`${d.getMonth()+1}/${d.getDate()}`:pad(d.getHours()))};
 const tfull=(t,unit)=>{const d=new Date(t*1000);return d.toLocaleString([],unit=='day'?{month:'short',day:'numeric'}:{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})};
 const timeline=(tl,unit,key,cls,suffix)=>bars(tl.map(r=>r[key]??0),tl.map(r=>tlabel(r.t,unit)),cls,
-(i,v)=>tl[i][key]==null?'no data':v+suffix,[]);
+(i,v)=>tl[i][key]==null?'no data':v+suffix,[],(i,v)=>v?(suffix=='%'?Math.round(v)+'%':v):'');
 function gantt(rows,d){const W0=d.range_start,W1=d.range_end,span=W1-W0,p=t=>100*(Math.min(Math.max(t,W0),W1)-W0)/span;
 const step=span<=26*3600?2*3600:span<=50*3600?4*3600:6*3600;let ticks='',grid='';
 for(let t=Math.ceil(W0/step)*step;t<W1;t+=step){ticks+=`<span style="left:${p(t)}%">${tlabel(t,'hour')}</span>`;grid+=`<i class=grid style="left:${p(t)}%"></i>`}
@@ -456,12 +598,25 @@ const COLS=[['bay','Bay'],['status','Now'],['visits','Visits'],['utilisation_pct
 const util=u=>`<span class=bar style="width:${Math.min(100,u)*1.2}px"></span>${u}%`;
 const pill=(s,t)=>`<span class="pill ${s}">${s}</span> <small>${t}</small>`;
 
+function highlights(hl,d){const c=[],unit=d.unit=='day'?'day':'hour';
+if(hl.busiest_slot)c.push(card(`Busiest ${unit}`,(d.unit=='hour'?pad(new Date(hl.busiest_slot.t*1000).getHours())+':00':tlabel(hl.busiest_slot.t,'day')),hl.busiest_slot.arrivals+' arrivals'));
+if(hl.peak_occupied)c.push(card('Peak occupancy',hl.peak_occupied.count+' bays',`at ${hhmm(hl.peak_occupied.t)}`));
+if(hl.longest_stay)c.push(card('Longest stay',dur(hl.longest_stay.ttat),`${hl.longest_stay.bay} · arrived ${fmt(hl.longest_stay.t)}`));
+if(hl.longest_in_bay_now)c.push(card('In bay longest (now)',dur(d.generated-hl.longest_in_bay_now.since),hl.longest_in_bay_now.bay));
+if(hl.longest_idle_now)c.push(card('Idle longest (now)',dur(d.generated-hl.longest_idle_now.since),hl.longest_idle_now.bay+' empty'));
+if(hl.overstay_sec)c.push(card(`Over ${dur(hl.overstay_sec)} in bay`,`<span class="${hl.overstay_bays.length?'flag':''}">${hl.overstay_bays.length}</span>`,hl.overstay_bays.join(', ')||'none'));
+return c.length?`<div class=cards>${c.join('')}</div>`:''}
+const histo=(hs,cls)=>bars(hs.counts,hs.labels,cls||'b',(i,v)=>v+' trucks');
 function renderOverview(){const f=data.fleet||{};
 const gs=data.groups||[];
 let h=`<div class=chips><button class="chip ${group?'':'on'}" data-g="">All groups</button>`+
 gs.map(g=>`<button class="chip ${group==g.group?'on':''}" data-g="${g.group}">${g.group} <small>(${g.bays})</small></button>`).join('')+`</div>`;
-h+=`<div class=cards>`+card('Occupied now',`${f.occupied_now??0} / ${f.bays??0}`)+card('Visits',f.visits??0)+
-card('Avg TTAT',dur(f.ttat_avg))+card('Median TTAT',dur(f.ttat_median))+card('Avg utilisation',(f.utilisation_pct??0)+'%')+`</div>`;
+const pv=data.prev,pl=pv?pv.label:'';
+h+=`<div class=cards>`+card('Occupied now',`${f.occupied_now??0} / ${f.bays??0}`)+
+card('Visits',f.visits??0,pv?delta(f.visits,pv.visits,x=>x,pl):'')+
+card('Avg TTAT',dur(f.ttat_avg),pv?delta(f.ttat_avg,pv.ttat_avg,dur,pl,true):'')+card('Median TTAT',dur(f.ttat_median))+
+card('Avg utilisation',(f.utilisation_pct??0)+'%',pv?delta(f.utilisation_pct,pv.utilisation_pct,x=>x.toFixed(1)+' pts',pl):'')+`</div>`;
+h+=highlights(data.highlights||{},data);
 if(gs.length>1)h+=`<section><h2>By group <small>(first characters of the bay name · click to filter)</small></h2><table><tr>
 <th>Group</th><th>Bays</th><th>Occupied now</th><th>Visits</th><th>Utilisation</th><th>Avg TTAT</th><th>Median</th><th>P90</th></tr>`+
 gs.map(g=>`<tr class=click data-g="${g.group}"><td>${g.group}</td><td>${g.bays}</td><td>${g.occupied_now}</td><td>${g.visits}</td>
@@ -470,13 +625,14 @@ const rows=[...data.bays].sort((a,b)=>{const x=a[sort.k],y=b[sort.k];
 return ((x==null)-(y==null))||(x>y?1:x<y?-1:0)*sort.d});
 h+=`<section><h2>Per bay <small>(click a heading to sort, a bay for detail · TTAT = occupied → empty)</small></h2><table><tr>`+
 COLS.map(([k,l])=>`<th data-k=${k}>${l}${sort.k==k?(sort.d>0?' ▲':' ▼'):''}</th>`).join('')+'</tr>'+
-(rows.map(b=>`<tr class=click data-bay="${b.bay}"><td>${b.bay}</td><td>${pill(b.status,ago(b.since))}</td>
+(rows.map(b=>`<tr class="click ${b.overstay?'over':''}" data-bay="${b.bay}"><td>${b.bay}${b.overstay?' ⚠':''}</td><td>${pill(b.status,ago(b.since))}</td>
 <td>${b.visits}</td><td>${util(b.utilisation_pct)}</td><td>${dur(b.ttat_avg)}</td><td>${dur(b.ttat_median)}</td><td>${dur(b.ttat_p90)}</td>
 <td>${dur(b.ttat_min)}</td><td>${dur(b.ttat_max)}</td><td>${ago(b.last_visit_end)}</td></tr>`).join('')||'<tr><td>No data yet</td></tr>')+`</table></section>`;
 const u=data.unit,per=u=='day'?'day':'hour';
 if(u=='hour'&&data.bays.length)h+=`<section><h2>Bay timeline <small>(orange = truck in bay · click a bay · ${rangeNote(data).replace(/<\/?small>/g,'')})</small></h2>${gantt(data.bays,data)}</section>`;
 h+=`<section><h2>Arrivals per ${per} <small>(actual clock time)</small></h2>${timeline(data.timeline,u,'arrivals','','')}</section>`;
 h+=`<section><h2>Occupancy per ${per} <small>(% of bays occupied)</small></h2>${timeline(data.timeline,u,'occ_pct','b','%')}</section>`;
+h+=`<section><h2>How long trucks stay <small>(TTAT distribution · completed visits)</small></h2>${histo(data.ttat_hist)}</section>`;
 if(u=='day')h+=`<section><h2>Arrivals by hour of day <small>(pattern across the range)</small></h2>${bars(data.by_hour,HRS)}</section>`;
 $('view').innerHTML=h;
 document.querySelectorAll('.lbl[data-bay]').forEach(e=>e.onclick=()=>{location.hash='#/bay/'+encodeURIComponent(e.dataset.bay)});
@@ -493,11 +649,12 @@ const u=d.unit,per=u=='day'?'day':'hour';
 if(u=='hour')h+=`<section><h2>Timeline <small>(orange = truck in bay)</small></h2>${gantt([{bay:d.bay,segments:d.trucks.map(x=>[x.start,x.end,x.partial])}],d)}</section>`;
 h+=`<section><h2>Arrivals per ${per} <small>(actual clock time)</small></h2>${timeline(d.timeline,u,'arrivals','','')}</section>`;
 h+=`<section><h2>Occupancy per ${per} <small>(% of each ${per} the bay was occupied)</small></h2>${timeline(d.timeline,u,'occ_pct','b','%')}</section>`;
+h+=`<section><h2>How long trucks stay here <small>(TTAT distribution)</small></h2>${histo(d.ttat_hist)}</section>`;
 if(u=='day'){h+=`<section><h2>Arrivals by hour of day <small>(pattern across the range)</small></h2>${bars(d.arrivals_by_hour,HRS)}</section>`;
-h+=`<section><h2>Occupancy by hour of day <small>(% of each hour the bay was occupied)</small></h2>${bars(d.occupancy_pct_by_hour,HRS,'b',(i,v)=>v+'%')}</section>`}
+h+=`<section><h2>Occupancy by hour of day <small>(% of each hour the bay was occupied)</small></h2>${bars(d.occupancy_pct_by_hour,HRS,'b',(i,v)=>v+'%',[],(i,v)=>v?Math.round(v)+'%':'')}</section>`}
 const t=d.trucks,done=t.filter(x=>x.ttat!=null);
 h+=`<section><h2>Each truck entry <small>(bar = time in bay, oldest → newest; faded = already there when monitoring started)</small></h2>`+
-(done.length?bars(done.map(x=>x.ttat),done.map(x=>new Date(x.start*1000).toLocaleDateString([],{month:'numeric',day:'numeric'})),'',(i,v)=>dur(v)+' from '+fmt(done[i].start),done.map(x=>x.partial)):'<small>No completed visits in this range.</small>')+`</section>`;
+(done.length?bars(done.map(x=>x.ttat),done.map(x=>new Date(x.start*1000).toLocaleDateString([],{month:'numeric',day:'numeric'})),'',(i,v)=>dur(v)+' from '+fmt(done[i].start),done.map(x=>x.partial),(i,v)=>dur(v)):'<small>No completed visits in this range.</small>')+`</section>`;
 h+=`<section><h2>Entries <small>(newest first)</small></h2><table><tr><th>Arrived</th><th>Left</th><th>TTAT</th><th>Detected as</th></tr>`+
 [...t].reverse().map(x=>`<tr><td>${fmt(x.start)}${x.partial?' <small>(already there at startup)</small>':''}</td>
 <td>${x.end?fmt(x.end):'<small>in bay now</small>'}</td><td>${dur(x.ttat)}</td><td>${x.class||'–'}</td></tr>`).join('')+`</table></section>`;
@@ -516,6 +673,8 @@ async function load(){route=location.hash||'#/';const q=rangeQuery();
 const m=route.match(/^#\/bay\/(.+)$/);
 let url;if(m){url='/api/bay/'+m[1]+(q.length?'?'+q.join('&'):'')}
 else{if(group)q.push('group='+encodeURIComponent(group));url='/api/stats'+(q.length?'?'+q.join('&'):'')}
+const cq=q.filter(x=>!x.startsWith('group=')).concat(m?['bay='+m[1]]:(group?['group='+encodeURIComponent(group)]:[]));
+$('csv').href='/api/visits.csv'+(cq.length?'?'+cq.join('&'):'');
 const r=await fetch(url);
 if(!r.ok){$('view').innerHTML='<p><a class=back href="#/">← All bays</a></p><p>Not found.</p>';return}
 data=await r.json();m?renderBay():renderOverview();
@@ -524,7 +683,7 @@ $('days').onchange=load;$('pick').onchange=load;window.onhashchange=load;load();
 </script></body></html>"""
 
 
-def make_handler(db, csv_path, prefix_len=2):
+def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600):
     class H(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype):
             self.send_response(code)
@@ -555,8 +714,16 @@ def make_handler(db, csv_path, prefix_len=2):
                     import_csv(db, csv_path)
                     stats = build_stats(load_events(db), time.time(), days,
                                         q.get("group", [None])[0], prefix_len,
-                                        start, end)
+                                        start, end, overstay_sec)
                 return self._json(200, stats)
+            if u.path == "/api/visits.csv":
+                with _lock:
+                    import_csv(db, csv_path)
+                    body = visits_csv(load_events(db), time.time(), days,
+                                      q.get("group", [None])[0],
+                                      q.get("bay", [None])[0], prefix_len,
+                                      start, end)
+                return self._send(200, body.encode(), "text/csv")
             if u.path.startswith("/api/bay/"):
                 bay = unquote(u.path[len("/api/bay/"):])
                 with _lock:
@@ -584,7 +751,8 @@ def main():
     print(f"imported {n} events from {csv_path}; "
           f"serving on http://{d['host']}:{d['port']}/")
     ThreadingHTTPServer((d["host"], int(d["port"])), make_handler(
-        db, csv_path, int(d["group_prefix_len"]))).serve_forever()
+        db, csv_path, int(d["group_prefix_len"]),
+        int(float(d["overstay_hours"]) * 3600))).serve_forever()
 
 
 if __name__ == "__main__":

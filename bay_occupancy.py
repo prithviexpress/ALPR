@@ -97,6 +97,11 @@ DEFAULTS = {
     "save_interval_sec": 10,      # also saved immediately on a status change
     # One row per confirmed status change, all bays. "" disables.
     "events_csv": "bay_events.csv",
+    # A snapshot at every confirmed arrival/departure, so a truck entry in
+    # the dashboard can show what the camera saw. "" disables.
+    "event_images_dir": "event_images",
+    "event_images_max_dimension": 960,
+    "event_images_keep_days": 30,
     # Query webhook: GET /bay/<bay> -> status + timestamp + base64 JPEG.
     "webhook": {"enabled": True, "host": "0.0.0.0", "port": 8081,
                 "max_dimension": 640, "jpeg_quality": 80},
@@ -256,7 +261,7 @@ class Monitor:
                                  self.cfg["plate_class"])
 
     # -- publish ----------------------------------------------------------
-    def publish(self, bay, occupied, best):
+    def publish(self, bay, occupied, best, frame=None):
         payload = {
             "bay": bay,
             "status": "occupied" if occupied else "empty",
@@ -268,15 +273,72 @@ class Monitor:
         topic = f"{m['topic_prefix']}/{bay}"
         log.info(f"{bay}: -> {payload['status']} "
                  f"({payload['class']} {payload['confidence']})")
-        self.record_event(payload)
+        image = self.save_event_image(bay, frame, payload["status"])
+        self.record_event(payload, image)
         if self.mqtt:
             self.mqtt.publish(topic, json.dumps(payload), qos=1,
                               retain=bool(m.get("retain", True)))
 
     CSV_COLUMNS = ["timestamp", "bay", "status", "previous_status",
-                   "previous_duration_sec", "class", "confidence"]
+                   "previous_duration_sec", "class", "confidence", "image"]
 
-    def record_event(self, payload):
+    def save_event_image(self, bay, frame, status):
+        """<bay>_<status>_<YYYYmmdd_HHMMSS>.jpg in event_images_dir, shrunk
+        to event_images_max_dimension. Returns the file name or ''."""
+        d = self.cfg.get("event_images_dir")
+        if not d or frame is None:
+            return ""
+        try:
+            Path(d).mkdir(parents=True, exist_ok=True)
+            h, w = frame.shape[:2]
+            scale = min(1.0, self.cfg["event_images_max_dimension"] / max(h, w))
+            if scale < 1.0:
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)),
+                                   interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", frame,
+                                   [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                return ""
+            name = f"{bay}_{status}_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+            (Path(d) / name).write_bytes(buf.tobytes())
+            return name
+        except (OSError, cv2.error) as e:
+            log.warning(f"{bay}: could not save event image: {e}")
+            return ""
+
+    def prune_event_images(self):
+        d, days = self.cfg.get("event_images_dir"), self.cfg[
+            "event_images_keep_days"]
+        if not d or not days or not Path(d).is_dir():
+            return
+        cutoff = time.time() - days * 86400
+        for f in Path(d).glob("*.jpg"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+
+    def _ensure_csv_header(self, path):
+        """An older CSV without the newest columns is rewritten once, in
+        place, so appended rows line up with the header."""
+        p = Path(path)
+        if not p.exists() or p.stat().st_size == 0:
+            return
+        with open(p, newline="") as f:
+            rows = list(csv.reader(f))
+        if rows[0] == self.CSV_COLUMNS:
+            return
+        old = rows[0]
+        with open(p, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(self.CSV_COLUMNS)
+            for r in rows[1:]:
+                d = dict(zip(old, r))
+                w.writerow([d.get(c, "") for c in self.CSV_COLUMNS])
+        log.info(f"{path}: upgraded header to {self.CSV_COLUMNS}")
+
+    def record_event(self, payload, image=""):
         """Append one row per confirmed change. previous_* are blank for a
         bay's first confirmed state after startup."""
         path = self.cfg.get("events_csv")
@@ -288,8 +350,11 @@ class Monitor:
         row = [payload["timestamp"], bay, payload["status"],
                prev[0] if prev else "",
                round(now - prev[1]) if prev else "",
-               payload["class"] or "", payload["confidence"] or ""]
+               payload["class"] or "", payload["confidence"] or "", image]
         try:
+            if not getattr(self, "_csv_checked", False):
+                self._ensure_csv_header(path)
+                self._csv_checked = True
             new = not Path(path).exists() or Path(path).stat().st_size == 0
             with open(path, "a", newline="") as f:
                 w = csv.writer(f)
@@ -308,7 +373,7 @@ class Monitor:
             occupied, best = self._detect(frame)
             changed = self.deb[bay].update(occupied)
             if changed:
-                self.publish(bay, occupied, best)
+                self.publish(bay, occupied, best, frame)
             if self.cfg["webhook"]["enabled"]:
                 self._update_latest(bay, frame, occupied, best, changed)
             if self.cfg["save_images"]:
@@ -408,11 +473,16 @@ class Monitor:
         return srv
 
     def run(self):
+        self.prune_event_images()
+        last_prune = time.time()
         interval = self.cfg["round_interval_sec"]
         with ThreadPoolExecutor(self.cfg["fetch_workers"]) as pool:
             while not self.stop.is_set():
                 t0 = time.time()
                 try:
+                    if time.time() - last_prune > 6 * 3600:
+                        self.prune_event_images()
+                        last_prune = time.time()
                     self.run_round(pool)
                 except Exception:
                     log.exception("round failed")

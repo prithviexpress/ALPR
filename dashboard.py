@@ -32,6 +32,7 @@ and top-level "events_csv" (shared with bay_occupancy.py).
 import csv
 import io
 import json
+import re
 import sqlite3
 import statistics
 import sys
@@ -47,18 +48,21 @@ DEFAULTS = {"host": "0.0.0.0", "port": 8082, "db_path": "dashboard.db",
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(
   ts INTEGER NOT NULL, bay TEXT NOT NULL, status TEXT NOT NULL,
-  prev_status TEXT, class TEXT, confidence REAL, raw_ts TEXT,
+  prev_status TEXT, class TEXT, confidence REAL, raw_ts TEXT, image TEXT,
   UNIQUE(raw_ts, bay, status));
 CREATE INDEX IF NOT EXISTS ix_events_bay_ts ON events(bay, ts);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
 _lock = threading.Lock()
+IMG_RE = re.compile(r"^[A-Za-z0-9._-]+\.jpg$")
 
 
 # --------------------------------------------------------------- import --
 def connect(path):
     db = sqlite3.connect(path, check_same_thread=False)
     db.executescript(SCHEMA)
+    if "image" not in {r[1] for r in db.execute("PRAGMA table_info(events)")}:
+        db.execute("ALTER TABLE events ADD COLUMN image TEXT")   # older db
     return db
 
 
@@ -71,8 +75,11 @@ def import_csv(db, csv_path):
     size = p.stat().st_size
     row = db.execute("SELECT v FROM meta WHERE k='offset'").fetchone()
     offset = int(row[0]) if row else 0
-    if size < offset:                    # file replaced or truncated
-        offset = 0
+    hdr = db.execute("SELECT v FROM meta WHERE k='header'").fetchone()
+    with open(p, "rb") as f:
+        header_now = f.readline().decode("utf-8-sig").strip()
+    if size < offset or (hdr and hdr[0] != header_now):
+        offset = 0           # file replaced/truncated or columns changed
     n = 0
     with open(p, "rb") as f:
         header = f.readline()
@@ -95,12 +102,18 @@ def import_csv(db, csv_path):
             continue
         conf = d.get("confidence") or None
         cur = db.execute(
-            "INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO events(ts,bay,status,prev_status,class,confidence,"
+            "raw_ts,image) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(raw_ts,bay,status) DO UPDATE SET "
+            "image=COALESCE(excluded.image, image)",
             (ts, d["bay"], d["status"], d.get("previous_status") or None,
              d.get("class") or None,
-             float(conf) if conf else None, d["timestamp"]))
+             float(conf) if conf else None, d["timestamp"],
+             d.get("image") or None))
         n += cur.rowcount
     db.execute("INSERT OR REPLACE INTO meta VALUES('offset', ?)", (str(end),))
+    db.execute("INSERT OR REPLACE INTO meta VALUES('header', ?)",
+               (header_now,))
     db.commit()
     return n
 
@@ -122,9 +135,13 @@ def build_visits(events, now):
             ts, status, prev = e[0], e[2], e[3]
             if status == "occupied":
                 cur = {"start": ts, "end": None, "partial": prev is None,
-                       "cls": e[4] if len(e) > 4 else None}
+                       "cls": e[4] if len(e) > 4 else None,
+                       "conf": e[5] if len(e) > 5 else None,
+                       "img_in": e[6] if len(e) > 6 else None,
+                       "img_out": None}
             elif status == "empty" and cur:
                 cur["end"] = ts
+                cur["img_out"] = e[6] if len(e) > 6 else None
                 visits.append(cur)
                 cur = None
         if cur:
@@ -482,13 +499,55 @@ def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
     }
 
 
+def build_entry(events, bay, start, now, prefix_len=2):
+    """One truck entry (identified by bay + arrival epoch) with context:
+    gap since the previous truck, how its stay compares with the bay's
+    usual one, how many other bays were busy at arrival, and the
+    previous/next entry for navigation. None if there is no such visit."""
+    allv = build_visits(events, now)
+    vs = allv.get(bay, [])
+    idx = next((i for i, v in enumerate(vs) if v["start"] == int(start)), None)
+    if idx is None:
+        return None
+    v = vs[idx]
+    done = [x["end"] - x["start"] for x in vs
+            if x["end"] is not None and not x["partial"]]
+    ttat = v["end"] - v["start"] if v["end"] is not None else None
+    prev_v = vs[idx - 1] if idx else None
+    avg = statistics.mean(done) if done else None
+    others = sum(1 for b, bv in allv.items() if b != bay and any(
+        o["start"] <= v["start"] and (o["end"] is None or o["end"] > v["start"])
+        for o in bv))
+    rank = None
+    if ttat is not None and not v["partial"] and done:
+        rank = 1 + sum(1 for x in done if x > ttat)
+    return {
+        "generated": int(now), "bay": bay, "group": group_of(bay, prefix_len),
+        "start": v["start"], "end": v["end"], "ttat": ttat,
+        "in_bay_for": int(now - v["start"]) if v["end"] is None else None,
+        "partial": v["partial"], "class": v["cls"],
+        "confidence": v["conf"],
+        "arrival_image": v["img_in"], "departure_image": v["img_out"],
+        "idle_before": (v["start"] - prev_v["end"]
+                        if prev_v and prev_v["end"] is not None else None),
+        "bay_avg_ttat": round(avg) if avg is not None else None,
+        "vs_avg_pct": (round(100 * (ttat - avg) / avg)
+                       if ttat is not None and avg else None),
+        "rank_longest": rank, "of_visits": len(done),
+        "other_bays_occupied_at_arrival": others,
+        "prev_start": prev_v["start"] if prev_v else None,
+        "next_start": vs[idx + 1]["start"] if idx + 1 < len(vs) else None,
+    }
+
+
 def visits_csv(events, now, days=None, group=None, bay=None, prefix_len=2,
                start=None, end=None):
     """CSV text: one row per visit overlapping the range."""
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["bay", "group", "arrived", "left", "ttat_sec", "status",
-                "already_there_at_startup", "class"])
+                "already_there_at_startup", "class", "arrival_image",
+                "departure_image"])
     if events:
         d_start, d_end, *_ = _resolve_window(events, now, days, start, end)
         iso = lambda t: (datetime.fromtimestamp(t).astimezone()
@@ -504,13 +563,15 @@ def visits_csv(events, now, days=None, group=None, bay=None, prefix_len=2,
                             iso(v["end"]) if v["end"] else "",
                             v["end"] - v["start"] if v["end"] else "",
                             "completed" if v["end"] else "in_bay",
-                            int(v["partial"]), v["cls"] or ""])
+                            int(v["partial"]), v["cls"] or "",
+                            v["img_in"] or "", v["img_out"] or ""])
     return out.getvalue()
 
 
 def load_events(db):
     return db.execute(
-        "SELECT ts, bay, status, prev_status, class FROM events").fetchall()
+        "SELECT ts, bay, status, prev_status, class, confidence, image "
+        "FROM events").fetchall()
 
 
 # ------------------------------------------------------------------ web --
@@ -548,6 +609,11 @@ vertical-align:middle;margin-right:6px}
 .chart i{display:block;background:var(--acc);border-radius:3px 3px 0 0;min-height:1px}
 .chart.b i{background:var(--acc2)}.chart i.part{opacity:.4}
 .card small{display:block;margin-top:2px}.up{color:var(--ok)}.dn{color:var(--bad)}
+.chart .c[data-id],.gantt .seg,tr[data-entry]{cursor:pointer}.chart .c[data-id]:hover i{filter:brightness(1.15)}
+.gantt .seg:hover{filter:brightness(1.15);outline:1px solid var(--fg)}
+.shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}.shots figure{margin:0}
+.shots img{width:100%;border-radius:8px;border:1px solid var(--line);display:block}.shots figcaption{color:var(--mut);font-size:12px;margin-top:4px}
+.nav{display:flex;justify-content:space-between;margin:0 0 10px}.noimg{color:var(--mut);padding:24px;border:1px dashed var(--line);border-radius:8px;text-align:center}
 .flag{color:#d33;font-weight:600}tr.over td:first-child{color:#d33;font-weight:600}
 .axis{display:flex;gap:3px;color:var(--mut);font-size:10px}.axis span{flex:1;text-align:center;overflow:hidden}
 small{color:var(--mut)}.gantt{position:relative;display:grid;grid-template-columns:90px 1fr;gap:3px 8px;align-items:center}
@@ -576,8 +642,8 @@ const card=(l,v,sub='')=>`<div class=card><b>${v}</b><span>${l}</span>${sub?`<sm
 const delta=(cur,prev,fmtf,label,lowerBetter)=>{if(prev==null||cur==null)return '';const d=cur-prev;if(!d)return `= ${label}`;
 const good=lowerBetter?d<0:d>0;return `<span class="${good?'up':'dn'}">${d>0?'▲':'▼'} ${fmtf(Math.abs(d))}</span> vs ${label}`};
 const hhmm=t=>new Date(t*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-const bars=(vals,labels,cls='',tip=(i,v)=>v,parts=[],lab=(i,v)=>v?String(v):'')=>{const m=Math.max(1,...vals),show=vals.length<=40;
-return `<div class="chart ${cls}">`+vals.map((v,i)=>`<div class=c title="${labels[i]}: ${tip(i,v)}"><b class=v>${show?lab(i,v):''}</b><i class="${parts[i]?'part':''}" style="height:${100*v/m}%"></i></div>`).join('')+
+const bars=(vals,labels,cls='',tip=(i,v)=>v,parts=[],lab=(i,v)=>v?String(v):'',ids=[])=>{const m=Math.max(1,...vals),show=vals.length<=40;
+return `<div class="chart ${cls}">`+vals.map((v,i)=>`<div class=c ${ids[i]?`data-id="${ids[i]}"`:''} title="${labels[i]}: ${tip(i,v)}${ids[i]?' · click for detail':''}"><b class=v>${show?lab(i,v):''}</b><i class="${parts[i]?'part':''}" style="height:${100*v/m}%"></i></div>`).join('')+
 `</div><div class=axis>`+labels.map((l,i)=>`<span>${vals.length>14&&i%Math.ceil(vals.length/14)?'':l}</span>`).join('')+`</div>`};
 const pad=n=>String(n).padStart(2,'0');
 const tlabel=(t,unit)=>{const d=new Date(t*1000);return unit=='day'?`${d.getMonth()+1}-${pad(d.getDate())}`:(d.getHours()==0?`${d.getMonth()+1}/${d.getDate()}`:pad(d.getHours()))};
@@ -589,7 +655,7 @@ const step=span<=26*3600?2*3600:span<=50*3600?4*3600:6*3600;let ticks='',grid=''
 for(let t=Math.ceil(W0/step)*step;t<W1;t+=step){ticks+=`<span style="left:${p(t)}%">${tlabel(t,'hour')}</span>`;grid+=`<i class=grid style="left:${p(t)}%"></i>`}
 const nowL=d.generated>W0&&d.generated<W1?`<i class=now style="left:${p(d.generated)}%"></i>`:'';
 return `<div class=gantt><span></span><div class=ticks>${ticks}</div>`+rows.map(r=>`<span class=lbl data-bay="${r.bay}">${r.bay}</span><div class=track>${grid}`+
-(r.segments||[]).map(([s,e,pt])=>`<i class="seg ${pt?'part':''}" style="left:${p(s)}%;width:${Math.max(0.2,p(e??d.generated)-p(s))}%" title="${fmt(s)} → ${e?fmt(e):'now'}"></i>`).join('')+nowL+`</div>`).join('')+`</div>`}
+(r.segments||[]).map(([s,e,pt])=>`<i class="seg ${pt?'part':''}" data-bay="${r.bay}" data-start="${s}" style="left:${p(s)}%;width:${Math.max(0.2,p(e??d.generated)-p(s))}%" title="${fmt(s)} → ${e?fmt(e):'now'}"></i>`).join('')+nowL+`</div>`).join('')+`</div>`}
 const rangeNote=d=>`<small>${tfull(d.range_start,'hour')} → ${tfull(d.range_end,'hour')}</small>`;
 const HRS=[...Array(24).keys()].map(h=>String(h).padStart(2,'0'));
 const COLS=[['bay','Bay'],['status','Now'],['visits','Visits'],['utilisation_pct','Utilisation'],
@@ -653,11 +719,30 @@ h+=`<section><h2>How long trucks stay here <small>(TTAT distribution)</small></h
 if(u=='day'){h+=`<section><h2>Arrivals by hour of day <small>(pattern across the range)</small></h2>${bars(d.arrivals_by_hour,HRS)}</section>`;
 h+=`<section><h2>Occupancy by hour of day <small>(% of each hour the bay was occupied)</small></h2>${bars(d.occupancy_pct_by_hour,HRS,'b',(i,v)=>v+'%',[],(i,v)=>v?Math.round(v)+'%':'')}</section>`}
 const t=d.trucks,done=t.filter(x=>x.ttat!=null);
-h+=`<section><h2>Each truck entry <small>(bar = time in bay, oldest → newest; faded = already there when monitoring started)</small></h2>`+
-(done.length?bars(done.map(x=>x.ttat),done.map(x=>new Date(x.start*1000).toLocaleDateString([],{month:'numeric',day:'numeric'})),'',(i,v)=>dur(v)+' from '+fmt(done[i].start),done.map(x=>x.partial),(i,v)=>dur(v)):'<small>No completed visits in this range.</small>')+`</section>`;
-h+=`<section><h2>Entries <small>(newest first)</small></h2><table><tr><th>Arrived</th><th>Left</th><th>TTAT</th><th>Detected as</th></tr>`+
-[...t].reverse().map(x=>`<tr><td>${fmt(x.start)}${x.partial?' <small>(already there at startup)</small>':''}</td>
+h+=`<section><h2>Each truck entry <small>(bar = time in bay, oldest → newest; faded = already there when monitoring started · click a bar)</small></h2>`+
+(done.length?bars(done.map(x=>x.ttat),done.map(x=>new Date(x.start*1000).toLocaleDateString([],{month:'numeric',day:'numeric'})),'',(i,v)=>dur(v)+' from '+fmt(done[i].start),done.map(x=>x.partial),(i,v)=>dur(v),done.map(x=>x.start)):'<small>No completed visits in this range.</small>')+`</section>`;
+h+=`<section><h2>Entries <small>(newest first · click one for its detail)</small></h2><table><tr><th>Arrived</th><th>Left</th><th>TTAT</th><th>Detected as</th></tr>`+
+[...t].reverse().map(x=>`<tr data-entry="${d.bay}|${x.start}"><td>${fmt(x.start)}${x.partial?' <small>(already there at startup)</small>':''}</td>
 <td>${x.end?fmt(x.end):'<small>in bay now</small>'}</td><td>${dur(x.ttat)}</td><td>${x.class||'–'}</td></tr>`).join('')+`</table></section>`;
+$('view').innerHTML=h;wireEntries()}
+const goEntry=(bay,start)=>{location.hash='#/entry/'+encodeURIComponent(bay)+'/'+start};
+function wireEntries(){document.querySelectorAll('tr[data-entry]').forEach(e=>e.onclick=()=>{const [b,s]=e.dataset.entry.split('|');goEntry(b,s)});
+document.querySelectorAll('.c[data-id]').forEach(e=>e.onclick=()=>goEntry(data.bay,e.dataset.id));
+document.querySelectorAll('.seg[data-start]').forEach(e=>e.onclick=()=>goEntry(e.dataset.bay,e.dataset.start))}
+const shot=(f,cap)=>f?`<figure><a href="/img/${encodeURIComponent(f)}" target="_blank"><img loading=lazy src="/img/${encodeURIComponent(f)}" alt="${cap}"></a><figcaption>${cap}</figcaption></figure>`:
+`<div class=noimg>No snapshot for ${cap.toLowerCase()}.<br><small>Snapshots are saved only while <code>event_images_dir</code> is enabled in bay_occupancy.</small></div>`;
+function renderEntry(){const e=data,bay=encodeURIComponent(e.bay);
+const nav=`<div class=nav><span>${e.prev_start?`<a class=back href="#/entry/${bay}/${e.prev_start}">← Previous truck</a>`:''}</span>
+<span><a class=back href="#/bay/${bay}">${e.bay} · all entries</a></span><span>${e.next_start?`<a class=back href="#/entry/${bay}/${e.next_start}">Next truck →</a>`:''}</span></div>`;
+const inBay=e.end==null;
+let h=`${nav}<h2 style="font-size:18px">${e.bay} <small>group ${e.group}</small> · ${fmt(e.start)} ${inBay?pill('occupied','in bay now'):pill('empty','completed')}</h2>`;
+const vs=e.vs_avg_pct==null?'':`<span class="${e.vs_avg_pct>0?'dn':'up'}">${e.vs_avg_pct>0?'▲':'▼'} ${Math.abs(e.vs_avg_pct)}%</span> vs this bay's average (${dur(e.bay_avg_ttat)})`;
+h+=`<div class=cards>`+card('Arrived',fmt(e.start),e.partial?'already there when monitoring started':'')+
+card('Left',inBay?'in bay':fmt(e.end))+card(inBay?'In bay for':'Time in bay (TTAT)',dur(inBay?e.in_bay_for:e.ttat),vs)+
+(e.rank_longest?card('Ranking',`#${e.rank_longest} longest`,`of ${e.of_visits} visits in this bay`):'')+
+card('Bay was empty for',dur(e.idle_before),'before this truck')+card('Other bays busy',e.other_bays_occupied_at_arrival,'at arrival')+
+card('Detected as',e.class||'–',e.confidence!=null?'confidence '+e.confidence:'')+`</div>`;
+h+=`<section><h2>What the camera saw</h2><div class=shots>${shot(e.arrival_image,'Arrival · '+fmt(e.start))}${shot(e.departure_image,inBay?'Departure · not yet':'Departure · '+fmt(e.end))}</div></section>`;
 $('view').innerHTML=h}
 
 function rangeQuery(){const v=$('days').value,q=[];
@@ -670,20 +755,23 @@ else if(v=='date'){const p=$('pick').value;if(p){const a=new Date(p+'T00:00:00')
 else if(v!='all')q.push('days='+v);
 return q}
 async function load(){route=location.hash||'#/';const q=rangeQuery();
-const m=route.match(/^#\/bay\/(.+)$/);
-let url;if(m){url='/api/bay/'+m[1]+(q.length?'?'+q.join('&'):'')}
+const m=route.match(/^#\/bay\/(.+)$/),en=route.match(/^#\/entry\/(.+)\/(\d+)$/);
+let url;if(en){url='/api/entry/'+en[1]+'/'+en[2]}
+else if(m){url='/api/bay/'+m[1]+(q.length?'?'+q.join('&'):'')}
 else{if(group)q.push('group='+encodeURIComponent(group));url='/api/stats'+(q.length?'?'+q.join('&'):'')}
 const cq=q.filter(x=>!x.startsWith('group=')).concat(m?['bay='+m[1]]:(group?['group='+encodeURIComponent(group)]:[]));
 $('csv').href='/api/visits.csv'+(cq.length?'?'+cq.join('&'):'');
 const r=await fetch(url);
 if(!r.ok){$('view').innerHTML='<p><a class=back href="#/">← All bays</a></p><p>Not found.</p>';return}
-data=await r.json();m?renderBay():renderOverview();
+data=await r.json();en?renderEntry():m?renderBay():renderOverview();
+if(!en&&!m)wireEntries();
 $('gen').textContent=' updated '+new Date(data.generated*1000).toLocaleTimeString()}
 $('days').onchange=load;$('pick').onchange=load;window.onhashchange=load;load();setInterval(load,60000);
 </script></body></html>"""
 
 
-def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600):
+def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
+                 image_dir=None):
     class H(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype):
             self.send_response(code)
@@ -716,6 +804,32 @@ def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600):
                                         q.get("group", [None])[0], prefix_len,
                                         start, end, overstay_sec)
                 return self._json(200, stats)
+            if u.path.startswith("/img/"):
+                name = unquote(u.path[5:])
+                f = (Path(image_dir) / name) if image_dir else None
+                if (not f or not IMG_RE.match(name) or not f.is_file()):
+                    return self._json(404, {"error": "no such image"})
+                data = f.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "max-age=86400")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if u.path.startswith("/api/entry/"):
+                parts = unquote(u.path[len("/api/entry/"):]).rsplit("/", 1)
+                try:
+                    bay, st = parts[0], int(parts[1])
+                except (IndexError, ValueError):
+                    return self._json(400, {"error": "use /api/entry/<bay>/<start>"})
+                with _lock:
+                    import_csv(db, csv_path)
+                    ent = build_entry(load_events(db), bay, st, time.time(),
+                                      prefix_len)
+                if ent is None:
+                    return self._json(404, {"error": "unknown entry"})
+                return self._json(200, ent)
             if u.path == "/api/visits.csv":
                 with _lock:
                     import_csv(db, csv_path)
@@ -752,7 +866,8 @@ def main():
           f"serving on http://{d['host']}:{d['port']}/")
     ThreadingHTTPServer((d["host"], int(d["port"])), make_handler(
         db, csv_path, int(d["group_prefix_len"]),
-        int(float(d["overstay_hours"]) * 3600))).serve_forever()
+        int(float(d["overstay_hours"]) * 3600),
+        raw.get("event_images_dir", "event_images"))).serve_forever()
 
 
 if __name__ == "__main__":

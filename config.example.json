@@ -6,7 +6,12 @@
   "occupied_confirm_count": 2,
   "empty_confirm_count": 4,
   "round_interval_sec": 3.0,
-  "crop": {"top": 0, "bottom": 0, "left": 0, "right": 0},
+  "crop": {
+    "top": 0,
+    "bottom": 0,
+    "left": 0,
+    "right": 0
+  },
   "save_images": true,
   "save_dir": "latest",
   "save_interval_sec": 30,
@@ -15,13 +20,40 @@
   "latest_max_dimension": 960,
   "events_csv": "bay_events.csv",
   "dashboard_note": "dashboard.bay_webhook_url = where bay_occupancy.py serves /bay/<bay> (default http://127.0.0.1:8081); the bay page shows that live frame.",
-  "external": {"enabled": true, "base_url": "http://10.69.12.41:8502", "api_key": {"key": "X-API-Key", "value": "CHANGE_ME"}, "poll_sec": 15, "timeout_sec": 5, "max_age_sec": 300},
+  "external": {
+    "enabled": true,
+    "base_url": "http://10.69.12.41:8502",
+    "api_key": {
+      "key": "X-API-Key",
+      "value": "CHANGE_ME"
+    },
+    "poll_sec": 15,
+    "timeout_sec": 5,
+    "max_age_sec": 300
+  },
   "event_images_dir": "event_images",
   "event_images_max_dimension": 960,
   "event_images_keep_days": 30,
-  "webhook": {"enabled": true, "host": "0.0.0.0", "port": 8081, "max_dimension": 640, "jpeg_quality": 80},
-  "snapshot": {"username": "camera_admin", "password": "CHANGE_ME"},
-  "mqtt": {"host": "mqtt.example.local", "port": 1883,
-           "username": "mqtt_user", "password": "CHANGE_ME",
-           "topic_prefix": "site/alpr/bay_occupancy"}
+  "webhook": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8081,
+    "max_dimension": 640,
+    "jpeg_quality": 80
+  },
+  "snapshot": {
+    "username": "camera_admin",
+    "password": "CHANGE_ME"
+  },
+  "mqtt": {
+    "host": "mqtt.example.local",
+    "port": 1883,
+    "username": "mqtt_user",
+    "password": "CHANGE_ME",
+    "topic_prefix": "site/alpr/bay_occupancy"
+  },
+  "dashboard": {
+    "work_start": "06:30",
+    "work_end": "24:00"
+  }
 }

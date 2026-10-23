@@ -49,7 +49,8 @@ from datetime import timedelta
 from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULTS = {"host": "0.0.0.0", "port": 8082, "db_path": "dashboard.db",
-            "group_prefix_len": 2, "overstay_hours": 4}
+            "group_prefix_len": 2, "overstay_hours": 4,
+            "work_start": "06:30", "work_end": "24:00"}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(
   ts INTEGER NOT NULL, bay TEXT NOT NULL, status TEXT NOT NULL,
@@ -377,16 +378,73 @@ def _resolve_window(events, now, days, start, end):
     return d_start, d_end, w_start, w_end, max(1.0, w_end - w_start)
 
 
-def _stats_for(visits, w_start, w_end):
-    """Occupied seconds in the window plus TTAT list / last departure.
-    Only completed, non-partial visits that ENDED in the window count
-    toward TTAT."""
+# Daily working hours (seconds from local midnight). Utilisation counts only
+# time inside them; the timelines and TTAT are unaffected. Set from config
+# via set_work_hours(); the default is the whole day.
+WORK = {"start": 0, "end": 86400}
+
+
+def _hhmm(s):
+    s = str(s).strip()
+    if s == "24:00":
+        return 86400
+    h, m = s.split(":")
+    return int(h) * 3600 + int(m) * 60
+
+
+def set_work_hours(start, end):
+    WORK["start"], WORK["end"] = _hhmm(start), _hhmm(end)
+
+
+def work_label():
+    f = lambda sec: f"{sec // 3600:02d}:{sec % 3600 // 60:02d}"
+    return f"{f(WORK['start'])}–{f(WORK['end'])}"
+
+
+def work_intervals(a, b):
+    """[(start, end)] epoch pieces inside [a, b] that fall in the daily
+    working hours, in local time."""
+    out = []
+    if b <= a:
+        return out
+    day = datetime.fromtimestamp(a).replace(hour=0, minute=0, second=0,
+                                            microsecond=0)
+    while day.timestamp() < b:
+        s = (day + timedelta(seconds=WORK["start"])).timestamp()
+        e = (day + timedelta(seconds=WORK["end"])).timestamp()
+        s, e = max(s, a), min(e, b)
+        if e > s:
+            out.append((s, e))
+        day += timedelta(days=1)
+    return out
+
+
+def _overlap(a, b, work, starts):
+    """Seconds of [a, b) inside the working intervals."""
+    i = max(0, bisect_right(starts, a) - 1)
+    tot = 0.0
+    while i < len(work) and work[i][0] < b:
+        s, e = work[i]
+        ov = min(e, b) - max(s, a)
+        if ov > 0:
+            tot += ov
+        i += 1
+    return tot
+
+
+def _stats_for(visits, w_start, w_end, work=None):
+    """Occupied working-hours seconds in the window plus TTAT list / last
+    departure. Only completed, non-partial visits that ENDED in the window
+    count toward TTAT."""
+    if work is None:
+        work = work_intervals(w_start, w_end)
+    starts = [s for s, _ in work]
     occ_sec, ttats, last_end = 0.0, [], None
     for v in visits:
         e = v["end"] if v["end"] is not None else w_end
         cs, ce = max(v["start"], w_start), min(e, w_end)
         if ce > cs:
-            occ_sec += ce - cs
+            occ_sec += _overlap(cs, ce, work, starts)
         if (v["end"] is None or v["partial"]
                 or not w_start <= v["end"] <= w_end):
             continue
@@ -488,10 +546,11 @@ def _concurrency(bay_visits, w_start, w_end):
 def _period_numbers(visits, bays, w_start, w_end):
     """visits/ttat/utilisation for a window -- used for the previous
     period, so cards can show change."""
-    window = max(1.0, w_end - w_start)
+    work = work_intervals(w_start, w_end)
+    window = max(1.0, sum(e - s for s, e in work))
     ttats, utils = [], []
     for b in bays:
-        occ, tt, _ = _stats_for(visits.get(b, []), w_start, w_end)
+        occ, tt, _ = _stats_for(visits.get(b, []), w_start, w_end, work)
         ttats += tt
         utils.append(100 * occ / window)
     return {"visits": len(ttats),
@@ -572,15 +631,17 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
     last_status = {}
     for e in sorted(events, key=lambda e: e[0]):
         last_status[e[1]] = (e[2], e[0])
+    work = work_intervals(w_start, w_end)
+    work_sec = max(1.0, sum(e - s for s, e in work))
 
     bays, grp = [], {}
     for bay in sorted(visits):
-        occ_sec, ttats, last_end = _stats_for(visits[bay], w_start, w_end)
+        occ_sec, ttats, last_end = _stats_for(visits[bay], w_start, w_end, work)
         g = group_of(bay, prefix_len)
         st = last_status[bay]
         row = {"bay": bay, "group": g, "status": st[0], "since": st[1],
                "visits": len(ttats),
-               "utilisation_pct": round(100 * occ_sec / window, 1),
+               "utilisation_pct": round(100 * occ_sec / work_sec, 1),
                "last_visit_end": last_end, **_ttat_summary(ttats)}
         bays.append(row)
         a = grp.setdefault(g, {"bays": 0, "occupied_now": 0,
@@ -618,6 +679,7 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
                              and now - b["since"] > overstay_sec)
     return {
         "generated": int(now), "window_sec": int(window), "days": days,
+        "work_hours": work_label(),
         "range_start": int(d_start), "range_end": int(d_end), "unit": unit,
         "group": group or None, "bays": shown, "groups": groups,
         "highlights": _highlights(visits, last_status, shown, w_start,
@@ -651,7 +713,9 @@ def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
         events, now, days, start, end)
     unit = "hour" if d_end - d_start <= HOURLY_MAX_SEC else "day"
     visits = build_visits(events, now).get(bay, [])
-    occ_sec, ttats, last_end = _stats_for(visits, w_start, w_end)
+    work = work_intervals(w_start, w_end)
+    work_sec = max(1.0, sum(e - s for s, e in work))
+    occ_sec, ttats, last_end = _stats_for(visits, w_start, w_end, work)
     st = max((e for e in events if e[1] == bay), key=lambda e: e[0])
 
     arrivals = [0] * 24
@@ -678,7 +742,8 @@ def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
         "bay": bay, "group": group_of(bay, prefix_len),
         "status": st[2], "since": st[0],
         "visits": len(ttats),
-        "utilisation_pct": round(100 * occ_sec / window, 1),
+        "utilisation_pct": round(100 * occ_sec / work_sec, 1),
+        "work_hours": work_label(),
         "last_visit_end": last_end, **_ttat_summary(ttats),
         "timeline": _timeline([visits], d_start, d_end, w_start, w_end,
                               unit, now),
@@ -893,7 +958,7 @@ gs.map(g=>`<tr class=click data-g="${g.group}"><td>${g.group}</td><td>${g.bays}<
 <td>${util(g.utilisation_pct)}</td><td>${dur(g.ttat_avg)}</td><td>${dur(g.ttat_median)}</td><td>${dur(g.ttat_p90)}</td></tr>`).join('')+`</table></section>`;
 const rows=[...data.bays].sort((a,b)=>{const x=a[sort.k],y=b[sort.k];
 return ((x==null)-(y==null))||(x>y?1:x<y?-1:0)*sort.d});
-h+=`<section><h2>Per bay <small>(click a heading to sort, a bay for detail · TTAT = occupied → empty)</small></h2><table><tr>`+
+h+=`<section><h2>Per bay <small>(click a heading to sort, a bay for detail · TTAT = occupied → empty · utilisation counts ${data.work_hours} only)</small></h2><table><tr>`+
 COLS.map(([k,l])=>`<th data-k=${k}>${l}${sort.k==k?(sort.d>0?' ▲':' ▼'):''}</th>`).join('')+'</tr>'+
 (rows.map(b=>`<tr class="click ${b.overstay?'over':''}" data-bay="${b.bay}"><td>${b.bay}${b.overstay?' ⚠':''}</td><td>${pill(b.status,ago(b.since))}</td>
 <td>${b.visits}</td><td>${util(b.utilisation_pct)}</td><td>${dur(b.ttat_avg)}</td><td>${dur(b.ttat_median)}</td><td>${dur(b.ttat_p90)}</td>
@@ -913,7 +978,7 @@ document.querySelectorAll('[data-bay]').forEach(e=>e.onclick=()=>{location.hash=
 
 function renderBay(){const d=data;
 let h=`<p><a class=back href="#/">← All bays</a></p><h2 style="font-size:18px">${d.bay} <small>group ${d.group}</small> ${pill(d.status,ago(d.since))}</h2>`;
-h+=`<div class=cards>`+card('Visits',d.visits)+card('Utilisation',d.utilisation_pct+'%')+card('Avg TTAT',dur(d.ttat_avg))+
+h+=`<div class=cards>`+card('Visits',d.visits)+card('Utilisation',d.utilisation_pct+'%','working hours '+d.work_hours)+card('Avg TTAT',dur(d.ttat_avg))+
 card('Median TTAT',dur(d.ttat_median))+card('P90 TTAT',dur(d.ttat_p90))+card('Longest',dur(d.ttat_max))+card('Last departure',ago(d.last_visit_end))+
 `<div class="card tile" id=tilebox></div></div>`;
 const u=d.unit,per=u=='day'?'day':'hour';
@@ -1111,6 +1176,7 @@ def main():
     csv_path = str(base / (raw.get("events_csv") or "bay_events.csv"))
     latest_dir = str(base / raw.get("save_dir", "latest"))
     images_dir = str(base / raw.get("event_images_dir", "event_images"))
+    set_work_hours(d["work_start"], d["work_end"])
     db = connect(d["db_path"])
     store = Store(db, csv_path)
     store.get()

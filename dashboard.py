@@ -44,11 +44,12 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import urllib.request
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from bisect import bisect_left, bisect_right
+from datetime import timedelta
+from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULTS = {"host": "0.0.0.0", "port": 8082, "db_path": "dashboard.db",
-            "group_prefix_len": 2, "overstay_hours": 4,
-            "bay_webhook_url": "http://127.0.0.1:8081"}
+            "group_prefix_len": 2, "overstay_hours": 4}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(
   ts INTEGER NOT NULL, bay TEXT NOT NULL, status TEXT NOT NULL,
@@ -125,8 +126,11 @@ def import_csv(db, csv_path):
     return n
 
 
-# ------------------------------------------------------- live snapshot --
+# ------------------------------------------------ snapshots and plates --
 log = logging.getLogger("dashboard")
+RESPONSE_TTL_SEC = 10          # API answers are reused this long (same data)
+REBUILD_MIN_SEC = 5            # at most one events rebuild per this many sec
+MEDIA_RE = re.compile(r"^[A-Za-z0-9._-]+\.jpg$")
 
 
 def api_headers(api_key):
@@ -146,10 +150,20 @@ def norm_bay(b):
     return str(b or "").strip().upper()
 
 
+def latest_for(latest_dir, bay):
+    """Newest saved snapshot file for this bay (bay_occupancy keeps one per
+    bay). Compared by the timestamp in the name, not the status word."""
+    if not latest_dir or not Path(latest_dir).is_dir():
+        return None
+    pat = re.compile(rf"^{re.escape(bay)}_(occupied|empty)_\d{{8}}_\d{{6}}\.jpg$")
+    names = [f.name for f in Path(latest_dir).iterdir() if pat.match(f.name)]
+    return max(names, key=lambda n: n[-19:-4]) if names else None
+
+
 class PlateSource:
     """Truck numbers (plate_text) from the site's detections API,
-    GET <base>/api/detections?date=YYYY-MM-DD, cached per day. Only the
-    plate text is used; images are not fetched."""
+    GET <base>/api/detections?date=YYYY-MM-DD. Each day is fetched once per
+    cache_sec and indexed by bay, so matching a visit is a binary search."""
 
     def __init__(self, base_url, api_key, window_sec=900, cache_sec=60,
                  timeout=10):
@@ -158,7 +172,7 @@ class PlateSource:
         self.window = int(window_sec)
         self.cache_sec = cache_sec
         self.timeout = timeout
-        self._cache = {}
+        self._cache = {}                # date -> (fetched_at, index)
         self._lock = threading.Lock()
 
     def _get(self, path):
@@ -167,32 +181,37 @@ class PlateSource:
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return r.read()
 
-    def day(self, date_str):
+    def _index(self, date_str):
+        """{bay: (sorted_timestamps, plates)} for one day."""
         now = time.time()
         with self._lock:
             hit = self._cache.get(date_str)
             if hit and now - hit[0] < self.cache_sec:
                 return hit[1]
-        reads = []
+        reads = {}
         try:
             payload = json.loads(self._get(f"/api/detections?date={date_str}"))
             items = payload.get("items") if isinstance(payload, dict) else []
             for it in items or []:
+                if not it.get("plate_text"):
+                    continue
                 try:
-                    ts = datetime.strptime(
+                    ts = int(datetime.strptime(
                         f"{it.get('date') or date_str} {it['time']}",
-                        "%Y-%m-%d %H:%M:%S").timestamp()
+                        "%Y-%m-%d %H:%M:%S").timestamp())
                 except (KeyError, TypeError, ValueError):
                     continue
-                if it.get("plate_text"):
-                    reads.append({"ts": int(ts),
-                                  "bay": norm_bay(it.get("bay_number")),
-                                  "plate": str(it["plate_text"])})
+                reads.setdefault(norm_bay(it.get("bay_number")), []).append(
+                    (ts, str(it["plate_text"])))
         except (OSError, ValueError) as e:
             log.warning(f"detections for {date_str} unavailable: {e}")
+        index = {}
+        for bay, pairs in reads.items():
+            pairs.sort()
+            index[bay] = ([t for t, _ in pairs], [p for _, p in pairs])
         with self._lock:
-            self._cache[date_str] = (now, reads)
-        return reads
+            self._cache[date_str] = (now, index)
+        return index
 
     def for_visit(self, bay, start, end):
         """Truck number(s) read on this bay while the truck was in it. If
@@ -201,23 +220,23 @@ class PlateSource:
         end = end if end is not None else time.time()
         b = norm_bay(bay)
         inside, near = [], None
-        t = start - self.window
-        days = set()
-        while t <= end + self.window:
-            days.add(datetime.fromtimestamp(t).strftime("%Y-%m-%d"))
-            t += 86400
-        days.add(datetime.fromtimestamp(end + self.window).strftime("%Y-%m-%d"))
-        for day in sorted(days):
-            for r in self.day(day):
-                if r["bay"] != b:
-                    continue
-                if start <= r["ts"] <= end:
-                    if r["plate"] not in inside:
-                        inside.append(r["plate"])
-                else:
-                    dt = abs(r["ts"] - start)
+        day = datetime.fromtimestamp(start - self.window).date()
+        last = datetime.fromtimestamp(end + self.window).date()
+        while day <= last:
+            hit = self._index(day.strftime("%Y-%m-%d")).get(b)
+            day += timedelta(days=1)
+            if not hit:
+                continue
+            ts, plates = hit
+            lo, hi = bisect_left(ts, start), bisect_right(ts, end)
+            for p in plates[lo:hi]:
+                if p not in inside:
+                    inside.append(p)
+            for i in (lo - 1, hi):      # nearest read just before / after
+                if 0 <= i < len(ts) and not (lo <= i < hi):
+                    dt = abs(ts[i] - start)
                     if dt <= self.window and (near is None or dt < near[0]):
-                        near = (dt, r["plate"])
+                        near = (dt, plates[i])
         if inside:
             return ", ".join(inside)
         if near:
@@ -225,21 +244,53 @@ class PlateSource:
         return None
 
 
+class Store:
+    """The events list, kept in memory. The CSV is checked (size and mtime)
+    on each request; it is imported and the list rebuilt only when it has
+    changed, at most every REBUILD_MIN_SEC. `version` changes on each
+    rebuild, so cached answers are dropped exactly then."""
 
-def fetch_live_snapshot(webhook_url, bay, timeout=5):
-    """The live frame bay_occupancy.py serves at GET /bay/<bay> (its
-    snapshot_base64 JPEG). Raises OSError when the bay or service is
-    unavailable."""
-    url = webhook_url.rstrip("/") + "/bay/" + quote(bay, safe="")
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        j = json.loads(r.read())
-    if not j.get("snapshot_base64"):
-        raise OSError("no snapshot yet")
-    return base64.b64decode(j["snapshot_base64"])
+    def __init__(self, db, csv_path):
+        self.db, self.csv_path = db, csv_path
+        self._sig = None
+        self._events = None
+        self._built_at = 0.0
+        self.version = 0
+        self._lock = threading.Lock()
+
+    def get(self):
+        with self._lock:
+            try:
+                st = Path(self.csv_path).stat()
+                sig = (st.st_size, st.st_mtime_ns)
+            except OSError:
+                sig = None
+            fresh = self._events is None or (
+                sig != self._sig and time.time() - self._built_at >= REBUILD_MIN_SEC)
+            if fresh:
+                n = import_csv(self.db, self.csv_path)
+                if self._events is None or n:
+                    self._events = load_events(self.db)
+                    self.version += 1
+                    self._built_at = time.time()
+                self._sig = sig
+            return self._events, self.version
 
 
 # ---------------------------------------------------------------- stats --
+_visits_memo = {"events": None, "visits": None}
+
+
 def build_visits(events, now):
+    """Memoised on the events list object: the list is replaced only when
+    the CSV changes, so the pairing is reused across requests."""
+    if _visits_memo["events"] is not events:
+        _visits_memo["visits"] = _build_visits(events, now)
+        _visits_memo["events"] = events
+    return _visits_memo["visits"]
+
+
+def _build_visits(events, now):
     """events: [(ts, bay, status, prev_status[, class])] -> {bay: [visit]}.
     visit = dict(start, end|None, partial, cls). Only valid sequences are
     kept: an occupied row followed by another occupied row (service
@@ -357,27 +408,43 @@ def _ttat_summary(ttats):
 def _timeline(bay_visits, d_start, d_end, w_start, w_end, unit, now):
     """Actual-clock buckets across the displayed range: arrivals and
     occupancy %. bay_visits = list of per-bay visit lists. Buckets in the
-    future (or before the first event) carry occ_pct None."""
+    future (or before the first event) carry occ_pct None. Bucket edges are
+    computed once, and each visit is placed with a binary search, so the
+    cost is per visit rather than per visit-per-bucket."""
     n = max(1, len(bay_visits))
-    arr, occ = {}, {}
+    out, b = [], _floor(d_start, unit)
+    edges = []                       # bucket start epochs, then one end
+    while b < d_end:
+        edges.append(b)
+        b = _next(b, unit)
+    edges.append(b)
+    nb = len(edges) - 1
+    arr, occ = [0] * nb, [0.0] * nb
+    seen = [0.0] * nb
+    if w_end > w_start:
+        for i in range(max(0, bisect_right(edges, w_start) - 1), nb):
+            if edges[i] >= w_end:
+                break
+            seen[i] = (min(edges[i + 1], w_end) - max(edges[i], w_start))
     for visits in bay_visits:
         for v in visits:
             if not v["partial"] and w_start <= v["start"] <= w_end:
-                b = _floor(v["start"], unit)
-                arr[b] = arr.get(b, 0) + 1
+                i = bisect_right(edges, v["start"]) - 1
+                if 0 <= i < nb:
+                    arr[i] += 1
             e = v["end"] if v["end"] is not None else w_end
             cs, ce = max(v["start"], w_start), min(e, w_end)
-            if ce > cs:
-                for b, sec in _slices(cs, ce, unit):
-                    occ[b] = occ.get(b, 0.0) + sec
-    seen = dict(_slices(w_start, w_end, unit)) if w_end > w_start else {}
-    out, b = [], _floor(d_start, unit)
-    while b < d_end:
-        s = seen.get(b, 0.0)
-        out.append({"t": int(b), "arrivals": arr.get(b, 0),
-                    "occ_pct": (round(100 * occ.get(b, 0.0) / (s * n), 1)
-                                if s else None)})
-        b = _next(b, unit)
+            if ce <= cs:
+                continue
+            i = max(0, bisect_right(edges, cs) - 1)
+            while i < nb and edges[i] < ce:
+                occ[i] += min(edges[i + 1], ce) - max(edges[i], cs)
+                i += 1
+    for i in range(nb):
+        s_ = seen[i]
+        out.append({"t": int(edges[i]), "arrivals": arr[i],
+                    "occ_pct": (round(100 * occ[i] / (s_ * n), 1)
+                                if s_ else None)})
     return out
 
 
@@ -670,13 +737,13 @@ def build_entry(events, bay, start, now, prefix_len=2):
 
 
 def visits_csv(events, now, days=None, group=None, bay=None, prefix_len=2,
-               start=None, end=None):
+               start=None, end=None, plates=None):
     """CSV text: one row per visit overlapping the range."""
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["bay", "group", "arrived", "left", "ttat_sec", "status",
                 "already_there_at_startup", "class", "arrival_image",
-                "departure_image", "source"])
+                "departure_image", "source", "truck"])
     if events:
         d_start, d_end, *_ = _resolve_window(events, now, days, start, end)
         iso = lambda t: (datetime.fromtimestamp(t).astimezone()
@@ -694,7 +761,9 @@ def visits_csv(events, now, days=None, group=None, bay=None, prefix_len=2,
                             "completed" if v["end"] else "in_bay",
                             int(v["partial"]), v["cls"] or "",
                             v["img_in"] or "", v["img_out"] or "",
-                            v.get("src") or ""])
+                            v.get("src") or "",
+                            (plates.for_visit(b, v["start"], v["end"] or now)
+                             or "") if plates else ""])
     return out.getvalue()
 
 
@@ -918,18 +987,37 @@ $('days').onchange=load;$('pick').onchange=load;window.onhashchange=load;load();
 </script></body></html>"""
 
 
-def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
-                 image_dir=None, webhook_url=None, plates=None):
+def make_handler(store, prefix_len=2, overstay_sec=4 * 3600,
+                 image_dir=None, latest_dir=None, plates=None):
+    cache = {}          # request path+query -> (version, time, body, ctype)
+
     class H(BaseHTTPRequestHandler):
-        def _send(self, code, body, ctype):
+        def _send(self, code, body, ctype, no_store=False):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            if no_store:
+                self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
         def _json(self, code, obj):
             self._send(code, json.dumps(obj).encode(), "application/json")
+
+        def _answer(self, key, make):
+            """make(events, now) -> (code, body, ctype). Reused from cache
+            while the CSV is unchanged and the answer is young."""
+            events, ver = store.get()
+            now = time.time()
+            hit = cache.get(key)
+            if hit and hit[0] == ver and now - hit[1] < RESPONSE_TTL_SEC:
+                return self._send(200, hit[2], hit[3])
+            code, body, ctype = make(events, now)
+            if code == 200:
+                if len(cache) > 300:
+                    cache.clear()
+                cache[key] = (ver, now, body, ctype)
+            self._send(code, body, ctype)
 
         def do_GET(self):
             u = urlparse(self.path)
@@ -938,35 +1026,16 @@ def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             if u.path == "/healthz":
                 return self._json(200, {"ok": True})
-            try:
-                def num(k):
-                    v = q.get(k, [""])[0]
-                    return float(v) if v else None
-                days, start, end = num("days"), num("start"), num("end")
-            except ValueError:
-                return self._json(400, {"error": "bad days/start/end"})
-            if u.path == "/api/stats":
-                with _lock:
-                    import_csv(db, csv_path)
-                    stats = build_stats(load_events(db), time.time(), days,
-                                        q.get("group", [None])[0], prefix_len,
-                                        start, end, overstay_sec,
-                                        plates=plates)
-                return self._json(200, stats)
             if u.path.startswith("/snapshot/"):
                 bay = unquote(u.path[len("/snapshot/"):])
+                name = latest_for(latest_dir, bay)
                 try:
-                    data = fetch_live_snapshot(webhook_url, bay)
-                except (OSError, ValueError) as e:
-                    log.info(f"live snapshot for {bay} unavailable: {e}")
-                    return self._json(503, {"error": "live snapshot unavailable"})
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(data)
-                return
+                    data = (Path(latest_dir) / name).read_bytes() if name else None
+                except OSError:
+                    data = None
+                if data is None:
+                    return self._json(404, {"error": "no snapshot saved yet"})
+                return self._send(200, data, "image/jpeg", no_store=True)
             if u.path.startswith("/img/"):
                 name = unquote(u.path[5:])
                 f = (Path(image_dir) / name) if image_dir else None
@@ -980,37 +1049,52 @@ def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            try:
+                def num(k):
+                    v = q.get(k, [""])[0]
+                    return float(v) if v else None
+                days, start, end = num("days"), num("start"), num("end")
+            except ValueError:
+                return self._json(400, {"error": "bad days/start/end"})
+            if u.path == "/api/stats":
+                group = q.get("group", [None])[0]
+
+                def make(ev, now):
+                    return 200, json.dumps(build_stats(
+                        ev, now, days, group, prefix_len, start, end,
+                        overstay_sec, plates=plates)).encode(), "application/json"
+                return self._answer(self.path, make)
+            if u.path.startswith("/api/bay/"):
+                bay = unquote(u.path[len("/api/bay/"):])
+
+                def make(ev, now):
+                    det = build_bay_detail(ev, bay, now, days, prefix_len,
+                                           start=start, end=end, plates=plates)
+                    if det is None:
+                        return 404, json.dumps({"error": "unknown bay"}).encode(), "application/json"
+                    return 200, json.dumps(det).encode(), "application/json"
+                return self._answer(self.path, make)
             if u.path.startswith("/api/entry/"):
                 parts = unquote(u.path[len("/api/entry/"):]).rsplit("/", 1)
                 try:
                     bay, st = parts[0], int(parts[1])
                 except (IndexError, ValueError):
                     return self._json(400, {"error": "use /api/entry/<bay>/<start>"})
-                with _lock:
-                    import_csv(db, csv_path)
-                    ent = build_entry(load_events(db), bay, st, time.time(),
-                                      prefix_len)
-                if ent is None:
-                    return self._json(404, {"error": "unknown entry"})
-                return self._json(200, ent)
+
+                def make(ev, now):
+                    ent = build_entry(ev, bay, st, now, prefix_len)
+                    if ent is None:
+                        return 404, json.dumps({"error": "unknown entry"}).encode(), "application/json"
+                    return 200, json.dumps(ent).encode(), "application/json"
+                return self._answer(self.path, make)
             if u.path == "/api/visits.csv":
-                with _lock:
-                    import_csv(db, csv_path)
-                    body = visits_csv(load_events(db), time.time(), days,
-                                      q.get("group", [None])[0],
-                                      q.get("bay", [None])[0], prefix_len,
-                                      start, end)
-                return self._send(200, body.encode(), "text/csv")
-            if u.path.startswith("/api/bay/"):
-                bay = unquote(u.path[len("/api/bay/"):])
-                with _lock:
-                    import_csv(db, csv_path)
-                    det = build_bay_detail(load_events(db), bay, time.time(),
-                                           days, prefix_len, start=start,
-                                           end=end, plates=plates)
-                if det is None:
-                    return self._json(404, {"error": "unknown bay"})
-                return self._json(200, det)
+                group, bay = q.get("group", [None])[0], q.get("bay", [None])[0]
+
+                def make(ev, now):
+                    body = visits_csv(ev, now, days, group, bay, prefix_len,
+                                      start, end, plates=plates)
+                    return 200, body.encode(), "text/csv"
+                return self._answer(self.path, make)
             self._json(404, {"error": "not found"})
 
         def log_message(self, *a):
@@ -1023,11 +1107,14 @@ def main():
     cfg_path = Path(sys.argv[1] if len(sys.argv) > 1 else "config.json")
     raw = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
     d = {**DEFAULTS, **(raw.get("dashboard") or {})}
-    csv_path = raw.get("events_csv") or "bay_events.csv"
+    base = cfg_path.resolve().parent   # relative paths are next to config.json
+    csv_path = str(base / (raw.get("events_csv") or "bay_events.csv"))
+    latest_dir = str(base / raw.get("save_dir", "latest"))
+    images_dir = str(base / raw.get("event_images_dir", "event_images"))
     db = connect(d["db_path"])
-    n = import_csv(db, csv_path)
-    print(f"imported {n} events from {csv_path}; "
-          f"serving on http://{d['host']}:{d['port']}/")
+    store = Store(db, csv_path)
+    store.get()
+    print(f"loaded events from {csv_path}; serving on http://{d['host']}:{d['port']}/")
     ext = raw.get("external") or {}
     plates = None
     if api_key_value(ext.get("api_key")) not in (None, "", "CHANGE_ME"):
@@ -1035,10 +1122,9 @@ def main():
                              ext["api_key"], ext.get("plate_match_window_sec", 900))
         print("truck numbers from site detections API: on")
     ThreadingHTTPServer((d["host"], int(d["port"])), make_handler(
-        db, csv_path, int(d["group_prefix_len"]),
+        store, int(d["group_prefix_len"]),
         int(float(d["overstay_hours"]) * 3600),
-        raw.get("event_images_dir", "event_images"),
-        d["bay_webhook_url"], plates)).serve_forever()
+        images_dir, latest_dir, plates)).serve_forever()
 
 
 if __name__ == "__main__":

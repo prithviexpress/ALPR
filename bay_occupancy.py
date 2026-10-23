@@ -95,7 +95,8 @@ DEFAULTS = {
     # Keep only the newest image per bay: <bay>_<status>_<YYYYmmdd_HHMMSS>.jpg
     "save_images": True,
     "save_dir": "latest",
-    "save_interval_sec": 10,      # also saved immediately on a status change
+    "save_interval_sec": 30,      # also saved immediately on a status change
+    "latest_max_dimension": 960,  # saved frame is shrunk to this (CPU/disk)
     # One row per confirmed status change, all bays. "" disables.
     "events_csv": "bay_events.csv",
     # A snapshot at every confirmed arrival/departure, so a truck entry in
@@ -342,7 +343,12 @@ class Monitor:
             return
         path = Path(self.cfg["save_dir"]) / (
             f"{bay}_{status}_{time.strftime('%Y%m%d_%H%M%S')}.jpg")
-        ok, buf = cv2.imencode(".jpg", frame)
+        h, w = frame.shape[:2]
+        scale = min(1.0, self.cfg["latest_max_dimension"] / max(h, w))
+        small = frame if scale == 1.0 else cv2.resize(
+            frame, (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", small)
         if not ok:
             return
         tmp = path.with_name(path.name + ".tmp")

@@ -129,6 +129,90 @@ def import_csv(db, csv_path):
 log = logging.getLogger("dashboard")
 
 
+def norm_bay(b):
+    return str(b or "").strip().upper()
+
+
+class PlateSource:
+    """Truck numbers (plate_text) from the site's detections API,
+    GET <base>/api/detections?date=YYYY-MM-DD, cached per day. Only the
+    plate text is used; images are not fetched."""
+
+    def __init__(self, base_url, api_key, window_sec=900, cache_sec=60,
+                 timeout=10):
+        self.base = base_url.rstrip("/")
+        self.key = api_key
+        self.window = int(window_sec)
+        self.cache_sec = cache_sec
+        self.timeout = timeout
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def _get(self, path):
+        req = urllib.request.Request(self.base + path,
+                                     headers={"X-API-Key": self.key or ""})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return r.read()
+
+    def day(self, date_str):
+        now = time.time()
+        with self._lock:
+            hit = self._cache.get(date_str)
+            if hit and now - hit[0] < self.cache_sec:
+                return hit[1]
+        reads = []
+        try:
+            payload = json.loads(self._get(f"/api/detections?date={date_str}"))
+            items = payload.get("items") if isinstance(payload, dict) else []
+            for it in items or []:
+                try:
+                    ts = datetime.strptime(
+                        f"{it.get('date') or date_str} {it['time']}",
+                        "%Y-%m-%d %H:%M:%S").timestamp()
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if it.get("plate_text"):
+                    reads.append({"ts": int(ts),
+                                  "bay": norm_bay(it.get("bay_number")),
+                                  "plate": str(it["plate_text"])})
+        except (OSError, ValueError) as e:
+            log.warning(f"detections for {date_str} unavailable: {e}")
+        with self._lock:
+            self._cache[date_str] = (now, reads)
+        return reads
+
+    def for_visit(self, bay, start, end):
+        """Truck number(s) read on this bay while the truck was in it. If
+        nothing was read inside the visit, the nearest read within the
+        window of its arrival is used and marked as such. None if neither."""
+        end = end if end is not None else time.time()
+        b = norm_bay(bay)
+        inside, near = [], None
+        t = start - self.window
+        days = set()
+        while t <= end + self.window:
+            days.add(datetime.fromtimestamp(t).strftime("%Y-%m-%d"))
+            t += 86400
+        days.add(datetime.fromtimestamp(end + self.window).strftime("%Y-%m-%d"))
+        for day in sorted(days):
+            for r in self.day(day):
+                if r["bay"] != b:
+                    continue
+                if start <= r["ts"] <= end:
+                    if r["plate"] not in inside:
+                        inside.append(r["plate"])
+                else:
+                    dt = abs(r["ts"] - start)
+                    if dt <= self.window and (near is None or dt < near[0]):
+                        near = (dt, r["plate"])
+        if inside:
+            return ", ".join(inside)
+        if near:
+            return f"{near[1]} (read near arrival)"
+        return None
+
+
+
 def fetch_live_snapshot(webhook_url, bay, timeout=5):
     """The live frame bay_occupancy.py serves at GET /bay/<bay> (its
     snapshot_base64 JPEG). Raises OSError when the bay or service is
@@ -284,9 +368,13 @@ def _timeline(bay_visits, d_start, d_end, w_start, w_end, unit, now):
     return out
 
 
-def _segments(visits, d_start, d_end):
-    return [[v["start"], v["end"], v["partial"]] for v in visits
-            if v["start"] < d_end and (v["end"] is None or v["end"] > d_start)]
+def _segments(visits, d_start, d_end, plates=None, bay=None, now=None):
+    out = []
+    for v in visits:
+        if v["start"] < d_end and (v["end"] is None or v["end"] > d_start):
+            pl = plates.for_visit(bay, v["start"], v["end"] or now) if plates else None
+            out.append([v["start"], v["end"], v["partial"], pl])
+    return out
 
 
 TTAT_EDGES = [1800, 3600, 7200, 14400]
@@ -385,7 +473,7 @@ def _highlights(visits, last_status, shown, w_start, w_end, now, timeline,
 
 
 def build_stats(events, now, days=None, group=None, prefix_len=2,
-                start=None, end=None, overstay_sec=4 * 3600):
+                start=None, end=None, overstay_sec=4 * 3600, plates=None):
     """Overview for the last `days` days, or the explicit [start, end)
     range in epoch seconds (e.g. today 00:00 -> 24:00). `group` restricts
     bays/charts/cards to one bay group; `groups` always lists all."""
@@ -431,7 +519,8 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
     by_hour, by_day, all_ttat = [0] * 24, {}, []
     for b in shown:
         if unit == "hour":
-            b["segments"] = _segments(visits[b["bay"]], d_start, d_end)
+            b["segments"] = _segments(visits[b["bay"]], d_start, d_end,
+                                      plates, b["bay"], now)
         for v in visits[b["bay"]]:
             if (v["end"] is None or v["partial"]
                     or not w_start <= v["end"] <= w_end):
@@ -473,7 +562,7 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
 
 
 def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
-                     start=None, end=None):
+                     start=None, end=None, plates=None):
     """Drill-down for one bay: summary, actual-clock timeline, hour-of-day
     pattern, and one entry per truck visit. None for a bay with no events."""
     if not any(e[1] == bay for e in events):
@@ -518,7 +607,9 @@ def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
         "trucks": [{"start": v["start"], "end": v["end"],
                     "ttat": (v["end"] - v["start"]
                              if v["end"] is not None else None),
-                    "partial": v["partial"], "class": v["cls"]}
+                    "partial": v["partial"], "class": v["cls"],
+                    "plate": (plates.for_visit(bay, v["start"], v["end"] or now)
+                              if plates else None)}
                    for v in listed],
     }
 
@@ -686,7 +777,7 @@ const step=span<=26*3600?2*3600:span<=50*3600?4*3600:6*3600;let ticks='',grid=''
 for(let t=Math.ceil(W0/step)*step;t<W1;t+=step){ticks+=`<span style="left:${p(t)}%">${tlabel(t,'hour')}</span>`;grid+=`<i class=grid style="left:${p(t)}%"></i>`}
 const nowL=d.generated>W0&&d.generated<W1?`<i class=now style="left:${p(d.generated)}%"></i>`:'';
 return `<div class=gantt><span></span><div class=ticks>${ticks}</div>`+rows.map(r=>`<span class=lbl data-bay="${r.bay}">${r.bay}</span><div class=track>${grid}`+
-(r.segments||[]).map(([s,e,pt])=>`<i class="seg ${pt?'part':''}" data-bay="${r.bay}" data-start="${s}" style="left:${p(s)}%;width:${Math.max(0.2,p(e??d.generated)-p(s))}%" title="${fmt(s)} → ${e?fmt(e):'now'}"></i>`).join('')+nowL+`</div>`).join('')+`</div>`}
+(r.segments||[]).map(([s,e,pt,pl])=>`<i class="seg ${pt?'part':''}" data-bay="${r.bay}" data-start="${s}" style="left:${p(s)}%;width:${Math.max(0.2,p(e??d.generated)-p(s))}%" title="${fmt(s)} → ${e?fmt(e):'now'} · ${pl?'Truck '+pl:'no truck number read'}"></i>`).join('')+nowL+`</div>`).join('')+`</div>`}
 const rangeNote=d=>`<small>${tfull(d.range_start,'hour')} → ${tfull(d.range_end,'hour')}</small>`;
 const HRS=[...Array(24).keys()].map(h=>String(h).padStart(2,'0'));
 const COLS=[['bay','Bay'],['status','Now'],['visits','Visits'],['utilisation_pct','Utilisation'],
@@ -744,7 +835,7 @@ h+=`<div class=cards>`+card('Visits',d.visits)+card('Utilisation',d.utilisation_
 card('Median TTAT',dur(d.ttat_median))+card('P90 TTAT',dur(d.ttat_p90))+card('Longest',dur(d.ttat_max))+card('Last departure',ago(d.last_visit_end))+
 `<div class="card tile" id=tilebox></div></div>`;
 const u=d.unit,per=u=='day'?'day':'hour';
-if(u=='hour')h+=`<section><h2>Timeline <small>(orange = truck in bay)</small></h2>${gantt([{bay:d.bay,segments:d.trucks.map(x=>[x.start,x.end,x.partial])}],d)}</section>`;
+if(u=='hour')h+=`<section><h2>Timeline <small>(orange = truck in bay)</small></h2>${gantt([{bay:d.bay,segments:d.trucks.map(x=>[x.start,x.end,x.partial,x.plate])}],d)}</section>`;
 h+=`<section><h2>Arrivals per ${per} <small>(actual clock time)</small></h2>${timeline(d.timeline,u,'arrivals','','')}</section>`;
 h+=`<section><h2>Occupancy per ${per} <small>(% of each ${per} the bay was occupied)</small></h2>${timeline(d.timeline,u,'occ_pct','b','%')}</section>`;
 h+=`<section><h2>How long trucks stay here <small>(TTAT distribution)</small></h2>${histo(d.ttat_hist)}</section>`;
@@ -753,9 +844,9 @@ h+=`<section><h2>Occupancy by hour of day <small>(% of each hour the bay was occ
 const t=d.trucks,done=t.filter(x=>x.ttat!=null);
 h+=`<section><h2>Each truck entry <small>(bar = time in bay, oldest → newest; faded = already there when monitoring started · click a bar)</small></h2>`+
 (done.length?bars(done.map(x=>x.ttat),done.map(x=>new Date(x.start*1000).toLocaleDateString([],{month:'numeric',day:'numeric'})),'',(i,v)=>dur(v)+' from '+fmt(done[i].start),done.map(x=>x.partial),(i,v)=>dur(v),done.map(x=>x.start)):'<small>No completed visits in this range.</small>')+`</section>`;
-h+=`<section><h2>Entries <small>(newest first · click one for its detail)</small></h2><table><tr><th>Arrived</th><th>Left</th><th>TTAT</th><th>Detected as</th></tr>`+
+h+=`<section><h2>Entries <small>(newest first · click one for its detail)</small></h2><table><tr><th>Arrived</th><th>Left</th><th>TTAT</th><th>Truck</th><th>Detected as</th></tr>`+
 [...t].reverse().map(x=>`<tr data-entry="${d.bay}|${x.start}"><td>${fmt(x.start)}${x.partial?' <small>(already there at startup)</small>':''}</td>
-<td>${x.end?fmt(x.end):'<small>in bay now</small>'}</td><td>${dur(x.ttat)}</td><td>${x.class||'–'}</td></tr>`).join('')+`</table></section>`;
+<td>${x.end?fmt(x.end):'<small>in bay now</small>'}</td><td>${dur(x.ttat)}</td><td>${x.plate||'<small>–</small>'}</td><td>${x.class||'–'}</td></tr>`).join('')+`</table></section>`;
 $('view').innerHTML=h;wireEntries();placeTile(d.bay)}
 // One snapshot per opening of the bay page: the same <img> is moved into
 // the tile on every stats refresh, so it is never fetched again. Clicking
@@ -815,7 +906,7 @@ $('days').onchange=load;$('pick').onchange=load;window.onhashchange=load;load();
 
 
 def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
-                 image_dir=None, webhook_url=None):
+                 image_dir=None, webhook_url=None, plates=None):
     class H(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype):
             self.send_response(code)
@@ -846,7 +937,8 @@ def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
                     import_csv(db, csv_path)
                     stats = build_stats(load_events(db), time.time(), days,
                                         q.get("group", [None])[0], prefix_len,
-                                        start, end, overstay_sec)
+                                        start, end, overstay_sec,
+                                        plates=plates)
                 return self._json(200, stats)
             if u.path.startswith("/snapshot/"):
                 bay = unquote(u.path[len("/snapshot/"):])
@@ -902,7 +994,7 @@ def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
                     import_csv(db, csv_path)
                     det = build_bay_detail(load_events(db), bay, time.time(),
                                            days, prefix_len, start=start,
-                                           end=end)
+                                           end=end, plates=plates)
                 if det is None:
                     return self._json(404, {"error": "unknown bay"})
                 return self._json(200, det)
@@ -923,11 +1015,17 @@ def main():
     n = import_csv(db, csv_path)
     print(f"imported {n} events from {csv_path}; "
           f"serving on http://{d['host']}:{d['port']}/")
+    ext = raw.get("external") or {}
+    plates = None
+    if ext.get("api_key") and ext.get("api_key") != "CHANGE_ME":
+        plates = PlateSource(ext.get("base_url", "http://10.69.12.41:8502"),
+                             ext["api_key"], ext.get("plate_match_window_sec", 900))
+        print("truck numbers from site detections API: on")
     ThreadingHTTPServer((d["host"], int(d["port"])), make_handler(
         db, csv_path, int(d["group_prefix_len"]),
         int(float(d["overstay_hours"]) * 3600),
         raw.get("event_images_dir", "event_images"),
-        d["bay_webhook_url"])).serve_forever()
+        d["bay_webhook_url"], plates)).serve_forever()
 
 
 if __name__ == "__main__":

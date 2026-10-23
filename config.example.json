@@ -10,6 +10,8 @@
   "save_images": true,
   "save_dir": "latest",
   "save_interval_sec": 30,
+  "cpu_threads": null,
+  "process_priority": "below_normal",
   "latest_max_dimension": 960,
   "events_csv": "bay_events.csv",
   "dashboard_note": "dashboard.bay_webhook_url = where bay_occupancy.py serves /bay/<bay> (default http://127.0.0.1:8081); the bay page shows that live frame.",

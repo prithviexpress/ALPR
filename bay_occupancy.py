@@ -26,6 +26,7 @@ Run:  python bay_occupancy.py [config.json] [cameras.json]
 import base64
 import csv
 import json
+import os
 import re
 import sys
 import threading
@@ -95,6 +96,11 @@ DEFAULTS = {
     # Keep only the newest image per bay: <bay>_<status>_<YYYYmmdd_HHMMSS>.jpg
     "save_images": True,
     "save_dir": "latest",
+    # CPU limits so the detector doesn't starve other programs on the PC
+    # (e.g. dashboard.py). cpu_threads: torch threads (null = half the cores).
+    # process_priority: normal | below_normal | idle.
+    "cpu_threads": None,
+    "process_priority": "below_normal",
     "save_interval_sec": 30,      # also saved immediately on a status change
     "latest_max_dimension": 960,  # saved frame is shrunk to this (CPU/disk)
     # One row per confirmed status change, all bays. "" disables.
@@ -610,6 +616,32 @@ class Monitor:
                 self.stop.wait(max(0.0, interval - (time.time() - t0)))
 
 
+def apply_cpu_limits(cfg):
+    """Keep the detector from taking every core, and let other programs
+    (the dashboard) win CPU contention. Failures only log a warning."""
+    try:
+        import torch
+        threads = cfg.get("cpu_threads") or max(1, (os.cpu_count() or 2) // 2)
+        torch.set_num_threads(int(threads))
+        log.info(f"torch threads: {threads}")
+    except ImportError:
+        pass
+    pri = cfg.get("process_priority") or "normal"
+    if pri == "normal":
+        return
+    try:
+        if os.name == "nt":
+            import ctypes
+            cls = {"below_normal": 0x4000, "idle": 0x40}[pri]
+            k32 = ctypes.windll.kernel32
+            k32.SetPriorityClass(k32.GetCurrentProcess(), cls)
+        else:
+            os.nice({"below_normal": 5, "idle": 19}[pri])
+        log.info(f"process priority: {pri}")
+    except (KeyError, OSError, AttributeError) as e:
+        log.warning(f"could not set process priority {pri!r}: {e}")
+
+
 def main():
     cfg_path = Path(sys.argv[1] if len(sys.argv) > 1 else "config.json")
     cam_path = Path(sys.argv[2] if len(sys.argv) > 2 else "cameras.json")
@@ -620,6 +652,7 @@ def main():
     import paho.mqtt.client as mqtt
     if not Path(cfg["model_path"]).exists():
         sys.exit(f"model not found: {cfg['model_path']}")
+    apply_cpu_limits(cfg)
     model = YOLO(cfg["model_path"])
     log.info(f"model classes: {sorted(model.names.values())}")
 

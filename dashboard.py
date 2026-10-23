@@ -642,6 +642,11 @@ vertical-align:middle;margin-right:6px}
 .nav{display:flex;justify-content:space-between;margin:0 0 10px}.noimg{color:var(--mut);padding:24px;border:1px dashed var(--line);border-radius:8px;text-align:center}
 .flag{color:#d33;font-weight:600}tr.over td:first-child{color:#d33;font-weight:600}
 .axis{display:flex;gap:3px;color:var(--mut);font-size:10px}.axis span{flex:1;text-align:center;overflow:hidden}
+.tile{padding:8px 8px 6px;cursor:zoom-in;display:flex;flex-direction:column;gap:4px}
+.tile small{font-size:11px}.tile img{width:100%;height:auto;border-radius:6px;display:block;background:var(--bg)}
+.tile.big{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.92);border:0;border-radius:0;align-items:center;justify-content:center;padding:24px;cursor:zoom-out}
+.tile.big small{position:absolute;top:14px;left:18px;color:#ddd;font-size:13px}
+.tile.big img{width:min(92vw,1400px);max-height:92vh;height:auto;object-fit:contain}
 small{color:var(--mut)}.gantt{position:relative;display:grid;grid-template-columns:90px 1fr;gap:3px 8px;align-items:center}
 .gantt .lbl{font-size:12px;cursor:pointer}.gantt .track{position:relative;height:16px;background:var(--bg);border-radius:3px}
 .gantt .seg{position:absolute;top:0;bottom:0;background:var(--bad);border-radius:2px;min-width:2px}.gantt .seg.part{opacity:.45}
@@ -735,10 +740,9 @@ document.querySelectorAll('[data-bay]').forEach(e=>e.onclick=()=>{location.hash=
 
 function renderBay(){const d=data;
 let h=`<p><a class=back href="#/">← All bays</a></p><h2 style="font-size:18px">${d.bay} <small>group ${d.group}</small> ${pill(d.status,ago(d.since))}</h2>`;
-h+=`<section><h2>Live view <small>refreshes every 5 s · same frame as bay_occupancy's /bay/${d.bay}</small></h2>`+
-`<figure style="margin:0"><a href="/snapshot/${encodeURIComponent(d.bay)}" target="_blank"><img id=live style="width:100%;max-width:720px;border-radius:8px;border:1px solid var(--line)" src="/snapshot/${encodeURIComponent(d.bay)}?t=${Date.now()}" alt="${d.bay} live" onerror="this.alt='live view unavailable';this.style.opacity=.3"></a></figure></section>`;
 h+=`<div class=cards>`+card('Visits',d.visits)+card('Utilisation',d.utilisation_pct+'%')+card('Avg TTAT',dur(d.ttat_avg))+
-card('Median TTAT',dur(d.ttat_median))+card('P90 TTAT',dur(d.ttat_p90))+card('Longest',dur(d.ttat_max))+card('Last departure',ago(d.last_visit_end))+`</div>`;
+card('Median TTAT',dur(d.ttat_median))+card('P90 TTAT',dur(d.ttat_p90))+card('Longest',dur(d.ttat_max))+card('Last departure',ago(d.last_visit_end))+
+`<div class="card tile" id=tilebox></div></div>`;
 const u=d.unit,per=u=='day'?'day':'hour';
 if(u=='hour')h+=`<section><h2>Timeline <small>(orange = truck in bay)</small></h2>${gantt([{bay:d.bay,segments:d.trucks.map(x=>[x.start,x.end,x.partial])}],d)}</section>`;
 h+=`<section><h2>Arrivals per ${per} <small>(actual clock time)</small></h2>${timeline(d.timeline,u,'arrivals','','')}</section>`;
@@ -752,7 +756,17 @@ h+=`<section><h2>Each truck entry <small>(bar = time in bay, oldest → newest; 
 h+=`<section><h2>Entries <small>(newest first · click one for its detail)</small></h2><table><tr><th>Arrived</th><th>Left</th><th>TTAT</th><th>Detected as</th></tr>`+
 [...t].reverse().map(x=>`<tr data-entry="${d.bay}|${x.start}"><td>${fmt(x.start)}${x.partial?' <small>(already there at startup)</small>':''}</td>
 <td>${x.end?fmt(x.end):'<small>in bay now</small>'}</td><td>${dur(x.ttat)}</td><td>${x.class||'–'}</td></tr>`).join('')+`</table></section>`;
-$('view').innerHTML=h;wireEntries()}
+$('view').innerHTML=h;wireEntries();placeTile(d.bay)}
+// One snapshot per opening of the bay page: the same <img> is moved into
+// the tile on every stats refresh, so it is never fetched again. Clicking
+// the tile enlarges it in place (no second request).
+let liveImg=null,liveBay=null;
+function placeTile(bay){const box=$('tilebox');if(!box)return;
+if(!liveImg||liveBay!==bay){liveImg=new Image();liveBay=bay;liveImg.alt=bay+' live view';
+liveImg.onerror=()=>{liveImg.alt='live view unavailable'};liveImg.src='/snapshot/'+encodeURIComponent(bay)}
+box.innerHTML='<small>Live view · click to enlarge</small>';box.appendChild(liveImg);
+box.onclick=()=>box.classList.toggle('big')}
+document.addEventListener('keydown',e=>{if(e.key=='Escape')document.querySelectorAll('.tile.big').forEach(t=>t.classList.remove('big'))});
 const goEntry=(bay,start)=>{location.hash='#/entry/'+encodeURIComponent(bay)+'/'+start};
 function wireEntries(){document.querySelectorAll('tr[data-entry]').forEach(e=>e.onclick=()=>{const [b,s]=e.dataset.entry.split('|');goEntry(b,s)});
 document.querySelectorAll('.c[data-id]').forEach(e=>e.onclick=()=>goEntry(data.bay,e.dataset.id));
@@ -783,10 +797,7 @@ else if(v=='yesterday')span(mid(-1),mid(0));
 else if(v=='date'){const p=$('pick').value;if(p){const a=new Date(p+'T00:00:00'),b=new Date(a);b.setDate(b.getDate()+1);span(a,b)}else span(mid(0),mid(1))}
 else if(v!='all')q.push('days='+v);
 return q}
-let liveTimer=null;
-function startLive(bay){clearInterval(liveTimer);liveTimer=setInterval(()=>{const im=$('live');
-if(im)im.src='/snapshot/'+encodeURIComponent(bay)+'?t='+Date.now()},5000)}
-async function load(){route=location.hash||'#/';clearInterval(liveTimer);const q=rangeQuery();
+async function load(){route=location.hash||'#/';const q=rangeQuery();
 const m=route.match(/^#\/bay\/(.+)$/),en=route.match(/^#\/entry\/(.+)\/(\d+)$/);
 let url;if(en){url='/api/entry/'+en[1]+'/'+en[2]}
 else if(m){url='/api/bay/'+m[1]+(q.length?'?'+q.join('&'):'')}
@@ -796,7 +807,7 @@ $('csv').href='/api/visits.csv'+(cq.length?'?'+cq.join('&'):'');
 const r=await fetch(url);
 if(!r.ok){$('view').innerHTML='<p><a class=back href="#/">← All bays</a></p><p>Not found.</p>';return}
 data=await r.json();en?renderEntry():m?renderBay():renderOverview();
-if(m&&!en)startLive(data.bay);
+if(!m)liveImg=null;   // leaving the bay page: next open fetches a fresh frame
 if(!en&&!m)wireEntries();
 $('gen').textContent=' updated '+new Date(data.generated*1000).toLocaleTimeString()}
 $('days').onchange=load;$('pick').onchange=load;window.onhashchange=load;load();setInterval(load,60000);

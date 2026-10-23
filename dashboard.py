@@ -129,6 +129,19 @@ def import_csv(db, csv_path):
 log = logging.getLogger("dashboard")
 
 
+def api_headers(api_key):
+    """external.api_key may be the key value (sent as X-API-Key) or a
+    key/value pair: {"key": "X-API-Key", "value": "..."}."""
+    if isinstance(api_key, dict):
+        return {str(api_key.get("key") or "X-API-Key"):
+                str(api_key.get("value") or "")}
+    return {"X-API-Key": str(api_key or "")}
+
+
+def api_key_value(api_key):
+    return api_key.get("value") if isinstance(api_key, dict) else api_key
+
+
 def norm_bay(b):
     return str(b or "").strip().upper()
 
@@ -150,7 +163,7 @@ class PlateSource:
 
     def _get(self, path):
         req = urllib.request.Request(self.base + path,
-                                     headers={"X-API-Key": self.key or ""})
+                                     headers=api_headers(self.key))
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return r.read()
 
@@ -1017,7 +1030,7 @@ def main():
           f"serving on http://{d['host']}:{d['port']}/")
     ext = raw.get("external") or {}
     plates = None
-    if ext.get("api_key") and ext.get("api_key") != "CHANGE_ME":
+    if api_key_value(ext.get("api_key")) not in (None, "", "CHANGE_ME"):
         plates = PlateSource(ext.get("base_url", "http://10.69.12.41:8502"),
                              ext["api_key"], ext.get("plate_match_window_sec", 900))
         print("truck numbers from site detections API: on")

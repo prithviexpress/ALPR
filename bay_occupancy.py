@@ -177,6 +177,19 @@ class BayDebouncer:
 
 REPORTED_FMT = "%Y-%m-%d %H:%M:%S"
 
+def api_headers(api_key):
+    """external.api_key may be the key value (sent as X-API-Key) or a
+    key/value pair: {"key": "X-API-Key", "value": "..."}."""
+    if isinstance(api_key, dict):
+        return {str(api_key.get("key") or "X-API-Key"):
+                str(api_key.get("value") or "")}
+    return {"X-API-Key": str(api_key or "")}
+
+
+def api_key_value(api_key):
+    return api_key.get("value") if isinstance(api_key, dict) else api_key
+
+
 
 class ExternalStatus:
     """Polls the site's bay-status API (GET <base_url>/api/bay-status) and
@@ -226,7 +239,7 @@ class ExternalStatus:
 
     def fetch(self):
         r = requests.get(self.c["base_url"].rstrip("/") + "/api/bay-status",
-                         headers={"X-API-Key": self.c["api_key"] or ""},
+                         headers=api_headers(self.c["api_key"]),
                          timeout=self.c["timeout_sec"])
         r.raise_for_status()
         return r.json()

@@ -32,6 +32,7 @@ and top-level "events_csv" (shared with bay_occupancy.py).
 import csv
 import io
 import json
+import logging
 import re
 import sqlite3
 import statistics
@@ -41,6 +42,7 @@ import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import urllib.request
 from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULTS = {"host": "0.0.0.0", "port": 8082, "db_path": "dashboard.db",
@@ -49,7 +51,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(
   ts INTEGER NOT NULL, bay TEXT NOT NULL, status TEXT NOT NULL,
   prev_status TEXT, class TEXT, confidence REAL, raw_ts TEXT, image TEXT,
-  UNIQUE(raw_ts, bay, status));
+  source TEXT, UNIQUE(raw_ts, bay, status));
 CREATE INDEX IF NOT EXISTS ix_events_bay_ts ON events(bay, ts);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
@@ -61,8 +63,10 @@ IMG_RE = re.compile(r"^[A-Za-z0-9._-]+\.jpg$")
 def connect(path):
     db = sqlite3.connect(path, check_same_thread=False)
     db.executescript(SCHEMA)
-    if "image" not in {r[1] for r in db.execute("PRAGMA table_info(events)")}:
-        db.execute("ALTER TABLE events ADD COLUMN image TEXT")   # older db
+    have = {r[1] for r in db.execute("PRAGMA table_info(events)")}
+    for col in ("image", "source"):          # columns added after v1 of the db
+        if col not in have:
+            db.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
     return db
 
 
@@ -103,19 +107,123 @@ def import_csv(db, csv_path):
         conf = d.get("confidence") or None
         cur = db.execute(
             "INSERT INTO events(ts,bay,status,prev_status,class,confidence,"
-            "raw_ts,image) VALUES(?,?,?,?,?,?,?,?) "
+            "raw_ts,image,source) VALUES(?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(raw_ts,bay,status) DO UPDATE SET "
-            "image=COALESCE(excluded.image, image)",
+            "image=COALESCE(excluded.image, image), "
+            "source=COALESCE(excluded.source, source)",
             (ts, d["bay"], d["status"], d.get("previous_status") or None,
              d.get("class") or None,
              float(conf) if conf else None, d["timestamp"],
-             d.get("image") or None))
+             d.get("image") or None, d.get("source") or None))
         n += cur.rowcount
     db.execute("INSERT OR REPLACE INTO meta VALUES('offset', ?)", (str(end),))
     db.execute("INSERT OR REPLACE INTO meta VALUES('header', ?)",
                (header_now,))
     db.commit()
     return n
+
+
+# ---------------------------------------------------------- plate reads --
+log = logging.getLogger("dashboard")
+MEDIA_RE = re.compile(r"^[A-Za-z0-9._-]+\.jpg$")
+
+
+def norm_bay(b):
+    return str(b or "").strip().upper()
+
+
+def _proxy_url(remote):
+    """Remote media path (/media/<x>.jpg) -> our proxied path, so the API
+    key never reaches the browser. None when there is no image."""
+    if not remote:
+        return None
+    path = urlparse(remote).path
+    return "/ext" + path if path.startswith("/media/") else None
+
+
+class PlateSource:
+    """Truck/plate reads from the site's detections API
+    (GET <base>/api/detections?date=YYYY-MM-DD), cached per day, matched to
+    visits by bay and time."""
+
+    def __init__(self, base_url, api_key, window_sec=900, cache_sec=60,
+                 timeout=10):
+        self.base = base_url.rstrip("/")
+        self.key = api_key
+        self.window = int(window_sec)
+        self.cache_sec = cache_sec
+        self.timeout = timeout
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def _get(self, path):
+        req = urllib.request.Request(self.base + path,
+                                     headers={"X-API-Key": self.key or ""})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return r.read()
+
+    def day(self, date_str):
+        now = time.time()
+        with self._lock:
+            hit = self._cache.get(date_str)
+            if hit and now - hit[0] < self.cache_sec:
+                return hit[1]
+        reads = []
+        try:
+            payload = json.loads(self._get(f"/api/detections?date={date_str}"))
+            items = payload.get("items") if isinstance(payload, dict) else []
+            for it in items or []:
+                try:
+                    ts = datetime.strptime(
+                        f"{it.get('date') or date_str} {it['time']}",
+                        "%Y-%m-%d %H:%M:%S").timestamp()
+                except (KeyError, TypeError, ValueError):
+                    continue
+                reads.append({"ts": int(ts),
+                              "bay": norm_bay(it.get("bay_number")),
+                              "plate": it.get("plate_text") or None,
+                              "truck_url": it.get("truck_url"),
+                              "plate_url": it.get("plate_url")})
+        except (OSError, ValueError) as e:
+            log.warning(f"detections for {date_str} unavailable: {e}")
+        with self._lock:
+            self._cache[date_str] = (now, reads)
+        return reads
+
+    def near(self, bay, ts):
+        """Closest plate read on this bay within the match window of ts."""
+        b = norm_bay(bay)
+        days = {datetime.fromtimestamp(t).strftime("%Y-%m-%d")
+                for t in (ts - self.window, ts, ts + self.window)}
+        best = None
+        for day in sorted(days):
+            for r in self.day(day):
+                dt = abs(r["ts"] - ts)
+                if r["bay"] == b and dt <= self.window and (
+                        best is None or dt < best[0]):
+                    best = (dt, r)
+        if best is None:
+            return None
+        r = best[1]
+        return {"plate": r["plate"], "read_at": r["ts"],
+                "offset_sec": r["ts"] - ts,
+                "truck_image": _proxy_url(r["truck_url"]),
+                "plate_image": _proxy_url(r["plate_url"])}
+
+
+def latest_for(latest_dir, bay):
+    """Name of the newest saved snapshot for this bay (bay_occupancy keeps
+    exactly one per bay), or None. Compared by the timestamp in the name,
+    not the status word, which would sort 'occupied' after 'empty'."""
+    if not latest_dir or not Path(latest_dir).is_dir():
+        return None
+    pat = re.compile(rf"^{re.escape(bay)}_(occupied|empty)_\d{{8}}_\d{{6}}\.jpg$")
+    names = [f.name for f in Path(latest_dir).iterdir() if pat.match(f.name)]
+    return max(names, key=lambda n: n[-19:-4]) if names else None
+
+
+def snapshot_time(name):
+    return int(datetime.strptime(name[-19:-4], "%Y%m%d_%H%M%S").timestamp())
 
 
 # ---------------------------------------------------------------- stats --
@@ -138,6 +246,7 @@ def build_visits(events, now):
                        "cls": e[4] if len(e) > 4 else None,
                        "conf": e[5] if len(e) > 5 else None,
                        "img_in": e[6] if len(e) > 6 else None,
+                       "src": e[7] if len(e) > 7 else None,
                        "img_out": None}
             elif status == "empty" and cur:
                 cur["end"] = ts
@@ -449,7 +558,7 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
 
 
 def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
-                     start=None, end=None):
+                     start=None, end=None, plates=None):
     """Drill-down for one bay: summary, actual-clock timeline, hour-of-day
     pattern, and one entry per truck visit. None for a bay with no events."""
     if not any(e[1] == bay for e in events):
@@ -491,15 +600,19 @@ def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
                               unit, now),
         "arrivals_by_hour": arrivals, "occupancy_pct_by_hour": occ_pct,
         "ttat_hist": {"labels": TTAT_LABELS, "counts": _ttat_hist(ttats)},
-        "trucks": [{"start": v["start"], "end": v["end"],
-                    "ttat": (v["end"] - v["start"]
-                             if v["end"] is not None else None),
-                    "partial": v["partial"], "class": v["cls"]}
-                   for v in listed],
+        "trucks": [_truck(v, bay, plates) for v in listed],
     }
 
 
-def build_entry(events, bay, start, now, prefix_len=2):
+def _truck(v, bay, plates):
+    m = plates.near(bay, v["start"]) if plates else None
+    return {"start": v["start"], "end": v["end"],
+            "ttat": (v["end"] - v["start"] if v["end"] is not None else None),
+            "partial": v["partial"], "class": v["cls"],
+            "plate": m["plate"] if m else None}
+
+
+def build_entry(events, bay, start, now, prefix_len=2, plates=None):
     """One truck entry (identified by bay + arrival epoch) with context:
     gap since the previous truck, how its stay compares with the bay's
     usual one, how many other bays were busy at arrival, and the
@@ -521,9 +634,11 @@ def build_entry(events, bay, start, now, prefix_len=2):
     rank = None
     if ttat is not None and not v["partial"] and done:
         rank = 1 + sum(1 for x in done if x > ttat)
+    plate = plates.near(bay, v["start"]) if plates else None
     return {
         "generated": int(now), "bay": bay, "group": group_of(bay, prefix_len),
         "start": v["start"], "end": v["end"], "ttat": ttat,
+        "source": v.get("src"), "plate": plate,
         "in_bay_for": int(now - v["start"]) if v["end"] is None else None,
         "partial": v["partial"], "class": v["cls"],
         "confidence": v["conf"],
@@ -541,13 +656,13 @@ def build_entry(events, bay, start, now, prefix_len=2):
 
 
 def visits_csv(events, now, days=None, group=None, bay=None, prefix_len=2,
-               start=None, end=None):
+               start=None, end=None, plates=None):
     """CSV text: one row per visit overlapping the range."""
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["bay", "group", "arrived", "left", "ttat_sec", "status",
                 "already_there_at_startup", "class", "arrival_image",
-                "departure_image"])
+                "departure_image", "plate", "source"])
     if events:
         d_start, d_end, *_ = _resolve_window(events, now, days, start, end)
         iso = lambda t: (datetime.fromtimestamp(t).astimezone()
@@ -564,13 +679,16 @@ def visits_csv(events, now, days=None, group=None, bay=None, prefix_len=2,
                             v["end"] - v["start"] if v["end"] else "",
                             "completed" if v["end"] else "in_bay",
                             int(v["partial"]), v["cls"] or "",
-                            v["img_in"] or "", v["img_out"] or ""])
+                            v["img_in"] or "", v["img_out"] or "",
+                            (plates.near(b, v["start"]) or {}).get("plate", "")
+                            if plates else "",
+                            v.get("src") or ""])
     return out.getvalue()
 
 
 def load_events(db):
     return db.execute(
-        "SELECT ts, bay, status, prev_status, class, confidence, image "
+        "SELECT ts, bay, status, prev_status, class, confidence, image, source "
         "FROM events").fetchall()
 
 
@@ -709,6 +827,9 @@ document.querySelectorAll('[data-bay]').forEach(e=>e.onclick=()=>{location.hash=
 
 function renderBay(){const d=data;
 let h=`<p><a class=back href="#/">← All bays</a></p><h2 style="font-size:18px">${d.bay} <small>group ${d.group}</small> ${pill(d.status,ago(d.since))}</h2>`;
+h+=`<section><h2>Current view <small>${d.latest_at?'latest saved frame · '+fmt(d.latest_at)+' ('+ago(d.latest_at)+')':'no frame saved yet'}</small></h2>`+
+(d.latest_image?`<figure style="margin:0"><a href="/latest/${encodeURIComponent(d.bay)}" target="_blank"><img style="width:100%;max-width:720px;border-radius:8px;border:1px solid var(--line)" src="/latest/${encodeURIComponent(d.bay)}?v=${encodeURIComponent(d.latest_image)}" alt="${d.bay} now"></a></figure>`:
+'<div class=noimg>Snapshots are saved while <code>save_images</code> is on in bay_occupancy.</div>')+`</section>`;
 h+=`<div class=cards>`+card('Visits',d.visits)+card('Utilisation',d.utilisation_pct+'%')+card('Avg TTAT',dur(d.ttat_avg))+
 card('Median TTAT',dur(d.ttat_median))+card('P90 TTAT',dur(d.ttat_p90))+card('Longest',dur(d.ttat_max))+card('Last departure',ago(d.last_visit_end))+`</div>`;
 const u=d.unit,per=u=='day'?'day':'hour';
@@ -721,14 +842,15 @@ h+=`<section><h2>Occupancy by hour of day <small>(% of each hour the bay was occ
 const t=d.trucks,done=t.filter(x=>x.ttat!=null);
 h+=`<section><h2>Each truck entry <small>(bar = time in bay, oldest → newest; faded = already there when monitoring started · click a bar)</small></h2>`+
 (done.length?bars(done.map(x=>x.ttat),done.map(x=>new Date(x.start*1000).toLocaleDateString([],{month:'numeric',day:'numeric'})),'',(i,v)=>dur(v)+' from '+fmt(done[i].start),done.map(x=>x.partial),(i,v)=>dur(v),done.map(x=>x.start)):'<small>No completed visits in this range.</small>')+`</section>`;
-h+=`<section><h2>Entries <small>(newest first · click one for its detail)</small></h2><table><tr><th>Arrived</th><th>Left</th><th>TTAT</th><th>Detected as</th></tr>`+
+h+=`<section><h2>Entries <small>(newest first · click one for its detail)</small></h2><table><tr><th>Arrived</th><th>Left</th><th>TTAT</th><th>Plate</th><th>Detected as</th></tr>`+
 [...t].reverse().map(x=>`<tr data-entry="${d.bay}|${x.start}"><td>${fmt(x.start)}${x.partial?' <small>(already there at startup)</small>':''}</td>
-<td>${x.end?fmt(x.end):'<small>in bay now</small>'}</td><td>${dur(x.ttat)}</td><td>${x.class||'–'}</td></tr>`).join('')+`</table></section>`;
+<td>${x.end?fmt(x.end):'<small>in bay now</small>'}</td><td>${dur(x.ttat)}</td><td>${x.plate?`<b>${x.plate}</b>`:'<small>–</small>'}</td><td>${x.class||'–'}</td></tr>`).join('')+`</table></section>`;
 $('view').innerHTML=h;wireEntries()}
 const goEntry=(bay,start)=>{location.hash='#/entry/'+encodeURIComponent(bay)+'/'+start};
 function wireEntries(){document.querySelectorAll('tr[data-entry]').forEach(e=>e.onclick=()=>{const [b,s]=e.dataset.entry.split('|');goEntry(b,s)});
 document.querySelectorAll('.c[data-id]').forEach(e=>e.onclick=()=>goEntry(data.bay,e.dataset.id));
 document.querySelectorAll('.seg[data-start]').forEach(e=>e.onclick=()=>goEntry(e.dataset.bay,e.dataset.start))}
+const shotUrl=(url,cap)=>`<figure><a href="${url}" target="_blank"><img loading=lazy src="${url}" alt="${cap}"></a><figcaption>${cap}</figcaption></figure>`;
 const shot=(f,cap)=>f?`<figure><a href="/img/${encodeURIComponent(f)}" target="_blank"><img loading=lazy src="/img/${encodeURIComponent(f)}" alt="${cap}"></a><figcaption>${cap}</figcaption></figure>`:
 `<div class=noimg>No snapshot for ${cap.toLowerCase()}.<br><small>Snapshots are saved only while <code>event_images_dir</code> is enabled in bay_occupancy.</small></div>`;
 function renderEntry(){const e=data,bay=encodeURIComponent(e.bay);
@@ -741,8 +863,11 @@ h+=`<div class=cards>`+card('Arrived',fmt(e.start),e.partial?'already there when
 card('Left',inBay?'in bay':fmt(e.end))+card(inBay?'In bay for':'Time in bay (TTAT)',dur(inBay?e.in_bay_for:e.ttat),vs)+
 (e.rank_longest?card('Ranking',`#${e.rank_longest} longest`,`of ${e.of_visits} visits in this bay`):'')+
 card('Bay was empty for',dur(e.idle_before),'before this truck')+card('Other bays busy',e.other_bays_occupied_at_arrival,'at arrival')+
-card('Detected as',e.class||'–',e.confidence!=null?'confidence '+e.confidence:'')+`</div>`;
-h+=`<section><h2>What the camera saw</h2><div class=shots>${shot(e.arrival_image,'Arrival · '+fmt(e.start))}${shot(e.departure_image,inBay?'Departure · not yet':'Departure · '+fmt(e.end))}</div></section>`;
+card('Detected as',e.class||'–',e.confidence!=null?'confidence '+e.confidence:'')+
+card('Truck number',e.plate?e.plate.plate:'–',e.plate?`read ${Math.abs(Math.round(e.plate.offset_sec/60))} min ${e.plate.offset_sec>=0?'after':'before'} arrival`:'no plate read within the match window')+
+card('Bay status from',e.source=='external'?'site bay API':e.source=='camera'?'camera':'–','')+`</div>`;
+const photos=[e.plate&&e.plate.truck_image?shotUrl(e.plate.truck_image,'Truck at plate read'):'',e.plate&&e.plate.plate_image?shotUrl(e.plate.plate_image,'Plate'):''].join('');
+h+=`<section><h2>What the camera saw</h2><div class=shots>${shot(e.arrival_image,'Arrival · '+fmt(e.start))}${shot(e.departure_image,inBay?'Departure · not yet':'Departure · '+fmt(e.end))}${photos}</div></section>`;
 $('view').innerHTML=h}
 
 function rangeQuery(){const v=$('days').value,q=[];
@@ -771,7 +896,7 @@ $('days').onchange=load;$('pick').onchange=load;window.onhashchange=load;load();
 
 
 def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
-                 image_dir=None):
+                 image_dir=None, plates=None, latest_dir=None):
     class H(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype):
             self.send_response(code)
@@ -804,6 +929,28 @@ def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
                                         q.get("group", [None])[0], prefix_len,
                                         start, end, overstay_sec)
                 return self._json(200, stats)
+            if u.path.startswith("/ext/media/") and plates:
+                name = unquote(u.path[len("/ext/media/"):])
+                if not MEDIA_RE.match(name):
+                    return self._json(404, {"error": "no such image"})
+                try:
+                    data = plates._get("/media/" + name)
+                except OSError:
+                    return self._json(404, {"error": "image unavailable"})
+                return self._send(200, data, "image/jpeg")
+            if u.path.startswith("/latest/"):
+                bay = unquote(u.path[len("/latest/"):])
+                name = latest_for(latest_dir, bay)
+                if not name:
+                    return self._json(404, {"error": "no snapshot yet"})
+                self.send_response(200)
+                data = (Path(latest_dir) / name).read_bytes()
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if u.path.startswith("/img/"):
                 name = unquote(u.path[5:])
                 f = (Path(image_dir) / name) if image_dir else None
@@ -826,7 +973,7 @@ def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
                 with _lock:
                     import_csv(db, csv_path)
                     ent = build_entry(load_events(db), bay, st, time.time(),
-                                      prefix_len)
+                                      prefix_len, plates=plates)
                 if ent is None:
                     return self._json(404, {"error": "unknown entry"})
                 return self._json(200, ent)
@@ -836,7 +983,7 @@ def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
                     body = visits_csv(load_events(db), time.time(), days,
                                       q.get("group", [None])[0],
                                       q.get("bay", [None])[0], prefix_len,
-                                      start, end)
+                                      start, end, plates=plates)
                 return self._send(200, body.encode(), "text/csv")
             if u.path.startswith("/api/bay/"):
                 bay = unquote(u.path[len("/api/bay/"):])
@@ -844,9 +991,12 @@ def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
                     import_csv(db, csv_path)
                     det = build_bay_detail(load_events(db), bay, time.time(),
                                            days, prefix_len, start=start,
-                                           end=end)
+                                           end=end, plates=plates)
                 if det is None:
                     return self._json(404, {"error": "unknown bay"})
+                name = latest_for(latest_dir, bay)
+                det["latest_image"] = name
+                det["latest_at"] = snapshot_time(name) if name else None
                 return self._json(200, det)
             self._json(404, {"error": "not found"})
 
@@ -856,6 +1006,7 @@ def make_handler(db, csv_path, prefix_len=2, overstay_sec=4 * 3600,
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     cfg_path = Path(sys.argv[1] if len(sys.argv) > 1 else "config.json")
     raw = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
     d = {**DEFAULTS, **(raw.get("dashboard") or {})}
@@ -864,10 +1015,18 @@ def main():
     n = import_csv(db, csv_path)
     print(f"imported {n} events from {csv_path}; "
           f"serving on http://{d['host']}:{d['port']}/")
+    ext = raw.get("external") or {}
+    plates = None
+    if ext.get("api_key") and ext.get("api_key") != "CHANGE_ME":
+        plates = PlateSource(ext.get("base_url", "http://10.69.12.41:8502"),
+                             ext["api_key"],
+                             ext.get("plate_match_window_sec", 900))
+        print("truck/plate reads: on (site detections API)")
     ThreadingHTTPServer((d["host"], int(d["port"])), make_handler(
         db, csv_path, int(d["group_prefix_len"]),
         int(float(d["overstay_hours"]) * 3600),
-        raw.get("event_images_dir", "event_images"))).serve_forever()
+        raw.get("event_images_dir", "event_images"), plates,
+        raw.get("save_dir", "latest"))).serve_forever()
 
 
 if __name__ == "__main__":

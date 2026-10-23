@@ -30,6 +30,7 @@ import re
 import sys
 import threading
 import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -103,6 +104,11 @@ DEFAULTS = {
     "event_images_max_dimension": 960,
     "event_images_keep_days": 30,
     # Query webhook: GET /bay/<bay> -> status + timestamp + base64 JPEG.
+    # Site bay-status API. When enabled, a real true/false from it wins over
+    # the camera; null, unconfigured or stale readings fall back to the camera.
+    "external": {"enabled": False, "base_url": "http://10.69.12.41:8502",
+                 "api_key": None, "poll_sec": 15, "timeout_sec": 5,
+                 "max_age_sec": 300},
     "webhook": {"enabled": True, "host": "0.0.0.0", "port": 8081,
                 "max_dimension": 640, "jpeg_quality": 80},
     "snapshot": {"url_template": "http://{ip}:{port}/snap.jpg", "port": 80,
@@ -169,6 +175,91 @@ class BayDebouncer:
         return False
 
 
+REPORTED_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+class ExternalStatus:
+    """Polls the site's bay-status API (GET <base_url>/api/bay-status) and
+    keeps the latest usable reading per bay.
+
+    A reading is used only if it is a real true/false (null is ignored),
+    the bay is configured, and it was reported within max_age_sec. If the
+    API can't be reached, nothing is used and the camera decides."""
+
+    def __init__(self, ext_cfg):
+        self.c = ext_cfg
+        self._data = {}
+        self._lock = threading.Lock()
+        self._down = False
+        self.stop = threading.Event()
+
+    def get(self, bay):
+        with self._lock:
+            return self._data.get(bay)
+
+    def parse(self, payload, now=None):
+        now = time.time() if now is None else now
+        if isinstance(payload, dict):      # tolerate {"items": [...]} wrappers
+            payload = next((v for v in payload.values()
+                            if isinstance(v, list)), [])
+        out = {}
+        for item in payload if isinstance(payload, list) else []:
+            if not isinstance(item, dict):
+                continue
+            bay, occ = item.get("bay"), item.get("occupied")
+            if not bay or not isinstance(occ, bool):
+                continue                   # null/missing: camera decides
+            if item.get("configured") is False:
+                continue
+            rep = item.get("reported")
+            t = None
+            if rep:
+                try:
+                    t = datetime.strptime(rep, REPORTED_FMT).timestamp()
+                except (TypeError, ValueError):
+                    t = None
+            if t is not None and now - t > self.c["max_age_sec"]:
+                continue                   # stale: camera decides
+            out[bay] = {"occupied": occ, "since": item.get("since"),
+                        "reported": rep}
+        return out
+
+    def fetch(self):
+        r = requests.get(self.c["base_url"].rstrip("/") + "/api/bay-status",
+                         headers={"X-API-Key": self.c["api_key"] or ""},
+                         timeout=self.c["timeout_sec"])
+        r.raise_for_status()
+        return r.json()
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                fresh = self.parse(self.fetch())
+                with self._lock:
+                    self._data = fresh
+                if self._down:
+                    log.info("external bay status is back")
+                self._down = False
+            except (requests.RequestException, ValueError) as e:
+                with self._lock:
+                    self._data = {}        # unreachable: camera decides
+                if not self._down:
+                    log.warning(f"external bay status unavailable ({e}) "
+                                f"-- using camera readings")
+                self._down = True
+            self.stop.wait(self.c["poll_sec"])
+
+
+def resolve_status(camera_state, ext):
+    """-> (occupied or None, source). The external reading wins whenever it
+    has a real value; otherwise the camera's confirmed state is used."""
+    if ext is not None:
+        return ext["occupied"], "external"
+    if camera_state is not None:
+        return camera_state, "camera"
+    return None, None
+
+
 class Monitor:
     def __init__(self, cfg, cameras, model=None, mqtt_client=None):
         self.cfg = cfg
@@ -178,6 +269,9 @@ class Monitor:
                     for b in self.cameras}
         self.model = model
         self.mqtt = mqtt_client
+        self.external = (ExternalStatus(cfg["external"])
+                         if cfg["external"]["enabled"] else None)
+        self.last_pub = {}        # bay -> occupied bool last published
         self.latest = {}          # bay -> dict served by the webhook
         self.latest_lock = threading.Lock()
         self.last_change = {}     # bay -> (status, epoch) for the CSV
@@ -261,17 +355,18 @@ class Monitor:
                                  self.cfg["plate_class"])
 
     # -- publish ----------------------------------------------------------
-    def publish(self, bay, occupied, best, frame=None):
+    def publish(self, bay, occupied, best, frame=None, source="camera"):
         payload = {
             "bay": bay,
             "status": "occupied" if occupied else "empty",
             "class": best[0] if best else None,
             "confidence": round(best[1], 3) if best else None,
+            "source": source,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
         m = self.cfg["mqtt"]
         topic = f"{m['topic_prefix']}/{bay}"
-        log.info(f"{bay}: -> {payload['status']} "
+        log.info(f"{bay}: -> {payload['status']} via {source} "
                  f"({payload['class']} {payload['confidence']})")
         image = self.save_event_image(bay, frame, payload["status"])
         self.record_event(payload, image)
@@ -280,7 +375,8 @@ class Monitor:
                               retain=bool(m.get("retain", True)))
 
     CSV_COLUMNS = ["timestamp", "bay", "status", "previous_status",
-                   "previous_duration_sec", "class", "confidence", "image"]
+                   "previous_duration_sec", "class", "confidence", "source",
+                   "image"]
 
     def save_event_image(self, bay, frame, status):
         """<bay>_<status>_<YYYYmmdd_HHMMSS>.jpg in event_images_dir, shrunk
@@ -350,7 +446,8 @@ class Monitor:
         row = [payload["timestamp"], bay, payload["status"],
                prev[0] if prev else "",
                round(now - prev[1]) if prev else "",
-               payload["class"] or "", payload["confidence"] or "", image]
+               payload["class"] or "", payload["confidence"] or "",
+               payload.get("source") or "", image]
         try:
             if not getattr(self, "_csv_checked", False):
                 self._ensure_csv_header(path)
@@ -371,21 +468,24 @@ class Monitor:
                 continue
             frame = self._crop(bay, frame)
             occupied, best = self._detect(frame)
-            changed = self.deb[bay].update(occupied)
+            self.deb[bay].update(occupied)
+            ext = self.external.get(bay) if self.external else None
+            eff, src = resolve_status(self.deb[bay].state, ext)
+            changed = eff is not None and eff != self.last_pub.get(bay)
             if changed:
-                self.publish(bay, occupied, best, frame)
+                self.last_pub[bay] = eff
+                self.publish(bay, eff, best, frame, src)
             if self.cfg["webhook"]["enabled"]:
-                self._update_latest(bay, frame, occupied, best, changed)
+                self._update_latest(bay, frame, eff, best, changed, src)
             if self.cfg["save_images"]:
-                # Confirmed state if there is one, else this frame's reading.
-                state = self.deb[bay].state
-                state = occupied if state is None else state
+                # Effective state if there is one, else this frame's reading.
+                shown = occupied if eff is None else eff
                 self.save_image(bay, frame,
-                                "occupied" if state else "empty",
+                                "occupied" if shown else "empty",
                                 force=changed)
 
     # -- query webhook ----------------------------------------------------
-    def _update_latest(self, bay, frame, occupied, best, changed):
+    def _update_latest(self, bay, frame, occupied, best, changed, source=None):
         """Keep what the webhook serves: a small JPEG per bay, encoded once
         per round (full-size frames for every bay would be gigabytes)."""
         w = self.cfg["webhook"]
@@ -396,7 +496,7 @@ class Monitor:
             interpolation=cv2.INTER_AREA)
         ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY,
                                                int(w["jpeg_quality"])])
-        state = self.deb[bay].state
+        state = occupied
         now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         with self.latest_lock:
             prev = self.latest.get(bay, {})
@@ -408,6 +508,7 @@ class Monitor:
                 "timestamp": now,
                 "status_since": (now if changed or "status_since" not in prev
                                  else prev["status_since"]),
+                "source": source,
                 "class": best[0] if best else None,
                 "confidence": round(best[1], 3) if best else None,
                 "jpeg": buf.tobytes() if ok else None,
@@ -512,6 +613,9 @@ def main():
 
     mon = Monitor(cfg, cameras, model, client)
     log.info(f"monitoring {len(mon.cameras)} bays")
+    if mon.external:
+        threading.Thread(target=mon.external.run, daemon=True).start()
+        log.info(f"external bay status from {cfg['external']['base_url']}")
     if cfg["webhook"]["enabled"]:
         mon.start_webhook()
     try:

@@ -426,12 +426,46 @@ def work_label():
     return f"{f(WORK['start'])}–{f(WORK['end'])}"
 
 
+class Work:
+    """Daily working-hour spans (epoch [start, end) pieces) in a range.
+    Everything that counts or draws time uses this, so data outside working
+    hours is never shown."""
+
+    def __init__(self, spans):
+        self.spans = spans
+        self.starts = [s for s, _ in spans]
+        self.total = sum(e - s for s, e in spans)
+
+    def clip(self, a, b):
+        """Pieces of [a, b) that fall inside working hours."""
+        out = []
+        if b <= a or not self.spans:
+            return out
+        i = max(0, bisect_right(self.starts, a) - 1)
+        while i < len(self.spans) and self.spans[i][0] < b:
+            s, e = self.spans[i]
+            cs, ce = max(s, a), min(e, b)
+            if ce > cs:
+                out.append((cs, ce))
+            i += 1
+        return out
+
+    def overlap(self, a, b):
+        return sum(e - s for s, e in self.clip(a, b))
+
+    def contains(self, t):
+        """Is this moment inside the daily working hours? Uses the time of
+        day, so it is correct for arrivals before the displayed window too."""
+        dt = datetime.fromtimestamp(t)
+        sod = dt.hour * 3600 + dt.minute * 60 + dt.second
+        return WORK["start"] <= sod < WORK["end"]
+
+
 def work_intervals(a, b):
-    """[(start, end)] epoch pieces inside [a, b] that fall in the daily
-    working hours, in local time."""
+    """Work spans inside [a, b] in local time, as a Work object."""
     out = []
     if b <= a:
-        return out
+        return Work(out)
     day = datetime.fromtimestamp(a).replace(hour=0, minute=0, second=0,
                                             microsecond=0)
     while day.timestamp() < b:
@@ -441,37 +475,29 @@ def work_intervals(a, b):
         if e > s:
             out.append((s, e))
         day += timedelta(days=1)
-    return out
+    return Work(out)
 
 
-def _overlap(a, b, work, starts):
-    """Seconds of [a, b) inside the working intervals."""
-    i = max(0, bisect_right(starts, a) - 1)
-    tot = 0.0
-    while i < len(work) and work[i][0] < b:
-        s, e = work[i]
-        ov = min(e, b) - max(s, a)
-        if ov > 0:
-            tot += ov
-        i += 1
-    return tot
+def work_meta(work=None):
+    """Extra fields every chart response carries: which clock hours to draw
+    and the working spans (for the working-time axis)."""
+    meta = {"work_hour_range": [WORK["start"] // 3600,
+                                -(-WORK["end"] // 3600)]}
+    meta["work_spans"] = [[int(s), int(e)] for s, e in work.spans] if work else []
+    return meta
 
 
-def _stats_for(visits, w_start, w_end, work=None):
-    """Occupied working-hours seconds in the window plus TTAT list / last
-    departure. Only completed, non-partial visits that ENDED in the window
-    count toward TTAT."""
-    if work is None:
-        work = work_intervals(w_start, w_end)
-    starts = [s for s, _ in work]
+def _stats_for(visits, w_start, w_end, work):
+    """Occupied working-hour seconds in the window, TTAT list and last
+    departure. Only completed, non-partial visits that ARRIVED in working
+    hours and ENDED in the window count toward TTAT."""
     occ_sec, ttats, last_end = 0.0, [], None
     for v in visits:
         e = v["end"] if v["end"] is not None else w_end
-        cs, ce = max(v["start"], w_start), min(e, w_end)
-        if ce > cs:
-            occ_sec += _overlap(cs, ce, work, starts)
+        occ_sec += work.overlap(max(v["start"], w_start), min(e, w_end))
         if (v["end"] is None or v["partial"]
-                or not w_start <= v["end"] <= w_end):
+                or not w_start <= v["end"] <= w_end
+                or not work.contains(v["start"])):
             continue
         ttats.append(v["end"] - v["start"])
         last_end = v["end"]
@@ -488,55 +514,61 @@ def _ttat_summary(ttats):
     }
 
 
-def _timeline(bay_visits, d_start, d_end, w_start, w_end, unit, now):
-    """Actual-clock buckets across the displayed range: arrivals and
-    occupancy %. bay_visits = list of per-bay visit lists. Buckets in the
-    future (or before the first event) carry occ_pct None. Bucket edges are
-    computed once, and each visit is placed with a binary search, so the
-    cost is per visit rather than per visit-per-bucket."""
+def _timeline(bay_visits, d_start, d_end, w_start, w_end, unit, now, work):
+    """Actual-clock buckets across the displayed range: arrivals (in working
+    hours) and occupancy % of working time. Buckets with no working time
+    (e.g. 00:00-06:00 on the hour view) are left out; working hours not yet
+    reached show an empty percentage."""
     n = max(1, len(bay_visits))
-    out, b = [], _floor(d_start, unit)
-    edges = []                       # bucket start epochs, then one end
+    edges = []
+    b = _floor(d_start, unit)
     while b < d_end:
         edges.append(b)
         b = _next(b, unit)
     edges.append(b)
     nb = len(edges) - 1
     arr, occ = [0] * nb, [0.0] * nb
-    seen = [0.0] * nb
-    if w_end > w_start:
-        for i in range(max(0, bisect_right(edges, w_start) - 1), nb):
-            if edges[i] >= w_end:
-                break
-            seen[i] = (min(edges[i + 1], w_end) - max(edges[i], w_start))
+    # seen: observed working time in the bucket (future or pre-data = 0)
+    seen = [work.overlap(max(edges[i], w_start), min(edges[i + 1], w_end))
+            for i in range(nb)]
+    # bucket has working time in the displayed range -> it is drawn
+    full = work_intervals(d_start, d_end)
+    draw = [full.overlap(edges[i], edges[i + 1]) > 0 for i in range(nb)]
     for visits in bay_visits:
         for v in visits:
-            if not v["partial"] and w_start <= v["start"] <= w_end:
+            if (not v["partial"] and w_start <= v["start"] <= w_end
+                    and work.contains(v["start"])):
                 i = bisect_right(edges, v["start"]) - 1
                 if 0 <= i < nb:
                     arr[i] += 1
             e = v["end"] if v["end"] is not None else w_end
-            cs, ce = max(v["start"], w_start), min(e, w_end)
-            if ce <= cs:
-                continue
-            i = max(0, bisect_right(edges, cs) - 1)
-            while i < nb and edges[i] < ce:
-                occ[i] += min(edges[i + 1], ce) - max(edges[i], cs)
-                i += 1
+            for cs, ce in work.clip(max(v["start"], w_start),
+                                    min(e, w_end)):
+                i = max(0, bisect_right(edges, cs) - 1)
+                while i < nb and edges[i] < ce:
+                    occ[i] += min(edges[i + 1], ce) - max(edges[i], cs)
+                    i += 1
+    out = []
     for i in range(nb):
-        s_ = seen[i]
+        if not draw[i]:
+            continue
         out.append({"t": int(edges[i]), "arrivals": arr[i],
-                    "occ_pct": (round(100 * occ[i] / (s_ * n), 1)
-                                if s_ else None)})
+                    "occ_pct": (round(100 * occ[i] / (seen[i] * n), 1)
+                                if seen[i] > 0 else None)})
     return out
 
 
-def _segments(visits, d_start, d_end, plates=None, bay=None, now=None):
+def _segments(visits, d_start, d_end, work, plates=None, bay=None, now=None):
+    """Occupied pieces inside working hours: [start, end|None, partial, plate]."""
     out = []
     for v in visits:
         if v["start"] < d_end and (v["end"] is None or v["end"] > d_start):
             pl = plates.for_visit(bay, v["start"], v["end"] or now) if plates else None
-            out.append([v["start"], v["end"], v["partial"], pl])
+            end_eff = v["end"] if v["end"] is not None else (now or time.time())
+            for cs, ce in work.clip(max(v["start"], d_start),
+                                    min(end_eff, d_end)):
+                out.append([int(cs), None if v["end"] is None else int(ce),
+                            v["partial"], pl])
     return out
 
 
@@ -551,14 +583,13 @@ def _ttat_hist(ttats):
     return out
 
 
-def _concurrency(bay_visits, w_start, w_end):
-    """Peak number of bays occupied at once in the window -> (count, t)."""
+def _concurrency(bay_visits, w_start, w_end, work):
+    """Peak number of bays occupied at once during working hours -> (count, t)."""
     pts = []
     for visits in bay_visits:
         for v in visits:
             e = v["end"] if v["end"] is not None else w_end
-            cs, ce = max(v["start"], w_start), min(e, w_end)
-            if ce > cs:
+            for cs, ce in work.clip(max(v["start"], w_start), min(e, w_end)):
                 pts += [(cs, 1), (ce, -1)]
     best, cur, at = 0, 0, None
     for t, d in sorted(pts, key=lambda p: (p[0], p[1])):   # leaves first
@@ -572,7 +603,7 @@ def _period_numbers(visits, bays, w_start, w_end):
     """visits/ttat/utilisation for a window -- used for the previous
     period, so cards can show change."""
     work = work_intervals(w_start, w_end)
-    window = max(1.0, sum(e - s for s, e in work))
+    window = max(1.0, work.total)
     ttats, utils = [], []
     for b in bays:
         occ, tt, _ = _stats_for(visits.get(b, []), w_start, w_end, work)
@@ -604,19 +635,21 @@ def _previous(visits, bays, events, now, days, d_start, d_end, w_end):
 
 
 def _highlights(visits, last_status, shown, w_start, w_end, now, timeline,
-                overstay_sec):
+                overstay_sec, work):
     hl = {}
     peak = max(timeline, key=lambda r: r["arrivals"], default=None)
     if peak and peak["arrivals"]:
         hl["busiest_slot"] = {"t": peak["t"], "arrivals": peak["arrivals"]}
-    n, at = _concurrency([visits[b["bay"]] for b in shown], w_start, w_end)
+    n, at = _concurrency([visits[b["bay"]] for b in shown], w_start, w_end,
+                         work)
     if n:
         hl["peak_occupied"] = {"count": n, "t": int(at)}
     longest = None
     for b in shown:
         for v in visits[b["bay"]]:
             if (v["end"] is not None and not v["partial"]
-                    and w_start <= v["end"] <= w_end):
+                    and w_start <= v["end"] <= w_end
+                    and work.contains(v["start"])):
                 d = v["end"] - v["start"]
                 if longest is None or d > longest["ttat"]:
                     longest = {"bay": b["bay"], "ttat": d, "t": v["start"]}
@@ -647,6 +680,7 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
                 "timeline": [], "unit": "hour", "window_sec": 0,
                 "group": group, "range_start": int(now),
                 "range_end": int(now), "highlights": {}, "prev": None,
+                **work_meta(),
                 "ttat_hist": {"labels": TTAT_LABELS,
                               "counts": [0] * len(TTAT_LABELS)}}
     d_start, d_end, w_start, w_end, window = _resolve_window(
@@ -657,7 +691,7 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
     for e in sorted(events, key=lambda e: e[0]):
         last_status[e[1]] = (e[2], e[0])
     work = work_intervals(w_start, w_end)
-    work_sec = max(1.0, sum(e - s for s, e in work))
+    work_sec = max(1.0, work.total)
 
     bays, grp = [], {}
     for bay in sorted(visits):
@@ -686,10 +720,11 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
     for b in shown:
         if unit == "hour":
             b["segments"] = _segments(visits[b["bay"]], d_start, d_end,
-                                      plates, b["bay"], now)
+                                      work, plates, b["bay"], now)
         for v in visits[b["bay"]]:
             if (v["end"] is None or v["partial"]
-                    or not w_start <= v["end"] <= w_end):
+                    or not w_start <= v["end"] <= w_end
+                    or not work.contains(v["start"])):
                 continue
             all_ttat.append(v["end"] - v["start"])
             if v["start"] >= w_start:
@@ -698,7 +733,7 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
                 d = dt.strftime("%Y-%m-%d")
                 by_day[d] = by_day.get(d, 0) + 1
     timeline = _timeline([visits[b["bay"]] for b in shown], d_start,
-                         d_end, w_start, w_end, unit, now)
+                         d_end, w_start, w_end, unit, now, work)
     for b in shown:
         b["overstay"] = bool(overstay_sec and b["status"] == "occupied"
                              and now - b["since"] > overstay_sec)
@@ -708,7 +743,7 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
         "range_start": int(d_start), "range_end": int(d_end), "unit": unit,
         "group": group or None, "bays": shown, "groups": groups,
         "highlights": _highlights(visits, last_status, shown, w_start,
-                                  w_end, now, timeline, overstay_sec),
+                                  w_end, now, timeline, overstay_sec, work),
         "prev": _previous(visits, [b["bay"] for b in shown], events, now,
                           days, d_start, d_end, w_end),
         "ttat_hist": {"labels": TTAT_LABELS, "counts": _ttat_hist(all_ttat)},
@@ -723,7 +758,7 @@ def build_stats(events, now, days=None, group=None, prefix_len=2,
                 b["utilisation_pct"] for b in shown), 1) if shown else 0),
         },
         "timeline": timeline,
-        "by_hour": by_hour,
+        "by_hour": by_hour, **work_meta(work_intervals(d_start, d_end)),
         "by_day": [{"day": d, "visits": by_day[d]} for d in sorted(by_day)],
     }
 
@@ -739,7 +774,7 @@ def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
     unit = "hour" if d_end - d_start <= HOURLY_MAX_SEC else "day"
     visits = build_visits(events, now).get(bay, [])
     work = work_intervals(w_start, w_end)
-    work_sec = max(1.0, sum(e - s for s, e in work))
+    work_sec = max(1.0, work.total)
     occ_sec, ttats, last_end = _stats_for(visits, w_start, w_end, work)
     st = max((e for e in events if e[1] == bay), key=lambda e: e[0])
 
@@ -747,14 +782,15 @@ def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
     occ_by_hour = [0.0] * 24
     for v in visits:
         e = v["end"] if v["end"] is not None else w_end
-        cs, ce = max(v["start"], w_start), min(e, w_end)
-        for b, sec in (_slices(cs, ce, "hour") if ce > cs else []):
-            occ_by_hour[datetime.fromtimestamp(b).hour] += sec
-        if w_start <= v["start"] <= w_end and not v["partial"]:
+        for cs, ce in work.clip(max(v["start"], w_start), min(e, w_end)):
+            for b, sec in _slices(cs, ce, "hour"):
+                occ_by_hour[datetime.fromtimestamp(b).hour] += sec
+        if (w_start <= v["start"] <= w_end and not v["partial"]
+                and work.contains(v["start"])):
             arrivals[datetime.fromtimestamp(v["start"]).hour] += 1
     seen = [0.0] * 24
-    if w_end > w_start:
-        for b, sec in _slices(w_start, w_end, "hour"):
+    for cs, ce in work.clip(w_start, w_end):
+        for b, sec in _slices(cs, ce, "hour"):
             seen[datetime.fromtimestamp(b).hour] += sec
     occ_pct = [round(100 * o / s, 1) if s else 0 for o, s in
                zip(occ_by_hour, seen)]
@@ -771,8 +807,9 @@ def build_bay_detail(events, bay, now, days=None, prefix_len=2, limit=300,
         "work_hours": work_label(),
         "last_visit_end": last_end, **_ttat_summary(ttats),
         "timeline": _timeline([visits], d_start, d_end, w_start, w_end,
-                              unit, now),
+                              unit, now, work),
         "arrivals_by_hour": arrivals, "occupancy_pct_by_hour": occ_pct,
+        **work_meta(work_intervals(d_start, d_end)),
         "ttat_hist": {"labels": TTAT_LABELS, "counts": _ttat_hist(ttats)},
         "trucks": [{"start": v["start"], "end": v["end"],
                     "ttat": (v["end"] - v["start"]
@@ -944,14 +981,21 @@ const tlabel=(t,unit)=>{const d=new Date(t*1000);return unit=='day'?`${d.getMont
 const tfull=(t,unit)=>{const d=new Date(t*1000);return d.toLocaleString([],unit=='day'?{month:'short',day:'numeric'}:{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})};
 const timeline=(tl,unit,key,cls,suffix)=>bars(tl.map(r=>r[key]??0),tl.map(r=>tlabel(r.t,unit)),cls,
 (i,v)=>tl[i][key]==null?'no data':v+suffix,[],(i,v)=>v?(suffix=='%'?Math.round(v)+'%':v):'');
-function gantt(rows,d){const W0=d.range_start,W1=d.range_end,span=W1-W0,p=t=>100*(Math.min(Math.max(t,W0),W1)-W0)/span;
-const step=span<=26*3600?2*3600:span<=50*3600?4*3600:6*3600;let ticks='',grid='';
-for(let t=Math.ceil(W0/step)*step;t<W1;t+=step){ticks+=`<span style="left:${p(t)}%">${tlabel(t,'hour')}</span>`;grid+=`<i class=grid style="left:${p(t)}%"></i>`}
-const nowL=d.generated>W0&&d.generated<W1?`<i class=now style="left:${p(d.generated)}%"></i>`:'';
+function gantt(rows,d){
+// Working-time axis: only the daily working spans are drawn, laid end to end.
+const spans=d.work_spans&&d.work_spans.length?d.work_spans:[[d.range_start,d.range_end]];
+let total=0;const cum=spans.map(([s,e])=>{const c=total;total+=e-s;return c});total=total||1;
+const p=t=>{for(let i=0;i<spans.length;i++){const[s,e]=spans[i];if(t<=s)return 100*cum[i]/total;if(t<e)return 100*(cum[i]+t-s)/total}return 100};
+let ticks='',grid='';
+spans.forEach(([s,e])=>{for(let t=Math.ceil(s/3600)*3600;t<e;t+=2*3600){ticks+=`<span style="left:${p(t)}%">${tlabel(t,'hour')}</span>`;grid+=`<i class=grid style="left:${p(t)}%"></i>`}});
+const nowIn=spans.some(([s,e])=>d.generated>=s&&d.generated<e);
+const nowL=nowIn?`<i class=now style="left:${p(d.generated)}%"></i>`:'';
 return `<div class=gantt><span></span><div class=ticks>${ticks}</div>`+rows.map(r=>`<span class=lbl data-bay="${r.bay}">${r.bay}</span><div class=track>${grid}`+
 (r.segments||[]).map(([s,e,pt,pl])=>`<i class="seg ${pt?'part':''}" data-bay="${r.bay}" data-start="${s}" style="left:${p(s)}%;width:${Math.max(0.2,p(e??d.generated)-p(s))}%" title="${fmt(s)} → ${e?fmt(e):'now'} · ${pl?'Truck '+pl:'no truck number read'}"></i>`).join('')+nowL+`</div>`).join('')+`</div>`}
 const rangeNote=d=>`<small>${tfull(d.range_start,'hour')} → ${tfull(d.range_end,'hour')}</small>`;
 const HRS=[...Array(24).keys()].map(h=>String(h).padStart(2,'0'));
+const WH=d=>{const[a,b]=d.work_hour_range||[0,24];return [a,b]};
+const hrs=(arr,d)=>{const[a,b]=WH(d);return [arr.slice(a,b),HRS.slice(a,b)]};
 const COLS=[['bay','Bay'],['status','Now'],['visits','Visits'],['utilisation_pct','Utilisation'],
 ['ttat_avg','Avg TTAT'],['ttat_median','Median'],['ttat_p90','P90'],['ttat_min','Min'],
 ['ttat_max','Max'],['last_visit_end','Last departure']];
@@ -993,7 +1037,7 @@ if(u=='hour'&&data.bays.length)h+=`<section><h2>Bay timeline <small>(orange = tr
 h+=`<section><h2>Arrivals per ${per} <small>(actual clock time)</small></h2>${timeline(data.timeline,u,'arrivals','','')}</section>`;
 h+=`<section><h2>Occupancy per ${per} <small>(% of bays occupied)</small></h2>${timeline(data.timeline,u,'occ_pct','b','%')}</section>`;
 h+=`<section><h2>How long trucks stay <small>(TTAT distribution · completed visits)</small></h2>${histo(data.ttat_hist)}</section>`;
-if(u=='day')h+=`<section><h2>Arrivals by hour of day <small>(pattern across the range)</small></h2>${bars(data.by_hour,HRS)}</section>`;
+if(u=='day')h+=`<section><h2>Arrivals by hour of day <small>(pattern across the range)</small></h2>${(()=>{const[v,l]=hrs(data.by_hour,data);return bars(v,l)})()}</section>`;
 $('view').innerHTML=h;
 document.querySelectorAll('.lbl[data-bay]').forEach(e=>e.onclick=()=>{location.hash='#/bay/'+encodeURIComponent(e.dataset.bay)});
 document.querySelectorAll('[data-g]').forEach(e=>e.onclick=()=>{group=e.dataset.g;load()});
@@ -1011,8 +1055,8 @@ if(u=='hour')h+=`<section><h2>Timeline <small>(orange = truck in bay)</small></h
 h+=`<section><h2>Arrivals per ${per} <small>(actual clock time)</small></h2>${timeline(d.timeline,u,'arrivals','','')}</section>`;
 h+=`<section><h2>Occupancy per ${per} <small>(% of each ${per} the bay was occupied)</small></h2>${timeline(d.timeline,u,'occ_pct','b','%')}</section>`;
 h+=`<section><h2>How long trucks stay here <small>(TTAT distribution)</small></h2>${histo(d.ttat_hist)}</section>`;
-if(u=='day'){h+=`<section><h2>Arrivals by hour of day <small>(pattern across the range)</small></h2>${bars(d.arrivals_by_hour,HRS)}</section>`;
-h+=`<section><h2>Occupancy by hour of day <small>(% of each hour the bay was occupied)</small></h2>${bars(d.occupancy_pct_by_hour,HRS,'b',(i,v)=>v+'%',[],(i,v)=>v?Math.round(v)+'%':'')}</section>`}
+if(u=='day'){h+=`<section><h2>Arrivals by hour of day <small>(pattern across the range)</small></h2>${(()=>{const[v,l]=hrs(d.arrivals_by_hour,d);return bars(v,l)})()}</section>`;
+h+=`<section><h2>Occupancy by hour of day <small>(% of each hour the bay was occupied)</small></h2>${(()=>{const[v,l]=hrs(d.occupancy_pct_by_hour,d);return bars(v,l,'b',(i,x)=>x+'%',[],(i,x)=>x?Math.round(x)+'%':'')})()}</section>`}
 const t=d.trucks,done=t.filter(x=>x.ttat!=null);
 h+=`<section><h2>Each truck entry <small>(bar = time in bay, oldest → newest; faded = already there when monitoring started · click a bar)</small></h2>`+
 (done.length?bars(done.map(x=>x.ttat),done.map(x=>new Date(x.start*1000).toLocaleDateString([],{month:'numeric',day:'numeric'})),'',(i,v)=>dur(v)+' from '+fmt(done[i].start),done.map(x=>x.partial),(i,v)=>dur(v),done.map(x=>x.start)):'<small>No completed visits in this range.</small>')+`</section>`;

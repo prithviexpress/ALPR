@@ -50,7 +50,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULTS = {"host": "0.0.0.0", "port": 8082, "db_path": "dashboard.db",
             "group_prefix_len": 2, "overstay_hours": 4,
-            "work_start": "06:30", "work_end": "24:00"}
+            "work_start": "06:30", "work_end": "24:00",
+            "min_visit_minutes": 10, "merge_gap_minutes": 5}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(
   ts INTEGER NOT NULL, bay TEXT NOT NULL, status TEXT NOT NULL,
@@ -280,6 +281,30 @@ class Store:
 
 # ---------------------------------------------------------------- stats --
 _visits_memo = {"events": None, "visits": None}
+# Blips are not truck entries: a completed visit shorter than min_sec is
+# dropped, and two visits separated by less than merge_gap_sec are one
+# truck (the model flickering empty/occupied for a moment). Open visits
+# (truck in bay now) are never dropped.
+VISIT_RULES = {"min_sec": 600, "merge_gap_sec": 300}
+
+
+def set_visit_rules(min_minutes, merge_gap_minutes):
+    VISIT_RULES["min_sec"] = float(min_minutes) * 60
+    VISIT_RULES["merge_gap_sec"] = float(merge_gap_minutes) * 60
+    _visits_memo["events"] = None          # recompute with the new rules
+
+
+def _clean_visits(vs):
+    merged = []
+    for v in vs:
+        last = merged[-1] if merged else None
+        if (last and last["end"] is not None
+                and v["start"] - last["end"] < VISIT_RULES["merge_gap_sec"]):
+            last["end"], last["img_out"] = v["end"], v["img_out"]
+            continue
+        merged.append(dict(v))
+    return [v for v in merged if v["end"] is None
+            or v["end"] - v["start"] >= VISIT_RULES["min_sec"]]
 
 
 def build_visits(events, now):
@@ -319,7 +344,7 @@ def _build_visits(events, now):
                 cur = None
         if cur:
             visits.append(cur)           # still open
-        out[bay] = visits
+        out[bay] = _clean_visits(visits)
     return out
 
 
@@ -1177,6 +1202,7 @@ def main():
     latest_dir = str(base / raw.get("save_dir", "latest"))
     images_dir = str(base / raw.get("event_images_dir", "event_images"))
     set_work_hours(d["work_start"], d["work_end"])
+    set_visit_rules(d["min_visit_minutes"], d["merge_gap_minutes"])
     db = connect(d["db_path"])
     store = Store(db, csv_path)
     store.get()

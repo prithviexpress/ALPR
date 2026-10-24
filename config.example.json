@@ -54,6 +54,8 @@
   },
   "dashboard": {
     "work_start": "06:30",
-    "work_end": "24:00"
+    "work_end": "24:00",
+    "min_visit_minutes": 10,
+    "merge_gap_minutes": 5
   }
 }

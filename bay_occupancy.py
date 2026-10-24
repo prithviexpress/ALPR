@@ -270,14 +270,23 @@ class ExternalStatus:
             self.stop.wait(self.c["poll_sec"])
 
 
-def resolve_status(camera_state, ext):
-    """-> (occupied or None, source). The external reading wins whenever it
-    has a real value; otherwise the camera's confirmed state is used."""
-    if ext is not None:
-        return ext["occupied"], "external"
+def resolve_status(camera_state):
+    """-> (occupied or None, source). Bay entries come from the camera only.
+    The site API never creates or changes an entry; see corroboration()."""
     if camera_state is not None:
         return camera_state, "camera"
     return None, None
+
+
+def corroboration(camera_state, ext):
+    """How the site API reading relates to the camera's confirmed state:
+    "agrees" (entry corroborated), "disagrees" (ignored), "no camera state",
+    or "no api reading"."""
+    if ext is None:
+        return "no api reading"
+    if camera_state is None:
+        return "no camera state"
+    return "agrees" if ext["occupied"] == camera_state else "disagrees"
 
 
 class Monitor:
@@ -292,6 +301,7 @@ class Monitor:
         self.external = (ExternalStatus(cfg["external"])
                          if cfg["external"]["enabled"] else None)
         self.last_pub = {}        # bay -> occupied bool last published
+        self.corr = {}            # bay -> site API corroboration (see above)
         self.latest = {}          # bay -> dict served by the webhook
         self.latest_lock = threading.Lock()
         self.last_change = {}     # bay -> (status, epoch) for the CSV
@@ -495,7 +505,8 @@ class Monitor:
             occupied, best = self._detect(frame)
             self.deb[bay].update(occupied)
             ext = self.external.get(bay) if self.external else None
-            eff, src = resolve_status(self.deb[bay].state, ext)
+            eff, src = resolve_status(self.deb[bay].state)
+            self.corr[bay] = corroboration(eff, ext)
             changed = eff is not None and eff != self.last_pub.get(bay)
             if changed:
                 self.last_pub[bay] = eff
@@ -534,6 +545,7 @@ class Monitor:
                 "status_since": (now if changed or "status_since" not in prev
                                  else prev["status_since"]),
                 "source": source,
+                "site_api": self.corr.get(bay),
                 "class": best[0] if best else None,
                 "confidence": round(best[1], 3) if best else None,
                 "jpeg": buf.tobytes() if ok else None,
